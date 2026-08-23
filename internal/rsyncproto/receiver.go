@@ -3,7 +3,9 @@ package rsyncproto
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/md5"
 	"fmt"
 	"io"
 	"net"
@@ -95,6 +97,13 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 	}
 	rollback := func() { txn.Rollback() }
 
+	// 活跃快照（delta 的 quick check 基准）：会话开始取一次，之后不随 CLI 切换
+	activeID, err := r.ActiveSnapshotID()
+	if err != nil {
+		rollback()
+		return err
+	}
+
 	// 传输阶段：对 flist 中每个条目发 ndx+iflags（目录/链接无 sums），
 	// 客户端 sender 对每条回显 ndx+iflags（文件另有 sum_head 回显与 token 流）。
 	for i, e := range entries {
@@ -125,18 +134,21 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 			}
 			continue
 		}
-		// 普通文件：ITEM_TRANSFER | ITEM_IS_NEW + 空校验和请求（write_sum_head(NULL) 16 字节全 0）
-		refs, err := receiveFile(ctx, stream, out, ndxOut, ndxIn, r, i)
+		// 普通文件：quick check 命中不发请求（不落库，CopyFiles 已继承旧行与 chunk 关联）；
+		// 变化文件发真实块校验和（delta）；新文件/空文件发空校验和请求（全量 literal）
+		refs, updated, err := receiveFileDelta(ctx, stream, out, ndxOut, ndxIn, r, neg, activeID, e, i)
 		if err != nil {
 			rollback()
 			return fmt.Errorf("文件 %s: %w", e.Path, err)
 		}
-		if err := txn.UpsertFile(meta.FileRow{
-			Path: e.Path, Mode: e.Mode, UID: e.UID, GID: e.GID,
-			Size: e.Size, MTimeNs: e.MTimeNs,
-		}, refs); err != nil {
-			rollback()
-			return fmt.Errorf("落库 %s: %w", e.Path, err)
+		if updated { // quick check 命中不落库：CopyFiles 已继承旧行与 chunk 关联
+			if err := txn.UpsertFile(meta.FileRow{
+				Path: e.Path, Mode: e.Mode, UID: e.UID, GID: e.GID,
+				Size: e.Size, MTimeNs: e.MTimeNs,
+			}, refs); err != nil {
+				rollback()
+				return fmt.Errorf("落库 %s: %w", e.Path, err)
+			}
 		}
 	}
 
@@ -272,12 +284,10 @@ func applyStaticEntry(txn *repo.SnapshotTxn, e FileEntry) error {
 	return nil
 }
 
-// receiveFile 单个普通文件的完整传输（generator 请求 + receiver 收数据）：
-// 1. 发 ndx + iflags(ITEM_TRANSFER|ITEM_IS_NEW) + write_sum_head(NULL)（16 字节全 0）
-// 2. 读客户端回显 ndx+iflags 与回显 sum_head（sender.c:409/410）
-// 3. token 流：正 int=literal（读 N 字节）；负=match（v1 无 basis，报错）；0=结束（token.c:304-319）
-// 4. 读 xferSumLen 字节整文件强校验和（md5，丢弃）
-func receiveFile(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, index int) ([]meta.ChunkRef, error) {
+// receiveFileLegacy 全量传输路径（v1）：发 ndx + iflags(ITEM_TRANSFER|ITEM_IS_NEW)
+// + write_sum_head(NULL)（16 字节全 0）→ 客户端 count==0 全量 literal 发送。
+// 用于新文件/空文件/旧行类型不一致（无可作 basis 的旧文件）场景。
+func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, index int) ([]meta.ChunkRef, error) {
 	// ndx + iflags + 空校验和请求（count/blength/s2length/remainder 各 int32 0 = 16 字节）
 	var buf bytesBuffer
 	if err := ndxOut.Write(&buf, int32(index)); err != nil {
@@ -377,4 +387,261 @@ func writeNullSumHead(w io.Writer) error {
 		}
 	}
 	return nil
+}
+
+// receiveFileDelta 单个普通文件的 delta 传输：
+//  1. quick check：活跃快照存在同路径普通文件且 (mtime, size) 一致 → 不发出
+//     任何字节（BeginSnapshot 的 CopyFiles 已继承旧行与 chunk 关联）。
+//  2. 无旧行 / 空文件 / 旧行类型不一致 → 全量路径（receiveFileLegacy）。
+//  3. 变化文件：第一遍读旧文件算块校验和表 → 发 ndx+iflags+sum_head+块校验和
+//     → 读回显 → token 流（match 从旧文件流复制 + literal 直收）按 4MiB 重组
+//     StoreChunk → 读 16B 整文件 MD5 与重组累计比对。
+func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, neg *Negotiation, activeID int64, e FileEntry, index int) ([]meta.ChunkRef, bool, error) {
+	row, ok, err := r.GetFileRow(activeID, e.Path)
+	if err != nil {
+		return nil, true, err
+	}
+	// quick check 命中：mtime+size 一致且旧行确为普通文件（类型变化不可跳过）。
+	// 不发出任何字节，返回 updated=false（CopyFiles 已继承旧行与 chunk 关联，不落库）。
+	if ok && !row.IsDir && !row.IsSymlink && row.MTimeNs == e.MTimeNs && row.Size == e.Size {
+		return nil, false, nil
+	}
+	// 全量路径：无旧行 / 空文件 / 旧行类型不一致（无可作 basis 的旧文件）
+	if !ok || e.Size == 0 || row.IsDir || row.IsSymlink {
+		legacyRefs, lerr := receiveFileLegacy(ctx, stream, out, ndxOut, ndxIn, r, index)
+		return legacyRefs, true, lerr
+	}
+
+	// --- delta 路径：旧文件为 basis ---
+	// 第一遍读旧文件计算块校验和表（len 取旧文件大小：sum 表描述 basis 块结构，
+	// 客户端按收到的 blength 匹配自己的新文件）
+	tbl, err := calcBlockSumsFromRepo(r, activeID, e.Path, row.Size, neg.ChecksumSeed)
+	if err != nil {
+		return nil, true, fmt.Errorf("计算块校验和: %w", err)
+	}
+	// 发 ndx + iflags + sum_head + 逐块校验和（协议 31 非 mux 独立帧，随 MSG_DATA 流）
+	var buf bytesBuffer
+	if err := ndxOut.Write(&buf, int32(index)); err != nil {
+		return nil, true, err
+	}
+	if err := WriteShortint(&buf, itemTransfer|itemIsNew); err != nil {
+		return nil, true, err
+	}
+	for _, v := range [...]int32{tbl.Count, tbl.Blength, tbl.S2Length, tbl.Remainder} {
+		if err := WriteInt32(&buf, v); err != nil {
+			return nil, true, err
+		}
+	}
+	for _, s := range tbl.Sums {
+		if err := WriteInt32(&buf, int32(s.Sum1)); err != nil {
+			return nil, true, err
+		}
+		buf.Write(s.Sum2[:])
+	}
+	if err := out.WriteData(buf.Bytes()); err != nil {
+		return nil, true, err
+	}
+	// 客户端回显：ndx+iflags + sum_head 镜像（与发送一致，防御协议错位）
+	if err := recvNdxEcho(stream, ndxIn); err != nil {
+		return nil, true, err
+	}
+	var echo [4]int32
+	for i := range echo {
+		if echo[i], err = ReadInt32(stream); err != nil {
+			return nil, true, fmt.Errorf("回显 sum_head: %w", err)
+		}
+	}
+	if echo != [4]int32{tbl.Count, tbl.Blength, tbl.S2Length, tbl.Remainder} {
+		return nil, true, fmt.Errorf("回显 sum_head 与发送不一致: %v", echo)
+	}
+	// 第二遍读旧文件（basisReader 短连接逐块读）供 match 块复制
+	br := &basisReader{r: r, snapshotID: activeID, path: e.Path, fileSize: row.Size}
+
+	// token 循环 + 4MiB 重组 + MD5 累计
+	chunkSize := r.ChunkSizeBytes()
+	data := make([]byte, 0, chunkSize)
+	var refs []meta.ChunkRef
+	var idx int
+	h := md5.New()
+	var consumed int64 // 旧文件流已消费偏移（match 单调递增断言基准）
+	flush := func() error {
+		if len(data) == 0 {
+			return nil
+		}
+		id, _, err := r.StoreChunk(data)
+		if err != nil {
+			return err
+		}
+		refs = append(refs, meta.ChunkRef{ChunkID: id, IDX: idx})
+		idx++
+		data = data[:0]
+		return nil
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, true, err
+		}
+		token, err := ReadInt32(stream)
+		if err != nil {
+			return nil, true, err
+		}
+		if token == 0 {
+			break // 文件数据流结束（token.c:319）
+		}
+		if token < 0 {
+			// match 第 b 块：从旧文件流复制（偏移 b*blength，末块长度按表规则）
+			b := int64(-token) - 1
+			if b >= int64(tbl.Count) {
+				return nil, true, fmt.Errorf("匹配块索引越界: %d (共 %d 块)", b, tbl.Count)
+			}
+			offset2 := b * int64(tbl.Blength)
+			if offset2 < consumed {
+				return nil, true, fmt.Errorf("匹配块偏移回退: %d < %d（rsync sender 应单调递增）", offset2, consumed)
+			}
+			if offset2 > consumed {
+				if _, err := io.CopyN(io.Discard, br, offset2-consumed); err != nil {
+					return nil, true, fmt.Errorf("推进旧文件流到偏移 %d: %w", offset2, err)
+				}
+				consumed = offset2
+			}
+			blen := int64(tbl.Blength)
+			if b == int64(tbl.Count)-1 && tbl.Remainder != 0 {
+				blen = int64(tbl.Remainder)
+			}
+			if consumed+blen > row.Size {
+				return nil, true, fmt.Errorf("匹配块越界: 偏移 %d 长度 %d 超过旧文件 %d 字节", consumed, blen, row.Size)
+			}
+			match := make([]byte, blen)
+			if _, err := io.ReadFull(br, match); err != nil {
+				return nil, true, fmt.Errorf("读取匹配块 %d: %w", b, err)
+			}
+			consumed += blen
+			h.Write(match)
+			data = append(data, match...)
+			if len(data) == chunkSize {
+				if err := flush(); err != nil {
+					return nil, true, err
+				}
+			}
+			continue
+		}
+		// literal：读 token 字节原始数据（客户端按 CHUNK_SIZE 分包，服务端合并）
+		n := int(token)
+		if n > 32<<20 {
+			return nil, true, fmt.Errorf("字面量块过大: %d", n)
+		}
+		remaining := n
+		for remaining > 0 {
+			take := min(remaining, chunkSize-len(data))
+			tmp := data[len(data) : len(data)+take]
+			if _, err := io.ReadFull(stream, tmp); err != nil {
+				return nil, true, err
+			}
+			data = data[:len(data)+take]
+			h.Write(tmp)
+			remaining -= take
+			if len(data) == chunkSize {
+				if err := flush(); err != nil {
+					return nil, true, err
+				}
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, true, err
+	}
+	// 整文件强校验和（纯 MD5(内容)，客户端 sum_end 不混 seed）与重组累计比对
+	var wantSum [xferSumLen]byte
+	if _, err := io.ReadFull(stream, wantSum[:]); err != nil {
+		return nil, true, err
+	}
+	gotSum := h.Sum(nil)
+	if !bytes.Equal(gotSum, wantSum[:]) {
+		return nil, true, fmt.Errorf("整文件校验和不匹配: 重组 %x vs 客户端 %x", gotSum, wantSum)
+	}
+	return refs, true, nil
+}
+
+// basisReader 顺序读取旧文件（basis）内容供 match 块复制：按 4MiB 存储块
+// 短连接读取（每块查询即查即关），避免 io.Pipe+StreamFile 长连接方案与
+// meta 层 MaxOpenConns=1 互锁。
+type basisReader struct {
+	r          *repo.Repo
+	snapshotID int64
+	path       string
+	fileSize   int64
+	cur        []byte // 当前存储块明文
+	pos        int64  // 已消费偏移
+}
+
+func (b *basisReader) Read(p []byte) (int, error) {
+	for len(b.cur) == 0 {
+		if b.pos >= b.fileSize {
+			return 0, io.EOF
+		}
+		idx := int(b.pos / int64(b.r.ChunkSizeBytes()))
+		blob, err := b.r.ReadChunkAt(b.snapshotID, b.path, idx)
+		if err != nil {
+			return 0, err
+		}
+		b.cur = blob
+	}
+	n := copy(p, b.cur)
+	b.cur = b.cur[n:]
+	b.pos += int64(n)
+	return n, nil
+}
+
+// calcBlockSumsFromRepo 第一遍读旧文件计算块校验和表：先按 size 定块结构
+// （len 取旧文件大小：sum 表描述 basis 块结构，客户端按收到的 blength 匹配
+// 自己的新文件），再流式读旧文件逐块计算 sum1+sum2（StreamFile 内部已校验
+// 内容与 files 表 size 一致，此处再按传入 size 复核）。
+func calcBlockSumsFromRepo(r *repo.Repo, snapshotID int64, path string, size int64, seed int32) (SumTable, error) {
+	count, blength, remainder, err := CalcSizes(size)
+	if err != nil {
+		return SumTable{}, err
+	}
+	w := &sumTableWriter{
+		tbl:     SumTable{Count: count, Blength: blength, S2Length: strongSumLen, Remainder: remainder},
+		seed:    seed,
+		fileLen: size,
+	}
+	if _, _, err := r.StreamFile(snapshotID, path, 0, w); err != nil {
+		return SumTable{}, err
+	}
+	return w.finish()
+}
+
+// sumTableWriter 累积流式字节，满 blength 即计算一块校验和（sum1+sum2）。
+type sumTableWriter struct {
+	tbl     SumTable
+	buf     []byte
+	seed    int32
+	total   int64
+	fileLen int64
+}
+
+func (w *sumTableWriter) Write(p []byte) (int, error) {
+	w.total += int64(len(p))
+	w.buf = append(w.buf, p...)
+	bl := int(w.tbl.Blength)
+	for len(w.buf) >= bl {
+		block := w.buf[:bl]
+		w.tbl.Sums = append(w.tbl.Sums, BlockSum{RollingSum1(block), StrongSum2(block, w.seed)})
+		w.buf = w.buf[bl:]
+	}
+	return len(p), nil
+}
+
+func (w *sumTableWriter) finish() (SumTable, error) {
+	if w.total != w.fileLen {
+		return SumTable{}, fmt.Errorf("旧文件读不完整: %d/%d 字节", w.total, w.fileLen)
+	}
+	if len(w.buf) > 0 { // 末块（长度=remainder 或 blength）
+		w.tbl.Sums = append(w.tbl.Sums, BlockSum{RollingSum1(w.buf), StrongSum2(w.buf, w.seed)})
+	}
+	if int32(len(w.tbl.Sums)) != w.tbl.Count {
+		return SumTable{}, fmt.Errorf("块数不符: %d/%d", len(w.tbl.Sums), w.tbl.Count)
+	}
+	return w.tbl, nil
 }

@@ -191,6 +191,29 @@ func (r *Repo) GetFileRow(snapshotID int64, path string) (meta.FileRow, bool, er
 	return r.meta.GetFileRow(snapshotID, path)
 }
 
+// ReadChunkAt 读取快照文件第 idx 个存储块（file_chunks.idx）的明文。
+// 短连接查询：Scan 后即释放连接，供 basisReader 逐块顺序读取（不长期占用
+// meta 单写连接——StreamFile+io.Pipe 方案会因连接互锁而死锁，
+// meta.DB SetMaxOpenConns(1) 下唯一连接被流式读占用时 StoreChunk 等不到连接）。
+func (r *Repo) ReadChunkAt(snapshotID int64, path string, idx int) ([]byte, error) {
+	var blobName string
+	var size int64
+	err := r.meta.QueryRow(`
+		SELECT c.blob_name, c.size FROM file_chunks fc
+		JOIN files f ON f.id = fc.file_id
+		JOIN chunks c ON c.id = fc.chunk_id
+		WHERE f.snapshot_id = ? AND f.path = ? AND fc.idx = ?`,
+		snapshotID, path, idx).Scan(&blobName, &size)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := r.backend.Get(blobName)
+	if err != nil {
+		return nil, fmt.Errorf("读取块 %s: %w", blobName, err)
+	}
+	return r.key.Decrypt(raw, blobName)
+}
+
 // StreamFile 流式读取快照中文件内容：逐块解密后写入 w，同时计算 rsync 整文件
 // 强校验和 MD5(content)（checksum.c sum_end：CSUM_MD5 分支为纯 MD5——sum_init
 // 的 seed 参数仅作用于 xxh 系列，对 MD5 无效；带 seed 混入的是 file_checksum，
