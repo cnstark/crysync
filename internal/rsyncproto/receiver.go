@@ -406,8 +406,8 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 	if ok && !row.IsDir && !row.IsSymlink && row.MTimeNs == e.MTimeNs && row.Size == e.Size {
 		return nil, false, nil
 	}
-	// 全量路径：无旧行 / 空文件 / 旧行类型不一致（无可作 basis 的旧文件）
-	if !ok || e.Size == 0 || row.IsDir || row.IsSymlink {
+	// 全量路径：无旧行 / 空文件（新旧任一为空都无 delta 基础）/ 旧行类型不一致
+	if !ok || e.Size == 0 || row.Size == 0 || row.IsDir || row.IsSymlink {
 		legacyRefs, lerr := receiveFileLegacy(ctx, stream, out, ndxOut, ndxIn, r, index)
 		return legacyRefs, true, lerr
 	}
@@ -492,16 +492,12 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 			idx++
 			data = data[chunkSize:]
 		}
-		if len(data) == 0 {
-			// data[chunkSize:] 切空后 cap=0（data[:0] 无法恢复容量），literal 路径
-			// 按 chunkSize 直接切片写入需保证容量；重置为新缓冲
-			data = make([]byte, 0, chunkSize)
-		} else {
-			// 残余（< chunkSize，末块由末尾 flush 落库）保留，但换新底层保证
-			// cap >= chunkSize——literal 路径 take=chunkSize-len 直接切片写需要容量
-			tail := make([]byte, len(data), chunkSize)
-			copy(tail, data)
-			data = tail
+		if cap(data) < chunkSize {
+			// 切空（cap=0）或残余底层容量不足时换新缓冲：literal 路径按
+			// chunkSize 直接切片写入需保证容量；容量足够时保留底层零拷贝
+			nd := make([]byte, len(data), chunkSize)
+			copy(nd, data)
+			data = nd
 		}
 		return nil
 	}
