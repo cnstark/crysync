@@ -243,3 +243,51 @@ func TestUpsertDecrementsOldRefs(t *testing.T) {
 		t.Fatalf("新 chunk 应保留: %d %v", n, err)
 	}
 }
+
+// TestGetFileRow：按 (snapshot_id, path) 单行查询（quick check 用）。
+func TestGetFileRow(t *testing.T) {
+	db := openTemp(t)
+	now := time.Unix(1700000000, 0).UTC()
+	s1, err := db.CreateSnapshot(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := FileRow{Path: "a/b.txt", Mode: 0o644, UID: 1000, GID: 1000, Size: 10, MTimeNs: now.UnixNano()}
+	if _, err := db.UpsertFile(s1, want); err != nil {
+		t.Fatal(err)
+	}
+	// 存在：字段完整一致
+	got, ok, err := db.GetFileRow(s1, "a/b.txt")
+	if err != nil || !ok {
+		t.Fatalf("GetFileRow: ok=%v err=%v", ok, err)
+	}
+	if got.Path != want.Path || got.Mode != want.Mode || got.UID != want.UID ||
+		got.GID != want.GID || got.Size != want.Size || got.MTimeNs != want.MTimeNs ||
+		got.IsDir || got.IsSymlink {
+		t.Fatalf("GetFileRow 字段不一致: %+v vs %+v", got, want)
+	}
+	// 目录行（is_dir=1）与符号链接行也按原样还原
+	if _, err := db.UpsertFile(s1, FileRow{Path: "sub", IsDir: true, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.UpsertFile(s1, FileRow{Path: "ln", IsSymlink: true, Mode: 0o777, LinkTarget: "a/b.txt"}); err != nil {
+		t.Fatal(err)
+	}
+	d, ok, err := db.GetFileRow(s1, "sub")
+	if err != nil || !ok || !d.IsDir || d.IsSymlink {
+		t.Fatalf("目录行: ok=%v d=%+v err=%v", ok, d, err)
+	}
+	l, ok, err := db.GetFileRow(s1, "ln")
+	if err != nil || !ok || !l.IsSymlink || l.LinkTarget != "a/b.txt" {
+		t.Fatalf("链接行: ok=%v l=%+v err=%v", ok, l, err)
+	}
+	// 跨快照隔离：另一快照中不存在
+	s2, _ := db.CreateSnapshot(now.Add(time.Minute))
+	if _, ok, err := db.GetFileRow(s2, "a/b.txt"); err != nil || ok {
+		t.Fatalf("快照 2 不应有 a/b.txt: ok=%v err=%v", ok, err)
+	}
+	// 不存在路径
+	if _, ok, err := db.GetFileRow(s1, "nope.txt"); err != nil || ok {
+		t.Fatalf("不存在路径: ok=%v err=%v", ok, err)
+	}
+}

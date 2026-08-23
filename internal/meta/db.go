@@ -220,6 +220,31 @@ func (d *DB) GetFiles(snapshotID int64) ([]FileRow, error) {
 	return out, rows.Err()
 }
 
+// GetFileRow 按 (snapshot_id, path) 查询单行文件元数据；不存在返回 ok=false。
+// quick check 用：字段扫描与 GetFiles 一致（is_dir/is_symlink 为 int、uid/gid 可空）。
+func (d *DB) GetFileRow(snapshotID int64, path string) (FileRow, bool, error) {
+	var f FileRow
+	var isDir, isSym int
+	var uid, gid sql.NullInt64
+	var xattrs []byte
+	var link sql.NullString
+	err := d.db.QueryRow(`SELECT path, is_dir, is_symlink, mode, uid, gid, size, mtime_ns, xattrs, link_target
+		FROM files WHERE snapshot_id = ? AND path = ?`, snapshotID, path).
+		Scan(&f.Path, &isDir, &isSym, &f.Mode, &uid, &gid, &f.Size, &f.MTimeNs, &xattrs, &link)
+	if err == sql.ErrNoRows {
+		return FileRow{}, false, nil
+	}
+	if err != nil {
+		return FileRow{}, false, err
+	}
+	f.IsDir = isDir != 0
+	f.IsSymlink = isSym != 0
+	f.UID, f.GID = int(uid.Int64), int(gid.Int64)
+	f.Xattrs = xattrs
+	f.LinkTarget = link.String
+	return f, true, nil
+}
+
 func (d *DB) SetMeta(key, value string) error {
 	_, err := d.db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
 	return err
