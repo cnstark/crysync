@@ -477,6 +477,34 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 		data = data[:0]
 		return nil
 	}
+	// flushFull 将 data 中所有完整 chunk 逐段落库：匹配块（rsync blength 最大 32KB，
+	// 测试配置 chunk=64）常跨多个 chunk 边界，==chunkSize 判断会漏冲刷导致 data 无限
+	// 累积。逐段分存可保证每块恰为 chunkSize（末块除外），chunk 布局规整——
+	// basisReader 的 pos/chunkSize 索引假设对 delta 快照同样成立。
+	flushFull := func() error {
+		for len(data) >= chunkSize {
+			full := data[:chunkSize]
+			id, _, err := r.StoreChunk(full)
+			if err != nil {
+				return err
+			}
+			refs = append(refs, meta.ChunkRef{ChunkID: id, IDX: idx})
+			idx++
+			data = data[chunkSize:]
+		}
+		if len(data) == 0 {
+			// data[chunkSize:] 切空后 cap=0（data[:0] 无法恢复容量），literal 路径
+			// 按 chunkSize 直接切片写入需保证容量；重置为新缓冲
+			data = make([]byte, 0, chunkSize)
+		} else {
+			// 残余（< chunkSize，末块由末尾 flush 落库）保留，但换新底层保证
+			// cap >= chunkSize——literal 路径 take=chunkSize-len 直接切片写需要容量
+			tail := make([]byte, len(data), chunkSize)
+			copy(tail, data)
+			data = tail
+		}
+		return nil
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, true, err
@@ -518,10 +546,8 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 			consumed += blen
 			h.Write(match)
 			data = append(data, match...)
-			if len(data) == chunkSize {
-				if err := flush(); err != nil {
-					return nil, true, err
-				}
+			if err := flushFull(); err != nil { // 匹配块跨 chunk 边界，逐段落库
+				return nil, true, err
 			}
 			continue
 		}
