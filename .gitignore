@@ -3,3 +3,6 @@ bin/
 
 # worktree（SDD 计划执行）
 .worktrees/
+
+# SDD 计划工作区（scratch）
+.superpowers/
