@@ -185,6 +185,12 @@ func (r *Repo) SnapshotFileRows(snapshotID int64, prefix string) ([]meta.FileRow
 	return out, nil
 }
 
+// GetFileRow 按快照路径查文件元数据（quick check 判定用）：旧快照存在同路径
+// 普通文件且 (mtime, size) 一致 → 未变化，无需传输。
+func (r *Repo) GetFileRow(snapshotID int64, path string) (meta.FileRow, bool, error) {
+	return r.meta.GetFileRow(snapshotID, path)
+}
+
 // StreamFile 流式读取快照中文件内容：逐块解密后写入 w，同时计算 rsync 整文件
 // 强校验和 MD5(content)（checksum.c sum_end：CSUM_MD5 分支为纯 MD5——sum_init
 // 的 seed 参数仅作用于 xxh 系列，对 MD5 无效；带 seed 混入的是 file_checksum，

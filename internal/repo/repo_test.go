@@ -512,3 +512,34 @@ func TestPrune(t *testing.T) {
 		t.Fatalf("无策略不应删除: %d %v", removed, err)
 	}
 }
+
+// TestGetFileRow：repo 层包装的 quick check 查询（UpsertFile 后可查回）。
+func TestGetFileRow(t *testing.T) {
+	r, _ := newTestRepo(t)
+	now := time.Unix(1700000000, 0).UTC()
+	txn, err := r.BeginSnapshot(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := meta.FileRow{Path: "a.txt", Mode: 0o644, Size: 5, MTimeNs: now.UnixNano()}
+	if err := txn.UpsertFile(want, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := txn.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	sid, err := r.LatestSnapshotID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := r.GetFileRow(sid, "a.txt")
+	if err != nil || !ok {
+		t.Fatalf("GetFileRow: ok=%v err=%v", ok, err)
+	}
+	if got.Size != 5 || got.MTimeNs != want.MTimeNs || got.Path != "a.txt" {
+		t.Fatalf("字段不一致: %+v", got)
+	}
+	if _, ok, err := r.GetFileRow(sid, "nope.txt"); err != nil || ok {
+		t.Fatalf("不存在路径: ok=%v err=%v", ok, err)
+	}
+}
