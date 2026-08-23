@@ -1,2 +1,5 @@
 # 编译产物
 bin/
+
+# worktree（SDD 计划执行）
+.worktrees/
