@@ -1,0 +1,11 @@
+# CrySync 配置示例（docker compose 部署时挂载到 /conf/crysync.yaml，权限 0600）
+listen: "0.0.0.0:873"
+auth:
+  users: { backup: "changeme" }   # rsyncd 协议限制：明文；配置权限收紧到 0600
+modules:
+  - name: home
+    path: "/"
+    backend: { type: dir, path: /data/home }
+    keyfile: /keys/home.key
+    meta: /meta/home.db
+    prune: { keep_last: 7, keep_daily: 14, keep_weekly: 8, keep_monthly: 6, schedule: "03:00" }

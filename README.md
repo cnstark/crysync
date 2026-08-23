@@ -1,0 +1,118 @@
+# CrySync
+
+加密备份工具：对外提供 rsyncd 风格的 rsync 协议服务（兼容 rsync 3.x 客户端，protocol 30/31）。服务端将文件内容 **AES-256-GCM 加密**后存入文件后端，目录树与属性明文存本地 SQLite，每次会话提交一个**多版本快照**，可按需恢复到任意时间点。
+
+## 特性
+
+- ✅ 备份（客户端推送）：真实 rsync 3.4.1 首次/二次/深层目录备份验证通过
+- ✅ 恢复（客户端拉取）：内容/mode/mtime（纳秒）/符号链接/空目录/中文文件名一致；支持子目录与单文件拉取、`--delete`、`--numeric-ids`
+- ✅ 只读模块：可拉不可推
+- ✅ 后端：本地目录 + WebDAV（v1）
+- ✅ 去重：4 MiB 分块 + SHA-256 明文哈希
+- ✅ 快照：多版本 + 活跃快照切换（恢复到任意时间点）
+- ✅ prune：restic 保留规则（keep_last/daily/weekly/monthly）+ 孤儿 blob 回收，每日调度
+- ✅ 认证：rsyncd 风格 challenge-response（MD5）
+- 🚧 未实现（v2）：delta 增量传输、xattr/硬链接/稀疏文件
+
+## 快速开始（本地）
+
+```bash
+# 1. 准备配置
+cat > crysync.yaml <<'EOF'
+listen: "0.0.0.0:873"
+auth:
+  users: { backup: "changeme" }   # 明文密码，配置文件权限收紧到 0600
+modules:
+  - name: home
+    path: "/"
+    backend: { type: dir, path: /var/lib/crysync/data/home }
+    keyfile: /var/lib/crysync/keys/home.key
+    meta: /var/lib/crysync/meta/home.db
+    prune: { keep_last: 7, keep_daily: 14, keep_weekly: 8, keep_monthly: 6 }
+EOF
+
+# 2. 初始化（生成密钥与元数据库）
+crysync init --config crysync.yaml
+
+# 3. 启动 daemon
+crysyncd --config crysync.yaml
+```
+
+备份与恢复（标准 rsync 客户端）：
+
+```bash
+# 备份
+rsync -a --password-file=pw.txt /path/to/src/ backup@host::home/
+
+# 恢复（拉回）
+rsync -a --password-file=pw.txt backup@host::home/ /path/to/dest/
+```
+
+## Docker 部署
+
+```bash
+# 一次性初始化（生成密钥与元数据库）
+docker compose run --rm crysync init --config /conf/crysync.yaml
+
+# 正常启动
+docker compose up -d
+```
+
+目录布局（三类数据分离，对应三个卷）：
+
+| 路径 | 内容 | 挂载 |
+|---|---|---|
+| `/conf/crysync.yaml` | 配置（只读，0600） | `./conf` |
+| `/keys/*.key` | 密钥文件（独立卷——与元数据、数据物理分离） | `crysync-keys` |
+| `/meta/*.db` | SQLite 元数据 | `crysync-meta` |
+| `/data/` | Dir 后端数据（WebDAV 后端不需要此卷） | `crysync-data` |
+
+## 配置
+
+```yaml
+listen: "0.0.0.0:873"
+auth:
+  users: { backup: "<密码>" }   # rsyncd 协议限制：明文，配置 0600
+modules:
+  - name: home
+    path: "/"                            # 客户端看到的模块根
+    read_only: false                     # true = 只读模块（可拉不可推）
+    backend: { type: dir, path: /var/lib/crysync/data/home }
+    # 或 WebDAV：backend: { type: webdav, url: https://dav.example.com/crysync, username: ..., password: ... }
+    keyfile: /var/lib/crysync/keys/home.key
+    meta: /var/lib/crysync/meta/home.db
+    prune:                               # 缺省不自动清理；配置后每日执行
+      keep_last: 7
+      keep_daily: 14
+      keep_weekly: 8
+      keep_monthly: 6
+      schedule: "03:00"                  # 每日执行时刻 HH:MM，缺省 03:00
+```
+
+## CLI
+
+```bash
+crysync init --config crysync.yaml                    # 生成模块密钥与元数据库
+crysync snapshots --config crysync.yaml               # 列出全部模块快照
+crysync snapshots --config crysync.yaml --module home # 指定模块
+crysync snapshots --config crysync.yaml --module home --set-active 3   # 切换到快照 3（恢复时间点）
+crysync prune --config crysync.yaml --module home     # 手动执行保留策略 + 孤儿 blob 回收
+```
+
+`set-active` 切换后，`rsync` 拉取即恢复该时间点的目录树。
+
+## 存储架构
+
+- **文件后端**：只存随机命名的加密 blob（64 hex，无任何目录结构/属性信息）
+- **元数据**：目录树 + 属性明文存 SQLite（WAL，每模块一个库）
+- **密钥**：独立文件（0600），每模块一个
+- **加密**：AES-256-GCM，每块随机 nonce，AAD 绑定 blob 名（防后端 blob 互换攻击）
+- **一致性**：blob 先写后端再提交快照；失败/中断会话不产生快照，孤儿 blob 由 GC/prune 回收
+
+## 开发
+
+```bash
+go build ./...
+go vet ./...
+go test ./...          # 全部测试（集成测试依赖 PATH 中的真实 rsync 二进制）
+```
