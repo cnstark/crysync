@@ -49,6 +49,26 @@ func TestBuildSmoke(t *testing.T) {
 	}
 }
 
+// TestCLIVersion：--version / version 子命令打印注入的版本号
+//（CI 用 ldflags -X main.version 注入，此处验证注入机制可用）。
+func TestCLIVersion(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "crysync")
+	build := exec.Command("go", "build", "-ldflags", "-X main.version=v9.9.9-test", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("构建失败: %v\n%s", err, out)
+	}
+	for _, arg := range []string{"--version", "version"} {
+		out, err := exec.Command(bin, arg).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%s 应成功: %v\n%s", arg, err, out)
+		}
+		if !strings.Contains(string(out), "v9.9.9-test") {
+			t.Fatalf("%s 输出应含注入版本: %s", arg, out)
+		}
+	}
+}
+
 // TestCLISnapshotsAndPrune：snapshots 列表 / set-active / prune 全流程。
 // 用 server.OpenRepoForModule 直接造快照（避免起 daemon），CLI 走真实二进制。
 func TestCLISnapshotsAndPrune(t *testing.T) {

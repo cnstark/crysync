@@ -1,12 +1,14 @@
 # 多阶段构建：golang 构建 -> alpine 运行（保留 shell 便于调试与健康检查）
 # CGO_ENABLED=0 静态编译（modernc.org/sqlite 纯 Go 驱动的前提）
 FROM golang:1.26-alpine AS build
+# VERSION 由 CI 通过 --build-arg 注入（如 v1.2.3），本地构建缺省 dev
+ARG VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/crysyncd ./cmd/crysyncd \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/crysync ./cmd/crysync
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/crysyncd ./cmd/crysyncd \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/crysync ./cmd/crysync
 
 FROM alpine:3.22
 # 非 root 运行，UID/GID 默认 1000 可配置

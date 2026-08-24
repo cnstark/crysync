@@ -7,12 +7,30 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"crysync/internal/crypto"
 )
+
+// TestDaemonVersion：--version 打印注入的版本号后退出（无需有效配置文件）。
+func TestDaemonVersion(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "crysyncd")
+	build := exec.Command("go", "build", "-ldflags", "-X main.version=v9.9.9-test", "-o", bin, ".")
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("构建失败: %v\n%s", err, out)
+	}
+	out, err := exec.Command(bin, "--version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("--version 应成功: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "v9.9.9-test") {
+		t.Fatalf("输出应含注入版本: %s", out)
+	}
+}
 
 func TestDaemonSmoke(t *testing.T) {
 	dir := t.TempDir()

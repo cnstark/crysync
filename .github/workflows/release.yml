@@ -1,0 +1,72 @@
+# tag 触发发布：多平台二进制（GitHub Release）+ 多架构 Docker 镜像（GHCR）
+# 设计文档：主仓库 docs/superpowers/specs/2026-08-24-release-workflow-design.md
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write    # 创建 release
+  packages: write    # 推送 GHCR
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # 二进制：linux/amd64 + linux/arm64 交叉编译（静态），tar.gz 打包 + 校验和
+      # 命名口径：文件名/镜像 tag 用去 v 版本（VERSION）；release 名/内嵌版本用 tag 原样（TAG）
+      - name: 构建多平台二进制并打包
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            mkdir -p "dist/linux_${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=${TAG}" \
+              -o "dist/linux_${arch}/crysyncd" ./cmd/crysyncd
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=${TAG}" \
+              -o "dist/linux_${arch}/crysync" ./cmd/crysync
+            tar -czf "dist/crysync_${VERSION}_linux_${arch}.tar.gz" \
+              -C "dist/linux_${arch}" crysyncd crysync
+          done
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      # 镜像：buildx 多架构（QEMU 模拟 arm64；纯 Go 静态编译跨平台可靠）推 GHCR
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ env.VERSION }}
+            ghcr.io/${{ github.repository }}:latest
+          build-args: VERSION=${{ env.TAG }}
+          push: true
+
+      # release 最后创建（最脆弱步骤置末；失败删半成品后重跑，tag 未变可幂等重入）
+      - name: 创建 release 并上传产物
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${TAG}" --title "${TAG}" --generate-notes \
+            dist/*.tar.gz dist/SHA256SUMS

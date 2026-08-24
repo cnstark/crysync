@@ -15,9 +15,18 @@ import (
 	"crysync/internal/server"
 )
 
+// version 由构建时注入（ldflags -X main.version=<tag>），本地构建缺省 dev。
+var version = "dev"
+
 func main() {
 	confPath := flag.String("config", "/etc/crysync/crysync.yaml", "配置文件路径")
+	showVersion := flag.Bool("version", false, "打印版本号并退出")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("crysyncd %s\n", version)
+		return
+	}
 
 	cfg, err := config.Load(*confPath)
 	if err != nil {

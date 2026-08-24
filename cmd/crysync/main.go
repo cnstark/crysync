@@ -22,12 +22,18 @@ func main() {
 	}
 }
 
+// version 由构建时注入（ldflags -X main.version=<tag>），本地构建缺省 dev。
+var version = "dev"
+
 func run(args []string) error {
 	if len(args) == 0 {
 		usage()
 		return fmt.Errorf("缺少子命令")
 	}
 	switch args[0] {
+	case "version", "--version", "-v":
+		fmt.Printf("crysync %s\n", version)
+		return nil
 	case "init":
 		return cmdInit(args[1:])
 	case "snapshots":
@@ -41,10 +47,11 @@ func run(args []string) error {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "用法: crysync <init|snapshots|prune> [选项]")
+	fmt.Fprintln(os.Stderr, "用法: crysync <init|snapshots|prune|version> [选项]")
 	fmt.Fprintln(os.Stderr, "  init       生成模块密钥与元数据库（--config）")
 	fmt.Fprintln(os.Stderr, "  snapshots  列出模块快照（--config [--module NAME]）")
 	fmt.Fprintln(os.Stderr, "  prune      手动执行模块保留策略与孤儿 blob 回收（--config --module NAME）")
+	fmt.Fprintln(os.Stderr, "  version    打印版本号")
 }
 
 func cmdInit(args []string) error {
