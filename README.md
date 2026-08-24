@@ -72,6 +72,22 @@ docker compose up -d
 | `/meta/*.db` | SQLite 元数据 | `crysync-meta` |
 | `/data/` | Dir 后端数据（WebDAV 后端不需要此卷） | `crysync-data` |
 
+### 卷权限
+
+镜像以 root 入口启动，entrypoint 按以下优先级确定运行身份，`su-exec` 降权后运行：
+
+1. 环境变量 `PUID`/`PGID`（`PGID` 缺省 = `PUID`）
+2. 自动探测 `/keys` `/meta` `/data` 挂载目录的属主（须一致；`/data` 未挂载则跳过）
+3. 都未挂载时回退镜像默认 `1000:1000`
+
+行为说明：
+
+- **bind mount 任意属主的宿主目录零配置**：探测属主后以该身份运行，不修改宿主文件
+- 目录属主为 root（dockerd 自动创建目录等场景）：打印警告后以 root 运行，建议宿主机 `chown` 后重启
+- 运行身份对挂载目录无写权限：启动报错并给出修复命令（`chown` 或设置 `PUID`/`PGID`）
+- compose 显式指定 `user:` 时跳过探测，直接以该身份运行（需自行保证权限）
+- named volume 首挂以镜像目录属主 `1000:1000` 初始化，行为与旧版一致
+
 ## 配置
 
 ```yaml

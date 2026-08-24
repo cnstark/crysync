@@ -11,15 +11,15 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}"
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/crysync ./cmd/crysync
 
 FROM alpine:3.22
-# 非 root 运行，UID/GID 默认 1000 可配置
-ARG UID=1000
-ARG GID=1000
-RUN addgroup -g ${GID} crysync && adduser -D -u ${UID} -G crysync crysync
+# root 入口：entrypoint 探测挂载卷属主（或 PUID/PGID 环境变量）后 su-exec 降权运行，
+# bind mount 任意属主目录零配置（设计：docs/superpowers/specs/2026-08-24-docker-volume-permissions-design.md）
+RUN apk add --no-cache su-exec
+# 默认运行身份 1000:1000（无数据卷挂载且 PUID 未设时回退；named volume 首挂以镜像目录属主初始化）
+RUN addgroup -g 1000 crysync && adduser -D -u 1000 -G crysync crysync
 COPY --from=build /out/crysyncd /out/crysync /usr/local/bin/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 # 三类数据分离，对应三个挂载卷（见 docker-compose.yml）
 RUN mkdir -p /keys /meta /data && chown -R crysync:crysync /keys /meta /data
-USER crysync
 EXPOSE 873
 VOLUME ["/keys", "/meta", "/data"]
 ENTRYPOINT ["entrypoint.sh"]
