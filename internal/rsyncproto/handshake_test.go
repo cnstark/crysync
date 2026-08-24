@@ -44,6 +44,24 @@ func TestHandleModuleList(t *testing.T) {
 	}
 }
 
+// TestHandleModuleListEmptyName 空模块名 = 列模块请求：rsync 3.4.1 客户端
+// "rsync host::" 发送空模块名行（真实 rsyncd 据此返回模块清单）。
+func TestHandleModuleListEmptyName(t *testing.T) {
+	cfg := &config.Config{Modules: []config.ModuleConfig{
+		{Name: "home", Path: "/"},
+	}}
+	for _, line := range []string{"\n", "  \n"} { // 空行与纯空白行
+		r := bufio.NewReader(strings.NewReader(clientGreeting + line))
+		var buf bytes.Buffer
+		if _, err := HandleModuleRequest(r, &buf, cfg); err == nil {
+			t.Fatalf("空模块名 %q 应返回错误（调用方关闭连接）", line)
+		}
+		if !strings.Contains(buf.String(), "home\t/") || !strings.Contains(buf.String(), "@RSYNCD: EXIT") {
+			t.Fatalf("空模块名 %q 响应错误: %q", line, buf.String())
+		}
+	}
+}
+
 func TestHandleModuleAuthFlow(t *testing.T) {
 	cfg := &config.Config{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}},
 		Modules: []config.ModuleConfig{{Name: "home", Path: "/"}}}

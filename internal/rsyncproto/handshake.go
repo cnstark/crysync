@@ -55,7 +55,10 @@ func HandleModuleRequest(r *bufio.Reader, w io.Writer, cfg *config.Config) (*con
 	if err != nil {
 		return nil, err
 	}
-	if line == "#list" {
+	// 空模块名 = 列模块请求：rsync 3.4.1 客户端执行 "rsync host::" 时发送空模块名行
+	// （非 "#list" 字面量），真实 rsyncd 对此返回 list 模块清单（clientserver.c
+	// module_list_request，无需认证）；行为与 #list 分支一致，实测 rsyncd 3.4.1 验证。
+	if line == "#list" || strings.TrimSpace(line) == "" {
 		for _, m := range cfg.Modules {
 			fmt.Fprintf(w, "%s\t%s\n", m.Name, m.Path)
 		}
