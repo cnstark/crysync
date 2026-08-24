@@ -69,7 +69,7 @@ func TestPruneOnce(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Serve(ctx, cfg)
+	go Serve(ctx, cfg, nil)
 	time.Sleep(200 * time.Millisecond)
 
 	src := t.TempDir()
@@ -83,7 +83,7 @@ func TestPruneOnce(t *testing.T) {
 	}
 
 	// 手动触发一次 prune（等价于调度时刻到达）
-	if err := pruneOnce(&cfg.Modules[0]); err != nil {
+	if err := pruneOnce(&cfg.Modules[0], nopLogger); err != nil {
 		t.Fatalf("pruneOnce: %v", err)
 	}
 

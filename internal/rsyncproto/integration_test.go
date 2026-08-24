@@ -60,7 +60,7 @@ func startTestServer(t *testing.T) (int, *repo.Repo) {
 					log.Printf("握手失败: %v", err)
 					return
 				}
-				if err := RunReceiver(context.Background(), br, c, module, r); err != nil {
+				if err := RunReceiver(context.Background(), br, c, module, r, nil); err != nil {
 					log.Printf("会话失败: %v", err)
 					return
 				}

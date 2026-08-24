@@ -46,7 +46,7 @@ func TestServeEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- Serve(ctx, cfg) }()
+	go func() { errCh <- Serve(ctx, cfg, nil) }()
 	time.Sleep(200 * time.Millisecond) // 等监听就绪
 
 	src := t.TempDir()
@@ -116,7 +116,7 @@ func startDaemon(t *testing.T) (int, *config.Config) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	errCh := make(chan error, 1)
-	go func() { errCh <- Serve(ctx, cfg) }()
+	go func() { errCh <- Serve(ctx, cfg, nil) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -360,7 +360,7 @@ func TestServeWebDAVBackend(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Serve(ctx, cfg)
+	go Serve(ctx, cfg, nil)
 	time.Sleep(200 * time.Millisecond)
 
 	src := t.TempDir()
@@ -402,7 +402,7 @@ func TestServeReadOnlyModule(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Serve(ctx, cfg)
+	go Serve(ctx, cfg, nil)
 	time.Sleep(200 * time.Millisecond)
 
 	pw := filepath.Join(dir, "pw")

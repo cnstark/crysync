@@ -80,3 +80,109 @@ modules:
 		t.Fatal("重复模块名应报错")
 	}
 }
+
+func TestLogConfigDefaults(t *testing.T) {
+	// 无 log 节：全部默认值（file 空 = 仅 stderr）
+	p := writeTemp(t, `
+listen: "127.0.0.1:873"
+modules:
+  - name: home
+    path: /
+    backend: { type: dir, path: /x }
+    keyfile: /k
+    meta: /m
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Log.File != "" || c.Log.Level != "info" || c.Log.SizeLimitMB() != 16 || c.Log.RetainFiles() != 5 {
+		t.Fatalf("log 默认值错误: %+v", c.Log)
+	}
+}
+
+func TestLogConfigExplicit(t *testing.T) {
+	p := writeTemp(t, `
+listen: "127.0.0.1:873"
+log:
+  file: /var/log/crysync/crysyncd.log
+  level: debug
+  max_size_mb: 8
+  max_files: 2
+modules:
+  - name: home
+    path: /
+    backend: { type: dir, path: /x }
+    keyfile: /k
+    meta: /m
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Log.File != "/var/log/crysync/crysyncd.log" || c.Log.Level != "debug" ||
+		c.Log.SizeLimitMB() != 8 || c.Log.RetainFiles() != 2 {
+		t.Fatalf("log 解析错误: %+v", c.Log)
+	}
+}
+
+func TestLogConfigInvalidLevel(t *testing.T) {
+	p := writeTemp(t, `
+listen: "127.0.0.1:873"
+log:
+  file: /tmp/x.log
+  level: verbose
+modules:
+  - name: home
+    path: /
+    backend: { type: dir, path: /x }
+    keyfile: /k
+    meta: /m
+`)
+	if _, err := Load(p); err == nil {
+		t.Fatal("非法 level 应报错")
+	}
+}
+
+func TestLogConfigInvalidSize(t *testing.T) {
+	for _, bad := range []string{"max_size_mb: 0", "max_files: -1"} {
+		p := writeTemp(t, `
+listen: "127.0.0.1:873"
+log:
+  file: /tmp/x.log
+  `+bad+`
+modules:
+  - name: home
+    path: /
+    backend: { type: dir, path: /x }
+    keyfile: /k
+    meta: /m
+`)
+		if _, err := Load(p); err == nil {
+			t.Fatalf("%s 应报错", bad)
+		}
+	}
+}
+
+func TestLogConfigMaxFilesZero(t *testing.T) {
+	// 显式 0 = 不轮转（区别于缺省 5）
+	p := writeTemp(t, `
+listen: "127.0.0.1:873"
+log:
+  file: /tmp/x.log
+  max_files: 0
+modules:
+  - name: home
+    path: /
+    backend: { type: dir, path: /x }
+    keyfile: /k
+    meta: /m
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Log.RetainFiles() != 0 {
+		t.Fatalf("显式 max_files=0 应为不轮转，得到 %d", c.Log.RetainFiles())
+	}
+}

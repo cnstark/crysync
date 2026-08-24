@@ -6,9 +6,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sort"
 	"strings"
+	"time"
 
 	"crysync/internal/config"
 	"crysync/internal/repo"
@@ -19,11 +21,15 @@ import (
 //   - 否则 → 服务端为 receiver（备份方向）
 //
 // 只读模块拒绝推送（真实 rsyncd 对只读模块 push 报错退出，do_server_recv）。
-func RunSession(ctx context.Context, br *bufio.Reader, w io.Writer, module *config.ModuleConfig, r *repo.Repo) error {
+func RunSession(ctx context.Context, br *bufio.Reader, w io.Writer, module *config.ModuleConfig, r *repo.Repo, logger *slog.Logger) error {
+	if logger == nil {
+		logger = nopLogger
+	}
 	neg, err := NegotiateBinary(br, w)
 	if err != nil {
 		return fmt.Errorf("协商: %w", err)
 	}
+	logNegotiated(logger, neg)
 	mr, err := NewMuxReader(br)
 	if err != nil {
 		return err
@@ -33,35 +39,39 @@ func RunSession(ctx context.Context, br *bufio.Reader, w io.Writer, module *conf
 		return fmt.Errorf("模块 %s 只读，拒绝推送", module.Name)
 	}
 	if neg.SenderMode {
-		return processSendSession(ctx, mr, mw, module, r, neg)
+		return processSendSession(ctx, mr, mw, module, r, neg, logger)
 	}
-	return processSession(ctx, mr, mw, module, r, neg)
+	return processSession(ctx, mr, mw, module, r, neg, logger)
 }
 
 // RunSessionWithReader：与已进行握手/认证的 bufio.Reader 继续协议（避免预读丢失）。
-func RunSessionWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn, module *config.ModuleConfig, r *repo.Repo) error {
-	return RunSession(ctx, br, conn, module, r)
+func RunSessionWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn, module *config.ModuleConfig, r *repo.Repo, logger *slog.Logger) error {
+	return RunSession(ctx, br, conn, module, r, logger)
 }
 
 // RunSender 处理一次恢复方向会话（客户端拉取，服务端为 sender）：argv/二进制协商
 // -> mux 会话。调用方需先完成：HandleModuleRequest（greeting/模块选择/认证）。
-func RunSender(ctx context.Context, br *bufio.Reader, w io.Writer, module *config.ModuleConfig, r *repo.Repo) error {
+func RunSender(ctx context.Context, br *bufio.Reader, w io.Writer, module *config.ModuleConfig, r *repo.Repo, logger *slog.Logger) error {
+	if logger == nil {
+		logger = nopLogger
+	}
 	neg, err := NegotiateBinary(br, w)
 	if err != nil {
 		return fmt.Errorf("协商: %w", err)
 	}
+	logNegotiated(logger, neg)
 	mr, err := NewMuxReader(br)
 	if err != nil {
 		return err
 	}
 	mw := NewMuxWriter(w)
-	return processSendSession(ctx, mr, mw, module, r, neg)
+	return processSendSession(ctx, mr, mw, module, r, neg, logger)
 }
 
 // RunSenderWithReader：与已进行握手/认证的 bufio.Reader 继续协议（避免预读丢失），
 // 与 RunReceiverWithReader 对称。
-func RunSenderWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn, module *config.ModuleConfig, r *repo.Repo) error {
-	return RunSender(ctx, br, conn, module, r)
+func RunSenderWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn, module *config.ModuleConfig, r *repo.Repo, logger *slog.Logger) error {
+	return RunSender(ctx, br, conn, module, r, logger)
 }
 
 // ITEM_* 标志补充（rsync.h:205-235；传输阶段 iflags）
@@ -81,7 +91,18 @@ const literalChunkSize = 32 << 10
 // processSendSession 完整 sender mux 会话（do_server_sender，main.c:908-967）：
 // filter 列表 -> flist + id list -> 传输循环（响应客户端 generator 的 ndx/sums
 // 请求并回送数据）-> 尾部 NDX_DONE + stats -> read_final_goodbye。
-func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *config.ModuleConfig, r *repo.Repo, neg *Negotiation) error {
+func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *config.ModuleConfig, r *repo.Repo, neg *Negotiation, logger *slog.Logger) (err error) {
+	if logger == nil {
+		logger = nopLogger
+	}
+	started := time.Now()
+	curPath := "" // 最近处理的条目路径（错误定位用）
+	defer func() {
+		if err != nil {
+			logger.Error("session_error", "dir", "restore", "path", curPath, "err", err.Error())
+		}
+	}()
+
 	stream := NewMuxStream(in)
 	// ndx 差分编码按方向独立：ndxIn 读客户端（generator 请求），ndxOut 写回复
 	ndxIn := newNdxCodec()  // C->S
@@ -137,6 +158,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 	}
 	// 与 SortFlistEntries 相同的 f_name_cmp 稳定排序（ndx = 排序后索引）
 	sort.SliceStable(items, func(i, j int) bool { return fNameCmp(items[i].entry, items[j].entry) < 0 })
+	logger.Info("session_start", "dir", "restore", "argv", strings.Join(neg.Argv, " "), "entries", len(items))
 
 	// 发 flist：条目 + 哨兵（旧式路径，单字节 0）+ id list（数值直通：空段 varint 0）
 	fw := NewFlistWriter()
@@ -180,6 +202,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 	// DONE 计数：phase>2（收到第 3 个 DONE）跳出循环，前两个各回 ACK。
 	phase := 0
 	var totalSize int64
+	var filesSent int64
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -215,6 +238,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 		}
 		it := items[ndx]
 		e := it.entry
+		curPath = e.Path
 
 		// ndx 之后：iflags（shortint）+ 可选 basis 类型字节 + 可选 xname vstring
 		iflags, err := ReadShortint(stream)
@@ -236,6 +260,14 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 
 		// 非传输条目（目录/符号链接/仅属性）：回显 ndx+iflags(+跟随位)（sender.c:285-289）
 		if iflags&itemTransfer == 0 {
+			attrs := []any{"path", e.Path}
+			switch {
+			case e.IsDir:
+				attrs = append(attrs, "type", "dir")
+			case e.IsSymlink:
+				attrs = append(attrs, "type", "link", "target", e.LinkTarget)
+			}
+			logger.Info("entry_sent", attrs...)
 			if err := writeNdxAttrs(out, ndxOut, int32(ndx), iflags, basis, xname); err != nil {
 				return err
 			}
@@ -271,11 +303,16 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 		}
 
 		lw := &literalWriter{out: out}
+		fileStart := time.Now()
 		n, fileSum, err := r.StreamFile(sid, it.snapPath, neg.ChecksumSeed, lw)
 		if err != nil {
 			return fmt.Errorf("读取文件 %s: %w", e.Path, err)
 		}
 		totalSize += n
+		filesSent++
+		logger.Info("file_sent", "path", e.Path, "size", n,
+			"chunks", (n+int64(r.ChunkSizeBytes())-1)/int64(r.ChunkSizeBytes()),
+			"elapsed_ms", time.Since(fileStart).Milliseconds())
 		// 文件数据结束标记 int32 0（token.c:319），随后整文件强校验和（xfer_sum_len=16）
 		if err := out.WriteData([]byte{0, 0, 0, 0}); err != nil {
 			return err
@@ -340,6 +377,8 @@ transferDone:
 			}
 		}
 	}
+	logger.Info("session_done", "dir", "restore", "files", filesSent, "bytes", totalSize,
+		"elapsed_ms", time.Since(started).Milliseconds())
 	return nil
 }
 

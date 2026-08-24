@@ -194,6 +194,7 @@ type Negotiation struct {
 	SenderMode     bool // argv 含 --sender（恢复方向，服务端为 sender）
 	ChecksumSeed   int32
 	ModuleArg      string
+	Argv           []string // 原始客户端参数（日志/调试用）
 }
 
 // CF_* compat flags（compat.c:117，服务端单方面发送，客户端据此决定会话行为）。
@@ -223,6 +224,7 @@ func NegotiateBinary(r *bufio.Reader, w io.Writer) (*Negotiation, error) {
 		return nil, fmt.Errorf("非法参数行: %v", argv)
 	}
 	neg := parseServerArgs(argv)
+	neg.Argv = argv
 
 	// compat_flags（varint；0 = 单字节 0x00）
 	if err := WriteVarint(w, int32(0)); err != nil {

@@ -322,7 +322,7 @@ func TestSenderSession(t *testing.T) {
 	neg := &Negotiation{PreserveUID: true, PreserveGID: true, ChecksumSeed: 42}
 	done := make(chan error, 1)
 	go func() {
-		done <- processSendSession(context.Background(), mustMux(connS), mustMuxW(connS), module, r, neg)
+		done <- processSendSession(context.Background(), mustMux(connS), mustMuxW(connS), module, r, neg, nil)
 	}()
 
 	c := newSenderClient(t, connC)
@@ -409,7 +409,7 @@ func TestSenderSessionDelStats(t *testing.T) {
 	neg := &Negotiation{ChecksumSeed: 0, PreserveUID: true}
 	done := make(chan error, 1)
 	go func() {
-		done <- processSendSession(context.Background(), mustMux(connS), mustMuxW(connS), module, r, neg)
+		done <- processSendSession(context.Background(), mustMux(connS), mustMuxW(connS), module, r, neg, nil)
 	}()
 
 	c := newSenderClient(t, connC)

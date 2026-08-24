@@ -4,9 +4,12 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
@@ -56,14 +59,30 @@ func OpenRepoForModule(module *config.ModuleConfig) (*repo.Repo, func() error, e
 	return r, func() error { return db.Close() }, nil
 }
 
+// nopLogger：未注入 logger 时的兜底（丢弃全部日志）。
+var nopLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+// newSessionID 生成 4 hex 随机会话标识（日志关联同一连接的全部事件）。
+func newSessionID() string {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "0000"
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // Serve 监听并服务 rsync 连接，直到 ctx 取消；配置了 prune 的模块启动每日调度。
-func Serve(ctx context.Context, cfg *config.Config) error {
+// logger 为 nil 时全部日志丢弃（向后兼容测试/嵌入用法）。
+func Serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+	if logger == nil {
+		logger = nopLogger
+	}
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("监听 %s: %w", cfg.Listen, err)
 	}
 	defer ln.Close()
-	log.Printf("CrySync 监听 %s（%d 个模块）", cfg.Listen, len(cfg.Modules))
+	logger.Info("daemon_start", "listen", cfg.Listen, "modules", len(cfg.Modules))
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -76,7 +95,7 @@ func Serve(ctx context.Context, cfg *config.Config) error {
 		wg.Add(1)
 		go func(module *config.ModuleConfig) {
 			defer wg.Done()
-			runPruneLoop(ctx, module)
+			runPruneLoop(ctx, module, logger)
 		}(m)
 	}
 	go func() {
@@ -89,7 +108,7 @@ func Serve(ctx context.Context, cfg *config.Config) error {
 			if ctx.Err() != nil {
 				break
 			}
-			log.Printf("accept: %v", err)
+			logger.Warn("conn_error", "err", err.Error())
 			continue
 		}
 		wg.Add(1)
@@ -97,8 +116,8 @@ func Serve(ctx context.Context, cfg *config.Config) error {
 			defer wg.Done()
 			defer c.Close()
 			c.SetDeadline(time.Now().Add(24 * time.Hour))
-			if err := handleConn(ctx, c, cfg); err != nil && !errors.Is(err, rsyncproto.ErrClientClosed) {
-				log.Printf("连接 %s: %v", c.RemoteAddr(), err)
+			if err := handleConn(ctx, c, cfg, logger); err != nil && !errors.Is(err, rsyncproto.ErrClientClosed) {
+				logger.Warn("conn_error", "client", c.RemoteAddr().String(), "err", err.Error())
 			}
 		}(conn)
 	}
@@ -114,7 +133,7 @@ func modulePrunePolicy(m *config.ModuleConfig) prune.Policy {
 }
 
 // runPruneLoop 每模块每日调度：睡到下一个 schedule 时刻 -> 打开仓库执行 Prune。
-func runPruneLoop(ctx context.Context, module *config.ModuleConfig) {
+func runPruneLoop(ctx context.Context, module *config.ModuleConfig, logger *slog.Logger) {
 	schedule := "03:00"
 	if module.Prune != nil && module.Prune.Schedule != "" {
 		schedule = module.Prune.Schedule
@@ -123,14 +142,14 @@ func runPruneLoop(ctx context.Context, module *config.ModuleConfig) {
 		if !sleepUntil(ctx, schedule) {
 			return
 		}
-		if err := pruneOnce(module); err != nil {
-			log.Printf("模块 %s prune: %v", module.Name, err)
+		if err := pruneOnce(module, logger); err != nil {
+			logger.Error("prune_error", "module", module.Name, "err", err.Error())
 		}
 	}
 }
 
 // pruneOnce 打开模块仓库执行一次保留策略清理（删除被裁快照 + 孤儿 blob 回收）。
-func pruneOnce(module *config.ModuleConfig) error {
+func pruneOnce(module *config.ModuleConfig, logger *slog.Logger) error {
 	r, closeRepo, err := OpenRepoForModule(module)
 	if err != nil {
 		return fmt.Errorf("打开仓库失败: %w", err)
@@ -141,7 +160,8 @@ func pruneOnce(module *config.ModuleConfig) error {
 		return err
 	}
 	if removed > 0 || blobs > 0 {
-		log.Printf("模块 %s prune: 删除 %d 个快照，回收 %d 个 blob", module.Name, removed, blobs)
+		logger.Info("prune_done", "module", module.Name,
+			"removed_snapshots", removed, "reclaimed_blobs", blobs)
 	}
 	return nil
 }
@@ -168,8 +188,9 @@ func sleepUntil(ctx context.Context, hhmm string) bool {
 }
 
 // handleConn：handshake 与协议共享同一个 bufio.Reader（buffer 可能预读协议字节，
-// 必须传给后续协议解析，否则预读字节丢失）。
-func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config) error {
+// 必须传给后续协议解析，否则预读字节丢失）。握手成功后派生会话级 logger
+//（module/client/session 字段贯穿该会话全部日志事件）。
+func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config, logger *slog.Logger) error {
 	br := bufio.NewReader(conn)
 	module, err := rsyncproto.HandleModuleRequest(br, conn, cfg)
 	if err != nil {
@@ -181,6 +202,8 @@ func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config) error {
 		return err
 	}
 	defer closeRepo()
+	sess := logger.With("module", module.Name,
+		"client", conn.RemoteAddr().String(), "session", newSessionID())
 	// 方向由 RunSession 在 argv 协商后判定（--sender = 恢复）；只读模块拒绝推送
-	return rsyncproto.RunSessionWithReader(ctx, br, conn, module, r)
+	return rsyncproto.RunSessionWithReader(ctx, br, conn, module, r, sess)
 }

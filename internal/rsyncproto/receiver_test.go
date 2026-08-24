@@ -201,7 +201,7 @@ func TestReceiverDirsAndFiles(t *testing.T) {
 	conn, serverOut := pipeConn(t, input)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r)
+	err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r, nil)
 	if err != nil {
 		t.Logf("daemon 输出: % x", serverOut.Bytes())
 		t.Fatalf("receiver: %v", err)
@@ -243,7 +243,7 @@ func TestReceiverTopDirEntry(t *testing.T) {
 	conn, _ := pipeConn(t, input)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r); err != nil {
+	if err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r, nil); err != nil {
 		t.Fatalf("receiver: %v", err)
 	}
 	sid, _ := r.LatestSnapshotID()
@@ -423,7 +423,7 @@ func TestReceiverQuickCheck(t *testing.T) {
 	// 第一次会话：全量备份（buildSessionInput 既有路径）
 	conn, _ := pipeConn(t, buildSessionInput(t, [][]byte{entry}, [][]byte{[]byte("hello")}))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r); err != nil {
+	if err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r, nil); err != nil {
 		t.Fatalf("首次备份: %v", err)
 	}
 	cancel()
@@ -432,7 +432,7 @@ func TestReceiverQuickCheck(t *testing.T) {
 	conn2, _ := pipeConn(t, buildSessionInput(t, [][]byte{entry}, nil))
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel2()
-	if err := RunReceiver(ctx2, bufio.NewReader(conn2), conn2, m, r); err != nil {
+	if err := RunReceiver(ctx2, bufio.NewReader(conn2), conn2, m, r, nil); err != nil {
 		t.Fatalf("二次备份: %v", err)
 	}
 	sid, _ := r.LatestSnapshotID()
@@ -463,7 +463,7 @@ func TestReceiverDelta(t *testing.T) {
 	oldEntry := buildEntry(t, "a.txt", 0o644, 1500, false, "")
 	conn, _ := pipeConn(t, buildSessionInput(t, [][]byte{oldEntry}, [][]byte{oldContent}))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r)
+	err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r, nil)
 	cancel()
 	if err != nil {
 		t.Fatalf("首次备份: %v", err)
@@ -493,7 +493,7 @@ func TestReceiverDelta(t *testing.T) {
 		return nil
 	})
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
-	err = RunReceiver(ctx2, bufio.NewReader(server), server, m, r)
+	err = RunReceiver(ctx2, bufio.NewReader(server), server, m, r, nil)
 	cancel2()
 	if cerr := <-done; cerr != nil && err == nil {
 		err = cerr
@@ -559,7 +559,7 @@ func TestReceiverDeltaProtocolErrors(t *testing.T) {
 			oldEntry := buildEntry(t, "a.txt", 0o644, 1500, false, "")
 			conn, _ := pipeConn(t, buildSessionInput(t, [][]byte{oldEntry}, [][]byte{oldContent}))
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r); err != nil {
+			if err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r, nil); err != nil {
 				t.Fatalf("首次备份: %v", err)
 			}
 			cancel()
@@ -579,7 +579,7 @@ func TestReceiverDeltaProtocolErrors(t *testing.T) {
 			ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
 			// 错误路径：服务端提前返回（goodbye 未发），客户端仍在等帧。
 			// 关闭服务端连接使客户端读帧得到 EOF，解除客户端 goroutine 阻塞（否则 <-done 死锁）。
-			err := RunReceiver(ctx2, bufio.NewReader(server), server, m, r)
+			err := RunReceiver(ctx2, bufio.NewReader(server), server, m, r, nil)
 			cancel2()
 			if err != nil {
 				server.Close()
