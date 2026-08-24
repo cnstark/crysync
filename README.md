@@ -5,14 +5,15 @@
 ## 特性
 
 - ✅ 备份（客户端推送）：真实 rsync 3.4.1 首次/二次/深层目录备份验证通过
+- ✅ delta 增量传输：未变化文件 quick check（mtime+size）零交互跳过；变化文件按块校验和只传差异部分（match+literal 重组），传输后整文件 MD5 校验
 - ✅ 恢复（客户端拉取）：内容/mode/mtime（纳秒）/符号链接/空目录/中文文件名一致；支持子目录与单文件拉取、`--delete`、`--numeric-ids`
 - ✅ 只读模块：可拉不可推
 - ✅ 后端：本地目录 + WebDAV（v1）
-- ✅ 去重：4 MiB 分块 + SHA-256 明文哈希
+- ✅ 去重：4 MiB 分块 + SHA-256 明文哈希（增量重组后统一切块，内容寻址天然去重）
 - ✅ 快照：多版本 + 活跃快照切换（恢复到任意时间点）
 - ✅ prune：restic 保留规则（keep_last/daily/weekly/monthly）+ 孤儿 blob 回收，每日调度
 - ✅ 认证：rsyncd 风格 challenge-response（MD5）
-- 🚧 未实现（v2）：delta 增量传输、xattr/硬链接/稀疏文件
+- 🚧 未实现（v2）：xattr/硬链接/稀疏文件
 
 ## 快速开始（本地）
 
@@ -41,7 +42,7 @@ crysyncd --config crysync.yaml
 备份与恢复（标准 rsync 客户端）：
 
 ```bash
-# 备份
+# 备份（首次全量；再次执行自动增量：未变化文件零传输，变化文件只传差异部分）
 rsync -a --password-file=pw.txt /path/to/src/ backup@host::home/
 
 # 恢复（拉回）
