@@ -186,3 +186,37 @@ modules:
 		t.Fatalf("显式 max_files=0 应为不轮转，得到 %d", c.Log.RetainFiles())
 	}
 }
+
+// TestEnvExpansion：配置文本在 yaml 解析前做 ${VAR} 环境变量展开——
+// 引号内引用可安全承载含特殊字符（#、:）的值；未定义变量展开为空。
+func TestEnvExpansion(t *testing.T) {
+	t.Setenv("CS_TEST_RSYNC_PASS", "p#ss:word")
+	t.Setenv("CS_TEST_WEBDAV_URL", "http://quarkdav:8080/crysync/")
+	p := writeTemp(t, `
+listen: "0.0.0.0:873"
+auth:
+  users: { backup: "${CS_TEST_RSYNC_PASS}" }
+modules:
+  - name: quark
+    path: "/"
+    backend:
+      type: webdav
+      url: "${CS_TEST_WEBDAV_URL}"
+      username: "${CS_TEST_UNSET_VAR}"
+    keyfile: /keys/quark.key
+    meta: /meta/quark.db
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Auth.Users["backup"] != "p#ss:word" {
+		t.Fatalf("密码应展开为含特殊字符的 env 值: %q", c.Auth.Users["backup"])
+	}
+	if c.Modules[0].Backend.URL != "http://quarkdav:8080/crysync/" {
+		t.Fatalf("url 应展开: %q", c.Modules[0].Backend.URL)
+	}
+	if c.Modules[0].Backend.Username != "" {
+		t.Fatalf("未定义变量应展开为空: %q", c.Modules[0].Backend.Username)
+	}
+}

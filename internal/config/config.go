@@ -96,8 +96,12 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取配置: %w", err)
 	}
+	// 环境变量展开（yaml 解析前，全字段生效）：支持 ${VAR} 与 $VAR 两种引用。
+	// 约定：引用写在 YAML 引号内（如 "${VAR}"），env 值含 #、: 等特殊字符时安全；
+	// 未定义变量展开为空串（$ 为特殊字符，配置字面值含 $ 时注意会被尝试展开）。
+	expanded := os.ExpandEnv(string(b))
 	var c Config
-	if err := yaml.Unmarshal(b, &c); err != nil {
+	if err := yaml.Unmarshal([]byte(expanded), &c); err != nil {
 		return nil, fmt.Errorf("解析配置: %w", err)
 	}
 	c.applyLogDefaults()
