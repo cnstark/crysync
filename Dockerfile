@@ -18,8 +18,9 @@ RUN apk add --no-cache su-exec
 RUN addgroup -g 1000 crysync && adduser -D -u 1000 -G crysync crysync
 COPY --from=build /out/crysyncd /out/crysync /usr/local/bin/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-# 三类数据分离，对应三个挂载卷（见 docker-compose.yml）
+# /keys /meta 为必挂卷；/data 仅 Dir 后端需要——不声明 VOLUME（声明会强制
+# 匿名卷，WebDAV 后端场景凭空多一个卷），需要时由 compose/docker run 显式挂载
 RUN mkdir -p /keys /meta /data && chown -R crysync:crysync /keys /meta /data
 EXPOSE 873
-VOLUME ["/keys", "/meta", "/data"]
+VOLUME ["/keys", "/meta"]
 ENTRYPOINT ["entrypoint.sh"]
