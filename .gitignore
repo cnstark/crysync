@@ -6,3 +6,7 @@ bin/
 
 # SDD 计划工作区（scratch）
 .superpowers/
+
+# 本地部署文件（由 example 复制，含环境信息/密码，勿提交）
+docker-compose.yml
+conf/crysync.yaml

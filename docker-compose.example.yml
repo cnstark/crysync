@@ -1,0 +1,30 @@
+# CrySync docker compose 部署示例
+# 使用方式：复制本文件为 docker-compose.yml（复制品含本地环境信息，已被 gitignore）
+#   cp docker-compose.example.yml docker-compose.yml
+# 前置：配置文件已就绪——复制并编辑 conf/crysync.yaml.example 为 conf/crysync.yaml
+#（密码、模块名、后端类型按需修改，权限 0600；WebDAV 后端无需 /data 卷）
+
+services:
+  crysync:
+    # GHCR 官方镜像；生产建议固定版本号（如 ghcr.io/cnstark/crysync:0.1.0）
+    image: ghcr.io/cnstark/crysync:latest
+    ports:
+      - "873:873"            # 宿主端口被占用时改左侧（如 "8873:873"），rsync --port 同步改
+    # 与镜像内运行用户一致（Dockerfile 默认 UID/GID 1000），挂载宿主目录时按需调整
+    user: "1000:1000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "873"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    volumes:
+      - ./conf:/conf:ro       # 配置目录（crysync.yaml 所在，只读挂载）
+      - crysync-keys:/keys    # 模块密钥（与元数据、数据物理分离的独立卷）
+      - crysync-meta:/meta    # SQLite 元数据库（每模块一个）
+      - crysync-data:/data    # Dir 后端 blob 数据；全部模块用 WebDAV 后端时此卷可去掉
+
+volumes:
+  crysync-keys:
+  crysync-meta:
+  crysync-data:

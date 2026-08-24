@@ -52,10 +52,14 @@ rsync -a --password-file=pw.txt backup@host::home/ /path/to/dest/
 ## Docker 部署
 
 ```bash
-# 一次性初始化（生成密钥与元数据库）
+# 1. 准备文件（复制品含本地密码/环境信息，已被 gitignore）
+cp docker-compose.example.yml docker-compose.yml
+cp conf/crysync.yaml.example conf/crysync.yaml   # 编辑密码与模块，权限 0600
+
+# 2. 一次性初始化（生成密钥与元数据库）
 docker compose run --rm crysync init --config /conf/crysync.yaml
 
-# 正常启动
+# 3. 正常启动
 docker compose up -d
 ```
 
