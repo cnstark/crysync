@@ -5,12 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"crysync/internal/backend"
 	"crysync/internal/config"
-	"crysync/internal/crypto"
-	"crysync/internal/meta"
 	"crysync/internal/prune"
 	"crysync/internal/server"
 )
@@ -48,7 +45,7 @@ func run(args []string) error {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "用法: crysync <init|snapshots|prune|version> [选项]")
-	fmt.Fprintln(os.Stderr, "  init       生成模块密钥与元数据库（--config）")
+	fmt.Fprintln(os.Stderr, "  init       显式初始化模块密钥与元数据库（可选，daemon 启动自动执行；--config）")
 	fmt.Fprintln(os.Stderr, "  snapshots  列出模块快照（--config [--module NAME]）")
 	fmt.Fprintln(os.Stderr, "  prune      手动执行模块保留策略与孤儿 blob 回收（--config --module NAME）")
 	fmt.Fprintln(os.Stderr, "  version    打印版本号")
@@ -67,28 +64,18 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	for _, m := range cfg.Modules {
-		if _, err := os.Stat(m.Keyfile); err == nil {
-			fmt.Printf("模块 %s: 密钥已存在，跳过\n", m.Name)
-		} else if os.IsNotExist(err) {
-			k, err := crypto.GenerateKey()
-			if err != nil {
-				return err
-			}
-			if err := os.MkdirAll(filepath.Dir(m.Keyfile), 0o700); err != nil {
-				return fmt.Errorf("创建密钥目录: %w", err)
-			}
-			if err := crypto.SaveKeyFile(m.Keyfile, k); err != nil {
-				return err
-			}
-			fmt.Printf("模块 %s: 密钥已生成\n", m.Name)
+	// 与 daemon 启动共用同一套初始化逻辑（幂等；密钥缺失但元数据库已存在时拒绝）
+	for i := range cfg.Modules {
+		m := &cfg.Modules[i]
+		autoInit, err := server.EnsureModuleInit(m)
+		if err != nil {
+			return fmt.Errorf("模块 %s: %w", m.Name, err)
+		}
+		if autoInit {
+			fmt.Printf("模块 %s: 密钥已生成，元数据已初始化\n", m.Name)
 		} else {
-			return err
+			fmt.Printf("模块 %s: 密钥已存在，元数据已初始化\n", m.Name)
 		}
-		if _, err := meta.Open(m.Meta); err != nil {
-			return err
-		}
-		fmt.Printf("模块 %s: 元数据已初始化\n", m.Name)
 	}
 	return nil
 }

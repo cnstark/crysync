@@ -44,15 +44,38 @@ func LoadKeyFile(path string) (*Key, error) {
 	return &k, nil
 }
 
-func SaveKeyFile(path string, k *Key) error {
+// encodeKey 密钥文件序列化：magic "CRYK" + 版本 + 32 字节密钥。
+func encodeKey(k *Key) []byte {
 	b := make([]byte, 0, 4+1+keyLen)
 	b = append(b, keyMagic...)
 	b = append(b, keyVersion)
 	b = append(b, k.data[:]...)
-	if err := os.WriteFile(path, b, 0o600); err != nil {
+	return b
+}
+
+func SaveKeyFile(path string, k *Key) error {
+	if err := os.WriteFile(path, encodeKey(k), 0o600); err != nil {
 		return fmt.Errorf("写入密钥文件: %w", err)
 	}
 	return os.Chmod(path, 0o600)
+}
+
+// SaveKeyFileExclusive 以独占创建方式写密钥文件（O_EXCL）：文件已存在时不覆盖，
+// 返回 created=false。供自动初始化跨进程竞态兜底（两进程同时首建同一模块时，
+// 只有一方真正生成，另一方沿用已存在的密钥）。
+func SaveKeyFileExclusive(path string, k *Key) (created bool, err error) {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("写入密钥文件: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(encodeKey(k)); err != nil {
+		return false, fmt.Errorf("写入密钥文件: %w", err)
+	}
+	return true, nil
 }
 
 func (k *Key) Encrypt(plaintext []byte, blobName string) ([]byte, error) {

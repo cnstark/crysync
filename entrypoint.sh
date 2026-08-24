@@ -6,8 +6,8 @@
 # 身份确定优先级：PUID/PGID 环境变量 > 挂载目录属主探测 > 默认 1000:1000。
 # 纯适配：不做任何 chown/chmod；身份对挂载目录无写权限时报错退出并给出修复命令。
 #
-# 子命令（crysync CLI）转发；其余参数启动 daemon（设计文档 §10 初始化流程：
-#   docker compose run --rm crysync init --config /conf/crysync.yaml）
+# 子命令（crysync CLI）转发；其余参数启动 daemon（daemon 启动时逐模块自动初始化，
+# init 仅为提前显式初始化的可选入口：docker compose run --rm crysync init --config /conf/crysync.yaml）
 
 DATA_DIRS="/keys /meta /data"
 

@@ -32,10 +32,7 @@ modules:
     prune: { keep_last: 7, keep_daily: 14, keep_weekly: 8, keep_monthly: 6 }
 EOF
 
-# 2. 初始化（生成密钥与元数据库）
-crysync init --config crysync.yaml
-
-# 3. 启动 daemon
+# 2. 启动 daemon（密钥与元数据库缺失时自动初始化）
 crysyncd --config crysync.yaml
 ```
 
@@ -56,12 +53,14 @@ rsync -a --password-file=pw.txt backup@host::home/ /path/to/dest/
 cp docker-compose.example.yml docker-compose.yml
 cp conf/crysync.yaml.example conf/crysync.yaml   # 编辑密码与模块，权限 0600
 
-# 2. 一次性初始化（生成密钥与元数据库）
-docker compose run --rm crysync init --config /conf/crysync.yaml
-
-# 3. 正常启动
+# 2. 直接启动（daemon 启动时逐模块自动初始化，无需手动 init）
 docker compose up -d
 ```
+
+> 迁移部署务必把 `crysync-keys` 与 `crysync-meta` 两个卷（或对应宿主机目录）一并迁走：
+> 快照清单存在本地 SQLite，密钥文件是 blob 解密的前提。若 daemon 发现**元数据库已存在
+> 而密钥文件缺失**（密钥卷丢失/未挂载），会拒绝自动初始化以防静默换钥导致旧快照永久
+> 无法解密--恢复密钥文件，或确认放弃旧数据后删除该元数据库。
 
 目录布局（三类数据分离，对应三个卷）：
 
@@ -113,7 +112,7 @@ modules:
 ## CLI
 
 ```bash
-crysync init --config crysync.yaml                    # 生成模块密钥与元数据库
+crysync init --config crysync.yaml                    # 显式初始化（可选，幂等；daemon 启动会自动执行）
 crysync snapshots --config crysync.yaml               # 列出全部模块快照
 crysync snapshots --config crysync.yaml --module home # 指定模块
 crysync snapshots --config crysync.yaml --module home --set-active 3   # 切换到快照 3（恢复时间点）

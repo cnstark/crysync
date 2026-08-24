@@ -83,3 +83,32 @@ func TestRandomBlobName(t *testing.T) {
 		t.Fatalf("blob 名应为 64 hex 且互不相同: %s %s", a, b)
 	}
 }
+
+func TestSaveKeyFileExclusive(t *testing.T) {
+	k1, _ := GenerateKey()
+	p := filepath.Join(t.TempDir(), "test.key")
+	created, err := SaveKeyFileExclusive(p, k1)
+	if err != nil || !created {
+		t.Fatalf("首次独占创建应成功：created=%v err=%v", created, err)
+	}
+	// 已存在时不覆盖：旧内容保持可加载，created=false
+	k2, _ := GenerateKey()
+	created, err = SaveKeyFileExclusive(p, k2)
+	if err != nil || created {
+		t.Fatalf("文件已存在应返回 created=false：created=%v err=%v", created, err)
+	}
+	got, err := LoadKeyFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.data != k1.data {
+		t.Fatal("已存在的密钥文件不应被覆盖")
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("密钥文件权限应为 0600，实际 %o", fi.Mode().Perm())
+	}
+}
