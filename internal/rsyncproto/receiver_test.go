@@ -131,6 +131,12 @@ func pipeConn(t *testing.T, input []byte) (net.Conn, *bytes.Buffer) {
 // 目录/链接条目响应：回显 ndx+iflags；文件条目响应：回显 ndx+iflags + 回显 sum_head(16B) +
 // literal token 流 + 0 + 16 字节整文件校验和。
 func buildSessionInput(t *testing.T, entries [][]byte, contents [][]byte) []byte {
+	return buildSessionInputSum(t, entries, contents, -1)
+}
+
+// buildSessionInputSum 同 buildSessionInput，badSumIdx 指定的文件（contents 下标）
+// 发坏整文件校验和（P1#9：客户端读源中途失败场景）；-1 表示全部正确。
+func buildSessionInputSum(t *testing.T, entries [][]byte, contents [][]byte, badSumIdx int) []byte {
 	t.Helper()
 	var pre bytes.Buffer
 	// 典型 -a 推送 argv（含 'o''g' -> preserve uid/gid，因此需要 id list）
@@ -146,7 +152,7 @@ func buildSessionInput(t *testing.T, entries [][]byte, contents [][]byte) []byte
 	payload.WriteByte(0)
 	payload.WriteByte(0)
 	// 传输阶段逐条响应（模拟客户端 sender；ndx 回显为递增序列，每条差分编码 [01]）
-	for _, c := range contents {
+	for i, c := range contents {
 		payload.WriteByte(0x01) // 客户端 write_ndx(i)：prev=-1 起点，diff=1
 		if c == nil {
 			// 目录/链接：iflags 回显 = 服务端发的 itemIsNew
@@ -162,8 +168,12 @@ func buildSessionInput(t *testing.T, entries [][]byte, contents [][]byte) []byte
 		WriteInt32(&payload, int32(len(c)))
 		payload.Write(c)
 		WriteInt32(&payload, 0)
-		// 整文件强校验和（md5 = 16 字节）
-		payload.Write(make([]byte, 16))
+		// 整文件强校验和：真实 MD5(内容)（坏校验和场景由 buildSessionInputSum 定制）
+		sum := md5.Sum(c)
+		if badSumIdx == i {
+			sum[0] ^= 0xFF // 坏校验和（模拟客户端读源中途失败）
+		}
+		payload.Write(sum[:])
 	}
 	// goodbye：客户端对 DONE#1/#2/#4 回 ACK（NDX_DONE = 单字节 0x00）
 	payload.WriteByte(0)
@@ -304,10 +314,13 @@ func runDeltaClient(t *testing.T, client net.Conn, pre []byte, respond func(tbl 
 		}
 		ackCount := 0
 		for {
-			frame, _, err := mr.Next()
+			frame, tag, err := mr.Next()
 			if err != nil {
 				done <- err
 				return
+			}
+			if tag != 0 {
+				continue // 消息帧（MSG_ERROR_XFER 等）：跳过
 			}
 			if len(frame) == 1 && frame[0] == 0x00 { // NDX_DONE（write_ndx 30+ 编码单字节 0）
 				ackCount++
@@ -542,15 +555,8 @@ func TestReceiverDeltaProtocolErrors(t *testing.T) {
 			},
 			wantErr: "越界",
 		},
-		{
-			name: "整文件校验和不匹配",
-			respond: func(tbl *SumTable, resp *bytes.Buffer) error {
-				tokens := []int32{3}
-				resp.Write(buildDeltaResponse(tbl, tokens, [][]byte{[]byte("abc")}, nil)) // nil → MD5 为空串
-				return nil
-			},
-			wantErr: "校验和不匹配",
-		},
+		// 整文件校验和不匹配不再是会话错误（P1#9 改为单文件跳过+会话继续），
+		// 新语义由 TestReceiverDeltaBadChecksumPartial 覆盖
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -596,5 +602,94 @@ func TestReceiverDeltaProtocolErrors(t *testing.T) {
 				t.Fatalf("失败会话不应产生快照: %d", sid)
 			}
 		})
+	}
+}
+
+// TestReceiverBadChecksumSkip P1#9：客户端发坏整文件校验和（读源中途失败）时
+// legacy 路径此前不比对静默存坏数据；修复后不落库该文件，会话继续其余文件
+// 并正常提交快照（rsync 语义：单文件报错，其余完成）。
+func TestReceiverBadChecksumSkip(t *testing.T) {
+	r, m := newTestRepoFull(t)
+	entries := [][]byte{
+		buildEntry(t, "bad.txt", 0o644, 6, false, ""),
+		buildEntry(t, "good.txt", 0o644, 4, false, ""),
+	}
+	// 排序后 bad.txt(0)、good.txt(1)；bad.txt 坏校验和
+	input := buildSessionInputSum(t, entries, [][]byte{[]byte("badsum"), []byte("good")}, 0)
+
+	conn, serverOut := pipeConn(t, input)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r, nil); err != nil {
+		t.Logf("daemon 输出: % x", serverOut.Bytes())
+		t.Fatalf("receiver: %v", err)
+	}
+	sid, _ := r.LatestSnapshotID()
+	if sid == 0 {
+		t.Fatal("部分失败会话应提交快照")
+	}
+	files, err := r.GetFilesForTest(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range files {
+		if f.Path == "bad.txt" {
+			t.Fatalf("坏校验和文件不应落库: %v", files)
+		}
+	}
+	var out bytes.Buffer
+	if err := r.ReadFile(sid, "good.txt", &out); err != nil || out.String() != "good" {
+		t.Fatalf("好文件应完好入库: %v %q", err, out.String())
+	}
+}
+
+// TestReceiverDeltaBadChecksumPartial P1#9 delta 变体：整文件校验和不匹配
+// （客户端读源中途失败发坏校验和）不再使整会话回滚——该文件不落库（快照
+// 继承旧版本内容），会话继续并提交新快照，客户端收到 file corruption 错误。
+func TestReceiverDeltaBadChecksumPartial(t *testing.T) {
+	r, m := newTestRepoLarge(t)
+	oldContent := bytes.Repeat([]byte{0x41}, 1500)
+	oldEntry := buildEntry(t, "a.txt", 0o644, 1500, false, "")
+	conn, _ := pipeConn(t, buildSessionInput(t, [][]byte{oldEntry}, [][]byte{oldContent}))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r, nil); err != nil {
+		t.Fatalf("首次备份: %v", err)
+	}
+	cancel()
+
+	newEntry := buildEntry(t, "a.txt", 0o644, 3, false, "")
+	var pre bytes.Buffer
+	pre.WriteString("--server\x00--sender\x00-vlogDtpre.iLsfxCIvu\x00.\x00home/\x00\x00")
+	var payload bytes.Buffer
+	payload.Write(newEntry)
+	payload.WriteByte(0)
+	payload.WriteByte(0)
+	payload.WriteByte(0)
+	pre.Write(muxDataFrame(t, payload.Bytes()))
+
+	server, client := listenOnce(t)
+	done := runDeltaClient(t, client, pre.Bytes(), func(tbl *SumTable, resp *bytes.Buffer) error {
+		tokens := []int32{3}
+		resp.Write(buildDeltaResponse(tbl, tokens, [][]byte{[]byte("abc")}, nil)) // nil → 空 MD5（坏校验和）
+		return nil
+	})
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	err := RunReceiver(ctx2, bufio.NewReader(server), server, m, r, nil)
+	server.Close()
+	if cerr := <-done; err == nil {
+		err = cerr
+	}
+	if err != nil {
+		t.Fatalf("坏校验和会话应正常完成: %v", err)
+	}
+	// 新快照提交（sid=2），a.txt 保留旧版本内容（继承未覆盖）
+	sid, _ := r.LatestSnapshotID()
+	if sid != 2 {
+		t.Fatalf("部分失败会话应提交新快照: %d", sid)
+	}
+	var out bytes.Buffer
+	if err := r.ReadFile(sid, "a.txt", &out); err != nil || !bytes.Equal(out.Bytes(), oldContent) {
+		t.Fatalf("a.txt 应保留旧版本: %v %d 字节", err, out.Len())
 	}
 }

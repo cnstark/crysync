@@ -1015,3 +1015,77 @@ func TestRsyncSourceMissingIoErrorNoDelete(t *testing.T) {
 	}
 }
 
+// TestRsyncFileOpenDeniedPartial P1#9：客户端 open 失败（chmod 000）时发
+// MSG_NO_SEND(102)+ndx 后跳过该文件继续下一个（sender.c:722-724）。rsync 语义：
+// 该文件报错、其余文件正常完成（rc=23）。此前服务端 MuxStream 丢弃消息帧，
+// recvNdxEcho 死等被跳过文件的回显 → 会话永久挂起。修复后：会话正常完成并
+// 提交快照（好文件入库、失败文件不落库），恢复好文件完好。
+func TestRsyncFileOpenDeniedPartial(t *testing.T) {
+	port, r, logBuf := startLoggedRouterServer(t)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("good a"), 0o644)
+	os.WriteFile(filepath.Join(src, "secret.txt"), []byte("unreadable"), 0o644)
+	os.WriteFile(filepath.Join(src, "z.txt"), []byte("good z"), 0o644)
+	if err := os.Chmod(filepath.Join(src, "secret.txt"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(filepath.Join(src, "secret.txt"), 0o644) })
+
+	// 挂起防护：当前实现死锁，20 秒内未返回即失败
+	done := make(chan struct{})
+	var out []byte
+	var rerr error
+	go func() {
+		cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+			src+"/", "backup@127.0.0.1::home/")
+		out, rerr = cmd.CombinedOutput()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("客户端 open 失败的会话不应挂起（MSG_NO_SEND 未处理）")
+	}
+	if rerr == nil {
+		t.Fatalf("含不可读文件应 rc!=0:\n%s", out)
+	}
+	if !strings.Contains(string(out), "secret.txt") {
+		t.Fatalf("客户端应报 secret.txt 错误:\n%s", out)
+	}
+
+	// 其余文件正常完成：快照存在且含好文件、不含失败文件
+	sid, err := r.LatestSnapshotID()
+	if err != nil || sid == 0 {
+		t.Fatalf("部分失败会话应提交快照: %d %v", sid, err)
+	}
+	files, _ := r.GetFilesForTest(sid)
+	got := map[string]bool{}
+	for _, f := range files {
+		got[f.Path] = true
+	}
+	if !got["a.txt"] || !got["z.txt"] {
+		t.Fatalf("好文件应入库: %v", files)
+	}
+	if got["secret.txt"] {
+		t.Fatalf("open 失败的文件不应入库: %v", files)
+	}
+	if findLine(logBuf.String(), "msg=file_skipped") == "" {
+		t.Fatalf("日志应含 file_skipped:\n%s", logBuf.String())
+	}
+
+	// 恢复好文件完好
+	dst := t.TempDir()
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/", dst+"/")
+	if rout, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("恢复失败: %v\n%s", err, rout)
+	}
+	if b, err := os.ReadFile(filepath.Join(dst, "a.txt")); err != nil || string(b) != "good a" {
+		t.Fatalf("恢复 a.txt: %v %q", err, b)
+	}
+}
+
+

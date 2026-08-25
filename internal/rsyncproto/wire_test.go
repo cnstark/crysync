@@ -190,13 +190,13 @@ func TestMuxFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, isMsg, err := mr.Next()
-	if err != nil || isMsg || string(data) != "hello" {
-		t.Fatalf("数据帧: %q %v %v", data, isMsg, err)
+	data, tag, err := mr.Next()
+	if err != nil || tag != 0 || string(data) != "hello" {
+		t.Fatalf("数据帧: %q %v %v", data, tag, err)
 	}
-	data, isMsg, err = mr.Next()
-	if err != nil || !isMsg || string(data) != "boom" {
-		t.Fatalf("消息帧: %q %v %v", data, isMsg, err)
+	data, tag, err = mr.Next()
+	if err != nil || tag != 1 || string(data) != "boom" {
+		t.Fatalf("消息帧: %q %v %v", data, tag, err)
 	}
 	if _, _, err := mr.Next(); err != io.EOF {
 		t.Fatalf("流结束应返回 EOF: %v", err)

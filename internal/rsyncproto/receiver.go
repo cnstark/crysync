@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -83,6 +84,9 @@ type fileStats struct {
 	chunks  int    // 文件落库块数（refs）
 	stored  int    // 其中新写后端的块数（去重后）
 	blength int32  // delta 块结构参数
+	// badSum：整文件校验和不匹配（客户端读源中途失败发坏校验和，receiver.c
+	// sum_end 比对失败）——该文件不落库，会话继续
+	badSum  bool
 	elapsed time.Duration
 }
 
@@ -168,6 +172,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		literal    int64
 		chunksStored int
 		deleted    int // --delete 移除的行（文件+目录）
+		failed     int // 失败文件（客户端 open 失败 MSG_NO_SEND / 校验和不匹配）
 	}
 	st.files = len(entries)
 	var curPath string
@@ -273,8 +278,30 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		// 变化文件发真实块校验和（delta）；新文件/空文件发空校验和请求（全量 literal）
 		refs, updated, fs, err := receiveFileDelta(ctx, stream, out, ndxOut, ndxIn, r, neg, activeID, e, i, prefix)
 		if err != nil {
+			// 客户端 MSG_NO_SEND（open 失败/vanished，sender.c:722-724）：该文件被
+			// 跳过（无回显无 token 流），客户端已报错（rc=23）——不落库，会话继续
+			var nse *noSendError
+			if errors.As(err, &nse) {
+				if nse.ndx != int32(i) {
+					rollback()
+					return fmt.Errorf("MSG_NO_SEND ndx 错位: %d（当前 %d）", nse.ndx, i)
+				}
+				st.failed++
+				logger.Warn("file_skipped", "path", full(e.Path),
+					"reason", "客户端无法读取源文件（MSG_NO_SEND）")
+				continue
+			}
 			rollback()
 			return fmt.Errorf("文件 %s: %w", e.Path, err)
+		}
+		// 整文件校验和不匹配（客户端读源中途失败发坏校验和）：不落库，发
+		// MSG_ERROR_XFER 使客户端计入 io_error（rc=23），会话继续其余文件
+		if fs.badSum {
+			st.failed++
+			logger.Error("file_verify_failed", "path", full(e.Path),
+				"size", e.Size, "hint", "整文件 MD5 不匹配，客户端读源失败")
+			_ = out.WriteMsg(fmt.Sprintf("file corruption in %q (checksum mismatch)\n", e.Path))
+			continue
 		}
 		switch fs.method {
 		case "quick_check":
@@ -383,6 +410,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		"dirs", st.dirs,
 		"links", st.links,
 		"deleted", st.deleted,
+		"failed", st.failed,
 		"bytes_matched", st.matched,
 		"bytes_literal", st.literal,
 		"chunks_stored", st.chunksStored,
@@ -497,6 +525,7 @@ func applyStaticEntry(txn *repo.SnapshotTxn, e FileEntry, path string) error {
 // + write_sum_head(NULL)（16 字节全 0）→ 客户端 count==0 全量 literal 发送。
 // 用于新文件/空文件/旧行类型不一致（无可作 basis 的旧文件）场景。
 func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, index int) ([]meta.ChunkRef, fileStats, error) {
+	started := time.Now()
 	st := fileStats{method: "full"}
 	// ndx + iflags + 空校验和请求（count/blength/s2length/remainder 各 int32 0 = 16 字节）
 	var buf bytesBuffer
@@ -530,6 +559,7 @@ func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, n
 	data := make([]byte, 0, chunkSize)
 	var refs []meta.ChunkRef
 	var idx int
+	h := md5.New() // 整文件校验和累计（客户端 read 中途失败时发坏校验和，必须比对）
 	flush := func() error {
 		if len(data) == 0 {
 			return nil
@@ -573,6 +603,7 @@ func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, n
 			if _, err := io.ReadFull(stream, tmp); err != nil {
 				return nil, st, err
 			}
+			h.Write(tmp)
 			data = data[:len(data)+take]
 			remaining -= take
 			if len(data) == chunkSize {
@@ -585,9 +616,17 @@ func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, n
 	if err := flush(); err != nil {
 		return nil, st, err
 	}
-	// 整文件强校验和（v1 不校验，读掉）
-	if _, err := io.ReadFull(stream, make([]byte, xferSumLen)); err != nil {
+	// 整文件强校验和（纯 MD5(内容)，与 delta 路径同语义）：不匹配说明客户端
+	// 读源中途失败（sender 发坏校验和）——不落库该文件（此前静默存坏数据），
+	// 调用方记 file_verify_failed 并继续其余文件
+	var wantSum [xferSumLen]byte
+	if _, err := io.ReadFull(stream, wantSum[:]); err != nil {
 		return nil, st, err
+	}
+	if !bytes.Equal(h.Sum(nil), wantSum[:]) {
+		st.badSum = true
+		st.elapsed = time.Since(started)
+		return nil, st, nil
 	}
 	st.chunks = len(refs)
 	return refs, st, nil
@@ -807,14 +846,18 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 	if err := flush(); err != nil {
 		return nil, true, st, err
 	}
-	// 整文件强校验和（纯 MD5(内容)，客户端 sum_end 不混 seed）与重组累计比对
+	// 整文件强校验和（纯 MD5(内容)，客户端 sum_end 不混 seed）与重组累计比对：
+	// 不匹配说明客户端读源中途失败（发坏校验和）——不落库该文件（已存块成孤儿
+	// 由 GC 回收），会话继续其余文件（rsync 同语义：单文件报错，其余正常完成）
 	var wantSum [xferSumLen]byte
 	if _, err := io.ReadFull(stream, wantSum[:]); err != nil {
 		return nil, true, st, err
 	}
 	gotSum := h.Sum(nil)
 	if !bytes.Equal(gotSum, wantSum[:]) {
-		return nil, true, st, fmt.Errorf("整文件校验和不匹配: 重组 %x vs 客户端 %x", gotSum, wantSum)
+		st.badSum = true
+		st.elapsed = time.Since(started)
+		return nil, true, st, nil
 	}
 	st.chunks = len(refs)
 	st.elapsed = time.Since(started)

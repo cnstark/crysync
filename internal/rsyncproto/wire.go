@@ -169,30 +169,43 @@ const (
 	muxTypeMsg byte = 1 // 任意非 0 code 即消息帧（用于命名对齐）
 )
 
+// msgNoSend = MSG_NO_SEND（rsync.h:308，code 102）：客户端 sender open 失败
+// （权限/ vanished 等）时发此消息帧跳过该文件（sender.c:722-724 send_msg_int
+// (MSG_NO_SEND, ndx) 后 continue），载荷为 4 字节 LE int32 ndx。
+const msgNoSend byte = 102
+
+// noSendError 表示客户端以 MSG_NO_SEND 跳过了 ndx 指示的文件（不发回显与
+// token 流）。上层据此放弃该文件并继续下一 ndx——协议随之重新同步。
+type noSendError struct{ ndx int32 }
+
+func (e *noSendError) Error() string {
+	return fmt.Sprintf("客户端跳过文件 (MSG_NO_SEND, ndx=%d)", e.ndx)
+}
+
 type MuxReader struct {
 	r io.Reader
 }
 
 func NewMuxReader(r io.Reader) (*MuxReader, error) { return &MuxReader{r: r}, nil }
 
-// Next 读取一帧；返回（载荷, 是否消息帧, 错误）；EOF 返回 io.EOF。
-func (m *MuxReader) Next() ([]byte, bool, error) {
+// Next 读取一帧；返回（载荷, tag, 错误）；EOF 返回 io.EOF。tag 为协议消息码
+// （0 = 数据帧 MSG_DATA，非 0 为消息帧，如 MSG_INFO=2/MSG_NO_SEND=102）。
+func (m *MuxReader) Next() ([]byte, byte, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(m.r, hdr[:]); err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
 	raw := binary.LittleEndian.Uint32(hdr[:])
 	length := raw & 0xFFFFFF
-	tag := int32(raw>>24) - mplexBase
+	tag := byte(int32(raw>>24) - mplexBase)
 	if length > 64<<20 {
-		return nil, false, fmt.Errorf("非法帧长度: %d", length)
+		return nil, 0, fmt.Errorf("非法帧长度: %d", length)
 	}
 	payload := make([]byte, length)
 	if _, err := io.ReadFull(m.r, payload); err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
-	// code 0（tag 0x07）= 数据帧；其余全部为消息帧（跳过，不得拼入数据流）
-	return payload, byte(tag) != muxTypeData, nil
+	return payload, tag, nil
 }
 
 type MuxWriter struct {
@@ -233,7 +246,7 @@ func NewMuxStream(mr *MuxReader) *MuxStream { return &MuxStream{mr: mr} }
 
 func (s *MuxStream) Read(p []byte) (int, error) {
 	for len(s.remain) == 0 && !s.eof {
-		data, isMsg, err := s.mr.Next()
+		data, tag, err := s.mr.Next()
 		if err == io.EOF {
 			s.eof = true
 			return 0, io.EOF
@@ -241,8 +254,13 @@ func (s *MuxStream) Read(p []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		if isMsg {
-			// 消息帧（MSG_INFO/MSG_ERROR/MSG_NOOP 等）：跳过，不得拼入数据流
+		if tag != muxTypeData {
+			// MSG_NO_SEND（sender open 失败跳过文件）：向上传播打破对回显/token
+			// 流的阻塞——客户端此后不再为该 ndx 发任何数据帧，静默跳过会死锁
+			if tag == msgNoSend && len(data) == 4 {
+				return 0, &noSendError{ndx: int32(binary.LittleEndian.Uint32(data))}
+			}
+			// 其余消息帧（MSG_INFO/MSG_ERROR/MSG_NOOP 等）：跳过，不得拼入数据流
 			continue
 		}
 		s.remain = data
