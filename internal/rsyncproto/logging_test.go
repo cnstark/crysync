@@ -67,7 +67,7 @@ func startLoggedTestServer(t *testing.T) (int, *bytes.Buffer) {
 
 // startLoggedRouterServer 同 startLoggedTestServer 但走 RunSession 双向路由
 // （备份 receiver / 恢复 sender），同一服务器可先备份再恢复。
-func startLoggedRouterServer(t *testing.T) (int, *bytes.Buffer) {
+func startLoggedRouterServer(t *testing.T) (int, *repo.Repo, *bytes.Buffer) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -104,13 +104,13 @@ func startLoggedRouterServer(t *testing.T) (int, *bytes.Buffer) {
 			}(conn)
 		}
 	}()
-	return ln.Addr().(*net.TCPAddr).Port, logBuf
+	return ln.Addr().(*net.TCPAddr).Port, r, logBuf
 }
 
 // TestSessionLogRestore 断言恢复会话日志（session_start dir=restore / entry_sent /
 // file_sent / session_done files+bytes）。
 func TestSessionLogRestore(t *testing.T) {
-	port, logBuf := startLoggedRouterServer(t)
+	port, _, logBuf := startLoggedRouterServer(t)
 
 	src := t.TempDir()
 	os.MkdirAll(filepath.Join(src, "sub"), 0o755)

@@ -167,6 +167,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		matched    int64
 		literal    int64
 		chunksStored int
+		deleted    int // --delete 移除的行（文件+目录）
 	}
 	st.files = len(entries)
 	var curPath string
@@ -330,11 +331,34 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 	}
 
+	// --delete 语义（generator.c delete_in_dir/delete_missing，flist.c:1402）：
+	// 删除传输根（prefix 子树）内、本次 flist 未覆盖的文件与目录行——快照模型
+	// "新快照 = 上一快照完整清单 + 会话变更"下不删除则客户端删掉的文件恢复时复活。
+	// io_error≠0 时禁用（发送侧 flist 构造出错，源清单不完整，删除会误删）。
+	// 覆盖集含全部 flist 条目路径（含跳过未落库的设备/special 与无 target 链接：
+	// 它们仍代表源侧现状，同路径旧数据不删），目录路径归一化无尾斜杠（落库形态）。
+	if neg.DeleteMode && parser.IoError == 0 {
+		covered := make(map[string]bool, len(entries))
+		for _, e := range entries {
+			covered[full(strings.TrimSuffix(e.Path, "/"))] = true
+		}
+		n, err := txn.ApplyDelete(prefix, covered)
+		if err != nil {
+			rollback()
+			return fmt.Errorf("--delete: %w", err)
+		}
+		st.deleted = n
+		if n > 0 {
+			logger.Info("delete_extraneous", "count", n, "prefix", prefix)
+		}
+	}
+
 	// 空 flist 会话（entries=0，如无 -a 的空目录推送——argv 形如
 	// "--server -e.LsfxCIvu --stats . mod/"）：协议走完但不提交快照。BeginSnapshot
 	// 已预建快照行（并复制上一快照清单），提交会使每次此类会话新增一个无变化
-	// 快照，污染快照历史与 prune 保留计算。
-	if len(entries) == 0 {
+	// 快照，污染快照历史与 prune 保留计算。--delete 且确有删除的会话除外
+	// （空源 + --delete = 清空传输根，是有效语义，rsync 同样提交）。
+	if len(entries) == 0 && st.deleted == 0 {
 		rollback()
 		logger.Info("session_done",
 			"snapshot_id", int64(0),
@@ -358,6 +382,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		"skipped", st.skipped,
 		"dirs", st.dirs,
 		"links", st.links,
+		"deleted", st.deleted,
 		"bytes_matched", st.matched,
 		"bytes_literal", st.literal,
 		"chunks_stored", st.chunksStored,

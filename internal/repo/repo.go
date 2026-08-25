@@ -116,6 +116,32 @@ func (t *SnapshotTxn) DeleteFile(path string) error {
 	return t.repo.meta.DeleteFile(t.snapshotID, path)
 }
 
+// ApplyDelete 执行 rsync --delete 语义：删除事务快照中 prefix 子树内、不在
+// covered 路径集合中的行（文件与目录，refcount 级联由 DeleteFile 处理），
+// 返回删除行数。covered 键为落库形态路径（目录无尾斜杠）；范围按 prefix
+// 子树界定（SnapshotFileRows 语义），不殃及模块内其他子路径。调用方须先
+// 确认发送侧无 io_error（rsync 语义：io_error≠0 时禁删，防源清单不完整误删）。
+func (t *SnapshotTxn) ApplyDelete(prefix string, covered map[string]bool) (int, error) {
+	if t.finalized {
+		return 0, errors.New("快照事务已结束")
+	}
+	rows, err := t.repo.SnapshotFileRows(t.snapshotID, prefix)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, row := range rows {
+		if covered[row.Path] {
+			continue
+		}
+		if err := t.DeleteFile(row.Path); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
 func (t *SnapshotTxn) Commit() (int64, error) {
 	if t.finalized {
 		return 0, errors.New("快照事务已结束")

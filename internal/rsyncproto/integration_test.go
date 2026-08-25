@@ -409,7 +409,7 @@ func TestRsyncBackupNoPreserve(t *testing.T) {
 // TestRsyncRestoreNoPreserve `rsync -r`（无 -og/-l）恢复：服务端 sender 不发
 // uid/gid/symlink target 字段（此前无条件发 → 客户端解析错位乱码）。
 func TestRsyncRestoreNoPreserve(t *testing.T) {
-	port, _ := startLoggedRouterServer(t)
+	port, _, _ := startLoggedRouterServer(t)
 
 	src := t.TempDir()
 	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
@@ -446,7 +446,7 @@ func TestRsyncRestoreNoPreserve(t *testing.T) {
 // TestRsyncListOnlyNoRecurse `rsync --list-only`（无 -a/-r）：客户端隐含过滤为单层，
 // 服务端只发顶层一层 flist（此前发整棵树 → rejecting unrequested file-list name）。
 func TestRsyncListOnlyNoRecurse(t *testing.T) {
-	port, _ := startLoggedRouterServer(t)
+	port, _, _ := startLoggedRouterServer(t)
 
 	src := t.TempDir()
 	os.MkdirAll(filepath.Join(src, "docs", "deep"), 0o755)
@@ -583,7 +583,7 @@ func TestRsyncBackupSubpathPrefix(t *testing.T) {
 
 // TestRsyncSubpathRestore P0#2 端到端：子路径备份后从同一子路径恢复。
 func TestRsyncSubpathRestore(t *testing.T) {
-	port, _ := startLoggedRouterServer(t)
+	port, _, _ := startLoggedRouterServer(t)
 	pw := filepath.Join(t.TempDir(), "pw")
 	os.WriteFile(pw, []byte("secret\n"), 0o600)
 
@@ -687,7 +687,7 @@ func TestRsyncCompressRejected(t *testing.T) {
 // TestRsyncCompressRestoreRejected 恢复方向 -az（客户端要求服务端 sender 压缩
 // 发送）同样拒绝。
 func TestRsyncCompressRestoreRejected(t *testing.T) {
-	port, _ := startLoggedRouterServer(t)
+	port, _, _ := startLoggedRouterServer(t)
 	src := t.TempDir()
 	os.WriteFile(filepath.Join(src, "a.txt"), []byte("restore me"), 0o644)
 	pw := filepath.Join(t.TempDir(), "pw")
@@ -750,7 +750,7 @@ func TestRsyncBackupChecksum(t *testing.T) {
 // 服务端 sender 发 flist 时每条 REGULAR 条目尾部同样须附 16 字节内容 MD5
 // （客户端 recv_file_entry 无条件读该段，缺失则整条流错位）。
 func TestRsyncRestoreChecksum(t *testing.T) {
-	port, _ := startLoggedRouterServer(t)
+	port, _, _ := startLoggedRouterServer(t)
 	src := t.TempDir()
 	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
 	os.WriteFile(filepath.Join(src, "a.txt"), []byte("checksum restore"), 0o644)
@@ -784,7 +784,7 @@ func TestRsyncRestoreChecksum(t *testing.T) {
 // 会话失败（rsync rc=12）；修复后设备/特殊条目读完整字段流但跳过落库（警告日志 +
 // 客户端提示），其余文件正常备份，rsync rc=0，恢复结果中无 FIFO。
 func TestRsyncBackupFifoSpecial(t *testing.T) {
-	port, logBuf := startLoggedRouterServer(t)
+	port, _, logBuf := startLoggedRouterServer(t)
 
 	src := t.TempDir()
 	os.WriteFile(filepath.Join(src, "a.txt"), []byte("fifo test"), 0o644)
@@ -893,3 +893,125 @@ func TestRsyncSourceMissingNoHang(t *testing.T) {
 		t.Fatalf("失败会话不应产生快照: %d", sid)
 	}
 }
+
+// TestRsyncDeleteSemantics P1#7：--delete 备份的快照语义——传输根（子路径前缀）
+// 内、本次 flist 未覆盖的文件与目录行应从新快照删除（此前永远复制保留，恢复时
+// "复活"客户端已删除的文件）。同时验证：范围界定（其他子路径不受影响）、旧快照
+// 不可变（历史时间点恢复仍含已删文件）。io_error 联动（源缺失时禁删）由
+// TestRsyncSourceMissingIoErrorNoDelete 覆盖。
+func TestRsyncDeleteSemantics(t *testing.T) {
+	port, r, _ := startLoggedRouterServer(t)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
+	os.MkdirAll(filepath.Join(src, "emptydir"), 0o755)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("keep"), 0o644)
+	os.WriteFile(filepath.Join(src, "sub", "b.txt"), []byte("gone"), 0o644)
+	os.WriteFile(filepath.Join(src, "emptydir", "keep.txt"), []byte("gone dir"), 0o644)
+	// 另一子路径先备份：验证 --delete 范围界定不殃及
+	other := t.TempDir()
+	os.WriteFile(filepath.Join(other, "x.txt"), []byte("other"), 0o644)
+
+	rsyncRun := func(args ...string) {
+		t.Helper()
+		base := []string{"--password-file=" + pw, "--port", fmt.Sprint(port)}
+		if out, err := exec.Command("rsync", append(base, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("rsync %v 失败: %v\n%s", args, err, out)
+		}
+	}
+	rowsOf := func(sid int64) map[string]bool {
+		t.Helper()
+		files, err := r.GetFilesForTest(sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := map[string]bool{}
+		for _, f := range files {
+			m[f.Path] = true
+		}
+		return m
+	}
+
+	rsyncRun("-a", other+"/", "backup@127.0.0.1::home/other/")
+	rsyncRun("-a", src+"/", "backup@127.0.0.1::home/del/")
+	sid1, err := r.LatestSnapshotID()
+	if err != nil || sid1 == 0 {
+		t.Fatalf("首次备份应产生快照: %d %v", sid1, err)
+	}
+	if m := rowsOf(sid1); !m["del/sub/b.txt"] || !m["del/emptydir/keep.txt"] || !m["other/x.txt"] {
+		t.Fatalf("首次备份清单不符: %v", m)
+	}
+
+	// 客户端删除 b.txt 与整个 emptydir 后 --delete 推送
+	os.Remove(filepath.Join(src, "sub", "b.txt"))
+	os.RemoveAll(filepath.Join(src, "emptydir"))
+	rsyncRun("-a", "--delete", src+"/", "backup@127.0.0.1::home/del/")
+	sid2, err := r.LatestSnapshotID()
+	if err != nil || sid2 == sid1 {
+		t.Fatalf("--delete 推送应产生新快照: %d %v", sid2, err)
+	}
+	m2 := rowsOf(sid2)
+	if m2["del/sub/b.txt"] || m2["del/emptydir"] || m2["del/emptydir/keep.txt"] {
+		t.Fatalf("--delete 后客户端已删条目应从新快照消失: %v", m2)
+	}
+	if !m2["del/a.txt"] || !m2["del/sub"] || !m2["other/x.txt"] {
+		t.Fatalf("--delete 不应误删保留条目/其他子路径: %v", m2)
+	}
+	// 旧快照不可变：历史时间点仍含已删文件（快照系统的核心属性）
+	if m1 := rowsOf(sid1); !m1["del/sub/b.txt"] {
+		t.Fatalf("旧快照不应被 --delete 改动: %v", m1)
+	}
+	// 恢复验证：b.txt / emptydir 不复活
+	dst := t.TempDir()
+	rsyncRun("-a", "backup@127.0.0.1::home/del/", dst+"/")
+	if _, err := os.Stat(filepath.Join(dst, "sub", "b.txt")); !os.IsNotExist(err) {
+		t.Fatalf("已删文件不应恢复复活: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "emptydir")); !os.IsNotExist(err) {
+		t.Fatalf("已删目录不应恢复复活: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dst, "a.txt")); err != nil || string(b) != "keep" {
+		t.Fatalf("a.txt 应完好: %v %q", err, b)
+	}
+}
+
+// TestRsyncSourceMissingIoErrorNoDelete P1#7/P1#8 联动：rsync 语义 io_error≠0 时
+// 禁用删除（flist.c:1402：发送侧出错时源清单不完整，删除会误删）。先备份有效
+// 数据，再用源缺失 + --delete 推送——不应清空已有数据。
+func TestRsyncSourceMissingIoErrorNoDelete(t *testing.T) {
+	port, r, _ := startLoggedRouterServer(t)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("keep"), 0o644)
+	base := []string{"--password-file=" + pw, "--port", fmt.Sprint(port)}
+	if out, err := exec.Command("rsync", append([]string{"-a"}, append(base, src+"/", "backup@127.0.0.1::home/")...)...).CombinedOutput(); err != nil {
+		t.Fatalf("首次备份失败: %v\n%s", err, out)
+	}
+	sid1, _ := r.LatestSnapshotID()
+	if sid1 == 0 {
+		t.Fatal("首次备份应产生快照")
+	}
+
+	// 源目录消失 + --delete：客户端 sender io_error=1，服务端必须禁删
+	cmd := exec.Command("rsync", append([]string{"-a", "--delete"},
+		append(base, filepath.Join(src, "gone-sub")+"/", "backup@127.0.0.1::home/")...)...)
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("源缺失 + --delete 应报错:\n%s", out)
+	}
+	// 最新快照（若产生）不得丢失 a.txt
+	sid, _ := r.LatestSnapshotID()
+	if sid != sid1 {
+		files, _ := r.GetFilesForTest(sid)
+		for _, f := range files {
+			if f.Path == "a.txt" {
+				return // 数据仍在
+			}
+		}
+		t.Fatalf("io_error 会话删除了已有数据: %v", files)
+	}
+}
+
