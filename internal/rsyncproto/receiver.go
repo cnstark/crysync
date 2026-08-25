@@ -323,6 +323,21 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 	}
 
+	// 空 flist 会话（entries=0，如无 -a 的空目录推送——argv 形如
+	// "--server -e.LsfxCIvu --stats . mod/"）：协议走完但不提交快照。BeginSnapshot
+	// 已预建快照行（并复制上一快照清单），提交会使每次此类会话新增一个无变化
+	// 快照，污染快照历史与 prune 保留计算。
+	if len(entries) == 0 {
+		rollback()
+		logger.Info("session_done",
+			"snapshot_id", int64(0),
+			"files", 0,
+			"empty_session", true,
+			"elapsed_ms", time.Since(started).Milliseconds(),
+		)
+		return nil
+	}
+
 	// 协议全部成功，才提交快照
 	sid, err := txn.Commit()
 	if err != nil {

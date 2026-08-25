@@ -823,3 +823,41 @@ func TestRsyncBackupFifoSpecial(t *testing.T) {
 		t.Fatal("恢复结果不应包含 myfifo")
 	}
 }
+
+// TestRsyncEmptySessionNoSnapshot P1#6：空 flist 备份会话（无 -a 的空目录推送，
+// argv 形如 "--server -e.LsfxCIvu --stats . home/"，entries=0）不应提交快照——
+// 此前每次此类会话都新增一个无变化快照，污染快照历史与 prune 保留计算。
+func TestRsyncEmptySessionNoSnapshot(t *testing.T) {
+	port, r := startTestServer(t)
+
+	empty := t.TempDir() // 空目录
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("keep"), 0o644)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	push := func(args ...string) {
+		t.Helper()
+		base := []string{"--password-file=" + pw, "--port", fmt.Sprint(port)}
+		if out, err := exec.Command("rsync", append(base, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("rsync %v 失败: %v\n%s", args, err, out)
+		}
+	}
+
+	// 空模块上的空会话：不产生任何快照
+	push("--stats", empty+"/", "backup@127.0.0.1::home/")
+	if sid, _ := r.LatestSnapshotID(); sid != 0 {
+		t.Fatalf("空模块空会话不应产生快照: %d", sid)
+	}
+	// 正常备份一个文件
+	push("-a", src+"/", "backup@127.0.0.1::home/")
+	sid1, err := r.LatestSnapshotID()
+	if err != nil || sid1 == 0 {
+		t.Fatalf("正常备份应产生快照: %d %v", sid1, err)
+	}
+	// 已有快照的空会话：不新增快照
+	push("--stats", empty+"/", "backup@127.0.0.1::home/")
+	if sid, _ := r.LatestSnapshotID(); sid != sid1 {
+		t.Fatalf("空会话不应新增快照: %d != %d", sid, sid1)
+	}
+}
