@@ -861,3 +861,35 @@ func TestRsyncEmptySessionNoSnapshot(t *testing.T) {
 		t.Fatalf("空会话不应新增快照: %d != %d", sid, sid1)
 	}
 }
+
+// TestRsyncSourceMissingNoHang P1#8：客户端源目录不存在（sender io_error=1）时
+// flist 结尾发 XMIT_IO_ERROR_ENDLIST(0x1004)+varint 哨兵（flist.c:2388-2391）。
+// 此前解析器把哨兵当普通条目读字段流 → 错位卡死到连接超时；修复后服务端识别
+// 哨兵结束 flist，会话快速正常收尾（客户端自身报 link_stat 错误 rc=23），不产生快照。
+func TestRsyncSourceMissingNoHang(t *testing.T) {
+	port, r := startTestServer(t)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	missing := filepath.Join(t.TempDir(), "no-such-dir")
+	done := make(chan struct{})
+	var out []byte
+	var rerr error
+	go func() {
+		cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+			missing+"/", "backup@127.0.0.1::home/")
+		out, rerr = cmd.CombinedOutput()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("源目录缺失的会话不应挂起（IO_ERROR_ENDLIST 未识别）")
+	}
+	if rerr == nil {
+		t.Fatalf("客户端应报源缺失错误:\n%s", out)
+	}
+	if sid, _ := r.LatestSnapshotID(); sid != 0 {
+		t.Fatalf("失败会话不应产生快照: %d", sid)
+	}
+}

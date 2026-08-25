@@ -122,6 +122,13 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 		entries = append(entries, e)
 	}
+	// IO_ERROR_ENDLIST 哨兵携带发送侧 io_error 位（源消失/vanished 文件等）：
+	// 会话继续处理已收条目，但错误必须可见（真实 rsync 客户端此时退出码 23）；
+	// P1#7 的 --delete 实现须在 io_error≠0 时禁用删除（flist.c:1402 语义）
+	if parser.IoError != 0 {
+		logger.Warn("flist_io_error", "io_error", parser.IoError,
+			"hint", "发送侧 flist 构造时出错（源消失等），已收条目仍处理")
+	}
 	// 按 f_name_cmp 排序（flist.c:3217）：generator 遍历 sorted 数组发 ndx
 	// （generator.c:2316-2322），传输阶段索引必须与真实 rsync 的 sorted 顺序一致
 	entries = SortFlistEntries(entries)

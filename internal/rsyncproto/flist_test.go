@@ -383,6 +383,48 @@ func TestParseDeviceSpecial(t *testing.T) {
 	}
 }
 
+// TestParseIoErrorEndlist P1#8：发送侧出错（源目录消失/vanished 文件）时 flist
+// 结尾用 XMIT_EXTENDED_FLAGS|XMIT_IO_ERROR_ENDLIST(0x1004) 短整型 + varint
+// io_error 替代单字节 0（flist.c:2388-2391 发送侧 / 2960-2970 接收侧）。解析器
+// 必须识别为列表结束并读掉 io_error，否则字段流错位、会话卡死。
+func TestParseIoErrorEndlist(t *testing.T) {
+	var buf bytes.Buffer
+	// 一条正常条目
+	buf.WriteByte(byte(XmitSameTime | XmitSameUID | XmitSameGID))
+	buf.WriteByte(5)
+	buf.WriteString("a.txt")
+	WriteVarlong30(&buf, 3)
+	WriteInt32(&buf, 0o100644)
+	// IO_ERROR_ENDLIST 哨兵：shortint 0x1004 + varint io_error=3
+	WriteShortint(&buf, uint16(XmitExtended|XmitIoErrorEndlist))
+	WriteVarint(&buf, 3)
+
+	p := NewFlistParser()
+	r := bytes.NewReader(buf.Bytes())
+	e, err := p.Parse(r, true, true, true, true, false)
+	if err != nil {
+		t.Fatalf("条目 1 解析失败: %v", err)
+	}
+	if e.Path != "a.txt" {
+		t.Fatalf("条目 1 解析错误: %+v", e)
+	}
+	if _, err := p.Parse(r, true, true, true, true, false); err != ErrFlistEnd {
+		t.Fatalf("应识别 IO_ERROR_ENDLIST 为列表结束，得到 %v", err)
+	}
+	if p.IoError != 3 {
+		t.Fatalf("应记录 io_error=3，得到 %d", p.IoError)
+	}
+	// 无 io_error 的普通哨兵不受影响
+	p2 := NewFlistParser()
+	r2 := bytes.NewReader([]byte{0})
+	if _, err := p2.Parse(r2, false, false, false, false, false); err != ErrFlistEnd {
+		t.Fatalf("普通哨兵应返回 ErrFlistEnd，得到 %v", err)
+	}
+	if p2.IoError != 0 {
+		t.Fatalf("普通哨兵不应设置 io_error: %d", p2.IoError)
+	}
+}
+
 // TestParseDeviceNoPreserveDevices preserve_devices off（如 `rsync -r`）时 CHR 条目
 // 无 rdev 字节（防御分支，flist.c:1043-1051：设备条目 file_length 仍清零）。
 func TestParseDeviceNoPreserveDevices(t *testing.T) {

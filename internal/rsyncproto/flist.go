@@ -24,6 +24,7 @@ const (
 	XmitGroupNameFollows = uint32(1 << 11)
 	XmitModNsec          = uint32(1 << 13) // protocol 31+
 	XmitSameAtime        = uint32(1 << 14)
+	XmitIoErrorEndlist   = uint32(1 << 12) // flist 结尾哨兵变体（protocols 31+，w/ EXTENDED）：后跟 varint io_error（rsync.h:65）
 )
 
 // S_IFMT 等类型位（stat(2)）
@@ -267,6 +268,9 @@ type FlistParser struct {
 	lastMTime int64  // SAME_TIME 复用上一条 mtime
 	lastUID   int    // SAME_UID 复用上一条 uid
 	lastGID   int    // SAME_GID 复用上一条 gid
+	// IoError：列表以 IO_ERROR_ENDLIST 哨兵结束时携带的发送侧 io_error 位
+	// （调用方读取——rsync 语义：io_error 非零时接收侧禁用删除，generator.c）
+	IoError int32
 }
 
 func NewFlistParser() *FlistParser { return &FlistParser{} }
@@ -296,6 +300,18 @@ func (p *FlistParser) Parse(r io.Reader, preserveUID, preserveGID, preserveLinks
 			return e, err
 		}
 		xflags = (xflags & 0xFF) | uint32(b2)<<8
+		// IO_ERROR_ENDLIST 哨兵（flist.c:2960-2970 接收侧）：发送侧曾出错
+		// （源消失/vanished 文件等）时 flist 结尾以 EXTENDED|IO_ERROR_ENDLIST
+		// 短整型 + varint io_error 替代单字节 0——视同列表结束，错误值记入
+		// IoError 供调用方处置（会话继续处理已收条目，与 rsync 一致）。
+		if xflags == XmitExtended|XmitIoErrorEndlist {
+			ioErr, err := ReadVarint(r)
+			if err != nil {
+				return e, err
+			}
+			p.IoError = ioErr
+			return e, ErrFlistEnd
+		}
 		xflags &^= XmitExtended // 清除格式标记位
 	}
 
