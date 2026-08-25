@@ -30,6 +30,7 @@ func logNegotiated(logger *slog.Logger, neg *Negotiation) {
 		"sender_mode", neg.SenderMode,
 		"preserve_uid", neg.PreserveUID,
 		"preserve_gid", neg.PreserveGID,
+		"preserve_devices", neg.PreserveDevices,
 		"delete_mode", neg.DeleteMode,
 		"numeric_ids", neg.NumericIDs,
 	)
@@ -51,6 +52,9 @@ func RunReceiver(ctx context.Context, br *bufio.Reader, w io.Writer, module *con
 		return err
 	}
 	mw := NewMuxWriter(w)
+	if err := rejectCompression(mw, neg); err != nil {
+		return err
+	}
 	return processSession(ctx, mr, mw, module, r, neg, logger)
 }
 
@@ -109,7 +113,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		e, err := parser.Parse(stream)
+		e, err := parser.Parse(stream, neg.PreserveUID, neg.PreserveGID, neg.PreserveLinks, neg.PreserveDevices, neg.ChecksumMode)
 		if err == ErrFlistEnd {
 			break
 		}
@@ -122,7 +126,22 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 	// （generator.c:2316-2322），传输阶段索引必须与真实 rsync 的 sorted 顺序一致
 	entries = SortFlistEntries(entries)
 
-	logger.Info("session_start", "dir", "backup",
+	// 子路径前缀（与 sender 方向 modulePrefix 对称）：flist 条目名相对传输根，
+	// 落库路径与 quick check 基准查询必须加模块子路径前缀，否则子路径备份
+	// 落库到模块根（多客户端子路径互相覆盖、子路径恢复必然空）。
+	prefix := modulePrefix(neg.ModuleArg, module.Name)
+	full := func(p string) string {
+		switch {
+		case prefix == "":
+			return p
+		case p == "":
+			return prefix
+		default:
+			return prefix + "/" + p
+		}
+	}
+
+	logger.Info("session_start", "dir", "backup", "prefix", prefix,
 		"argv", strings.Join(neg.Argv, " "), "entries", len(entries))
 
 	// id list：非增量模式下紧跟 flist 哨兵（uidlist.c:460-479；按 preserve 条件）
@@ -172,7 +191,9 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 		curPath = e.Path
 		if e.Path == "" {
-			// 顶层目录 "."（cleanPath 拒绝）：不落库，但仍需走 ndx 协议交互
+			// 顶层目录 "."（cleanPath 拒绝）：模块根时不落库，但仍需走 ndx 协议交互；
+			// 子路径备份时 "." 是传输根目录（prefix）自身的属性，落为 prefix 目录行，
+			// 恢复方向以子路径拉取时化身 "."（sender 侧 f.Path==prefix 分支）
 			if !e.IsDir {
 				rollback()
 				return fmt.Errorf("flist 条目 %d: 非法路径", i)
@@ -181,18 +202,55 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 				rollback()
 				return fmt.Errorf("条目 %d: %w", i, err)
 			}
+			if prefix != "" {
+				if err := applyStaticEntry(txn, e, prefix); err != nil {
+					rollback()
+					return fmt.Errorf("落库 %s: %w", prefix, err)
+				}
+				st.dirs++
+				logger.Info("entry", "path", prefix, "type", "dir",
+					"mode", fmt.Sprintf("%o", e.Mode), "uid", e.UID, "gid", e.GID,
+					"mtime", e.MTimeNs / 1e9)
+			}
 			continue
 		}
-		if e.IsDir || e.IsSymlink {
+		// 设备/特殊文件（CHR/BLK/FIFO/SOCK）：协议交互照常（无内容传输，回显
+		// ndx+iflags，与目录/链接同路径），但 v1 快照模型无设备语义——跳过落库，
+		// 警告日志 + MSG_INFO 客户端提示，会话继续（备份 /var 类含 FIFO 的目录
+		// 是真实场景，此前整会话失败不可接受）
+		if mt := e.Mode & sIfmt; mt == sIfChr || mt == sIfBlk || mt == sIfFifo || mt == sIfSock {
+			logger.Warn("skip_special_file", "path", full(e.Path),
+				"mode", fmt.Sprintf("%o", e.Mode),
+				"hint", "v1 暂不支持设备/特殊文件，未备份")
+			_ = out.WriteInfoMsg(fmt.Sprintf(
+				"skipping non-regular file %q (device/special files are not supported by this server)\n", e.Path))
 			if err := driveEntry(out, stream, ndxOut, ndxIn, i, itemIsNew); err != nil {
 				rollback()
 				return fmt.Errorf("条目 %d: %w", i, err)
 			}
-			if err := applyStaticEntry(txn, e); err != nil {
-				rollback()
-				return fmt.Errorf("落库 %s: %w", e.Path, err)
+			continue
+		}
+		if e.IsDir || e.IsSymlink {
+			// preserve off（无 -l）收到的 symlink 无 target 字段，无法恢复——
+			// 跳过落库并警告（协议本身合法，客户端未发送该信息）
+			if e.IsSymlink && e.LinkTarget == "" {
+				logger.Warn("skip_link_no_target",
+					"path", e.Path, "hint", "客户端未启用 -l（preserve links），symlink 未备份")
+				if err := driveEntry(out, stream, ndxOut, ndxIn, i, itemIsNew); err != nil {
+					rollback()
+					return fmt.Errorf("条目 %d: %w", i, err)
+				}
+				continue
 			}
-			attrs := []any{"path", e.Path, "mode", fmt.Sprintf("%o", e.Mode),
+			if err := driveEntry(out, stream, ndxOut, ndxIn, i, itemIsNew); err != nil {
+				rollback()
+				return fmt.Errorf("条目 %d: %w", i, err)
+			}
+			if err := applyStaticEntry(txn, e, full(e.Path)); err != nil {
+				rollback()
+				return fmt.Errorf("落库 %s: %w", full(e.Path), err)
+			}
+			attrs := []any{"path", full(e.Path), "mode", fmt.Sprintf("%o", e.Mode),
 				"uid", e.UID, "gid", e.GID, "mtime", e.MTimeNs / 1e9}
 			if e.IsSymlink {
 				st.links++
@@ -205,7 +263,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 		// 普通文件：quick check 命中不发请求（不落库，CopyFiles 已继承旧行与 chunk 关联）；
 		// 变化文件发真实块校验和（delta）；新文件/空文件发空校验和请求（全量 literal）
-		refs, updated, fs, err := receiveFileDelta(ctx, stream, out, ndxOut, ndxIn, r, neg, activeID, e, i)
+		refs, updated, fs, err := receiveFileDelta(ctx, stream, out, ndxOut, ndxIn, r, neg, activeID, e, i, prefix)
 		if err != nil {
 			rollback()
 			return fmt.Errorf("文件 %s: %w", e.Path, err)
@@ -219,7 +277,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		st.matched += fs.matched
 		st.literal += fs.literal
 		st.chunksStored += fs.stored
-		fields := []any{"path", e.Path, "size", e.Size, "mtime", e.MTimeNs / 1e9,
+		fields := []any{"path", full(e.Path), "size", e.Size, "mtime", e.MTimeNs / 1e9,
 			"mode", fmt.Sprintf("%o", e.Mode), "uid", e.UID, "gid", e.GID,
 			"method", fs.method}
 		switch fs.method {
@@ -233,11 +291,11 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		logger.Info("file", fields...)
 		if updated { // quick check 命中不落库：CopyFiles 已继承旧行与 chunk 关联
 			if err := txn.UpsertFile(meta.FileRow{
-				Path: e.Path, Mode: e.Mode, UID: e.UID, GID: e.GID,
+				Path: full(e.Path), Mode: e.Mode, UID: e.UID, GID: e.GID,
 				Size: e.Size, MTimeNs: e.MTimeNs,
 			}, refs); err != nil {
 				rollback()
-				return fmt.Errorf("落库 %s: %w", e.Path, err)
+				return fmt.Errorf("落库 %s: %w", full(e.Path), err)
 			}
 		}
 	}
@@ -369,18 +427,19 @@ func (w *bytesBuffer) Write(p []byte) (int, error) {
 
 func (w *bytesBuffer) Bytes() []byte { return w.b }
 
-// applyStaticEntry：目录/符号链接条目（无内容传输）。
-func applyStaticEntry(txn *repo.SnapshotTxn, e FileEntry) error {
+// applyStaticEntry：目录/符号链接条目（无内容传输）。path 为库内全路径
+// （已含子路径前缀；调用方对子路径备份的顶层 "." 传 prefix 自身）。
+func applyStaticEntry(txn *repo.SnapshotTxn, e FileEntry, path string) error {
 	if e.IsSymlink {
 		return txn.UpsertFile(meta.FileRow{
-			Path: e.Path, IsSymlink: true, Mode: e.Mode,
+			Path: path, IsSymlink: true, Mode: e.Mode,
 			UID: e.UID, GID: e.GID, MTimeNs: e.MTimeNs, LinkTarget: e.LinkTarget,
 		}, nil)
 	}
 	if e.IsDir {
 		// 目录路径统一去尾斜杠后落库
 		return txn.UpsertFile(meta.FileRow{
-			Path: strings.TrimSuffix(e.Path, "/"), IsDir: true, Mode: e.Mode,
+			Path: strings.TrimSuffix(path, "/"), IsDir: true, Mode: e.Mode,
 			UID: e.UID, GID: e.GID, MTimeNs: e.MTimeNs,
 		}, nil)
 	}
@@ -505,10 +564,16 @@ func writeNullSumHead(w io.Writer) error {
 //  3. 变化文件：第一遍读旧文件算块校验和表 → 发 ndx+iflags+sum_head+块校验和
 //     → 读回显 → token 流（match 从旧文件流复制 + literal 直收）按 4MiB 重组
 //     StoreChunk → 读 16B 整文件 MD5 与重组累计比对。
-func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, neg *Negotiation, activeID int64, e FileEntry, index int) ([]meta.ChunkRef, bool, fileStats, error) {
+//
+// 查询/落库均用库内全路径（prefix + e.Path），与 sender 方向子路径恢复对称。
+func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, neg *Negotiation, activeID int64, e FileEntry, index int, prefix string) ([]meta.ChunkRef, bool, fileStats, error) {
 	started := time.Now()
 	st := fileStats{method: "delta"}
-	row, ok, err := r.GetFileRow(activeID, e.Path)
+	fullPath := e.Path
+	if prefix != "" {
+		fullPath = prefix + "/" + e.Path
+	}
+	row, ok, err := r.GetFileRow(activeID, fullPath)
 	if err != nil {
 		return nil, true, st, err
 	}
@@ -529,7 +594,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 	// --- delta 路径：旧文件为 basis ---
 	// 第一遍读旧文件计算块校验和表（len 取旧文件大小：sum 表描述 basis 块结构，
 	// 客户端按收到的 blength 匹配自己的新文件）
-	tbl, err := calcBlockSumsFromRepo(r, activeID, e.Path, row.Size, neg.ChecksumSeed)
+	tbl, err := calcBlockSumsFromRepo(r, activeID, fullPath, row.Size, neg.ChecksumSeed)
 	if err != nil {
 		return nil, true, st, fmt.Errorf("计算块校验和: %w", err)
 	}
@@ -570,7 +635,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 		return nil, true, st, fmt.Errorf("回显 sum_head 与发送不一致: %v", echo)
 	}
 	// 第二遍读旧文件（basisReader 短连接逐块读）供 match 块复制
-	br := &basisReader{r: r, snapshotID: activeID, path: e.Path, fileSize: row.Size}
+	br := &basisReader{r: r, snapshotID: activeID, path: fullPath, fileSize: row.Size}
 
 	// token 循环 + 4MiB 重组 + MD5 累计
 	chunkSize := r.ChunkSizeBytes()

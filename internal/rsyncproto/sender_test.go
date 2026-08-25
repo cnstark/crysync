@@ -96,7 +96,7 @@ func (c *senderClient) readFlist() []FileEntry {
 	p := NewFlistParser()
 	var out []FileEntry
 	for {
-		e, err := p.Parse(c.stream)
+		e, err := p.Parse(c.stream, true, true, true, false, false)
 		if err == ErrFlistEnd {
 			return out
 		}
@@ -319,7 +319,7 @@ func TestSenderSession(t *testing.T) {
 	defer connC.Close()
 
 	module := &config.ModuleConfig{Name: "home"}
-	neg := &Negotiation{PreserveUID: true, PreserveGID: true, ChecksumSeed: 42}
+	neg := &Negotiation{PreserveUID: true, PreserveGID: true, PreserveLinks: true, Recurse: true, ChecksumSeed: 42}
 	done := make(chan error, 1)
 	go func() {
 		done <- processSendSession(context.Background(), mustMux(connS), mustMuxW(connS), module, r, neg, nil)
@@ -406,7 +406,7 @@ func TestSenderSessionDelStats(t *testing.T) {
 	defer connC.Close()
 
 	module := &config.ModuleConfig{Name: "home"}
-	neg := &Negotiation{ChecksumSeed: 0, PreserveUID: true}
+	neg := &Negotiation{ChecksumSeed: 0, PreserveUID: true, PreserveLinks: true, Recurse: true}
 	done := make(chan error, 1)
 	go func() {
 		done <- processSendSession(context.Background(), mustMux(connS), mustMuxW(connS), module, r, neg, nil)

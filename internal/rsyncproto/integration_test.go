@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -355,5 +356,470 @@ func TestRsyncMixedSecondBackupDelta(t *testing.T) {
 	files1, _ := r.GetFilesForTest(1)
 	if len(files1) != 3 {
 		t.Fatalf("首次快照应有 3 个条目: %v", files1)
+	}
+}
+
+// --- P0#1 preserve 选项矩阵回归（review 2026-08-24 #1）---
+
+// TestRsyncBackupNoPreserve `rsync -r`（无 -og/-l）备份：客户端不发 uid/gid/symlink
+// target 字段，服务端 Parse 需按 preserve 前提跳过（此前无条件读 → 死锁）。
+// symlink 无 target：跳过落库并告警。
+func TestRsyncBackupNoPreserve(t *testing.T) {
+	port, r := startTestServer(t)
+
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("no preserve"), 0o644)
+	os.WriteFile(filepath.Join(src, "sub", "b.txt"), []byte("nested"), 0o644)
+	os.Symlink("a.txt", filepath.Join(src, "link1"))
+
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-r", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rsync -r 备份失败: %v\n%s", err, out)
+	}
+
+	sid, err := r.LatestSnapshotID()
+	if err != nil || sid == 0 {
+		t.Fatalf("应产生快照: %d %v", sid, err)
+	}
+	files, _ := r.GetFilesForTest(sid)
+	got := map[string]bool{}
+	for _, f := range files {
+		got[f.Path] = true
+	}
+	// 文件与目录正常落库；link1 无 target 跳过
+	for _, want := range []string{"a.txt", "sub", "sub/b.txt"} {
+		if !got[want] {
+			t.Fatalf("快照缺少 %s: %v", want, files)
+		}
+	}
+	if got["link1"] {
+		t.Fatalf("无 target 的 symlink 应跳过落库: %v", files)
+	}
+	var out bytes.Buffer
+	if err := r.ReadFile(sid, "a.txt", &out); err != nil || out.String() != "no preserve" {
+		t.Fatalf("a.txt 内容: %v %q", err, out.String())
+	}
+}
+
+// TestRsyncRestoreNoPreserve `rsync -r`（无 -og/-l）恢复：服务端 sender 不发
+// uid/gid/symlink target 字段（此前无条件发 → 客户端解析错位乱码）。
+func TestRsyncRestoreNoPreserve(t *testing.T) {
+	port, _ := startLoggedRouterServer(t)
+
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("restore content"), 0o644)
+	os.WriteFile(filepath.Join(src, "sub", "b.txt"), []byte("nested"), 0o644)
+	os.Symlink("a.txt", filepath.Join(src, "link1"))
+
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	// 先 -a 备份
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("备份失败: %v\n%s", err, out)
+	}
+	// 无 preserve 恢复（rsync -r，无 -l/-og）
+	dst := t.TempDir()
+	cmd = exec.Command("rsync", "-r", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/", dst+"/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rsync -r 恢复失败: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if err != nil || string(data) != "restore content" {
+		t.Fatalf("恢复 a.txt: %v %q", err, data)
+	}
+	data, err = os.ReadFile(filepath.Join(dst, "sub", "b.txt"))
+	if err != nil || string(data) != "nested" {
+		t.Fatalf("恢复 sub/b.txt: %v %q", err, data)
+	}
+}
+
+// TestRsyncListOnlyNoRecurse `rsync --list-only`（无 -a/-r）：客户端隐含过滤为单层，
+// 服务端只发顶层一层 flist（此前发整棵树 → rejecting unrequested file-list name）。
+func TestRsyncListOnlyNoRecurse(t *testing.T) {
+	port, _ := startLoggedRouterServer(t)
+
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "docs", "deep"), 0o755)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("top level"), 0o644)
+	os.WriteFile(filepath.Join(src, "docs", "readme.md"), []byte("second level"), 0o644)
+	os.WriteFile(filepath.Join(src, "docs", "deep", "file.txt"), []byte("third"), 0o644)
+
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("备份失败: %v\n%s", err, out)
+	}
+	// --list-only 无 -r：只列一层
+	cmd = exec.Command("rsync", "--list-only", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("rsync --list-only 失败: %v\n%s", err, out)
+	}
+	list := string(out)
+	if !strings.Contains(list, "a.txt") || !strings.Contains(list, "docs") {
+		t.Fatalf("列表应含顶层条目:\n%s", list)
+	}
+	if strings.Contains(list, "readme.md") || strings.Contains(list, "deep") {
+		t.Fatalf("无 -r 时不应列出深层条目:\n%s", list)
+	}
+}
+
+// TestRsyncBackupRL `rsync -rl`（有 l 无 -og）混合组合：symlink target 在 wire 上、
+// uid/gid 不在。
+func TestRsyncBackupRL(t *testing.T) {
+	port, r := startTestServer(t)
+
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("rl test"), 0o644)
+	os.Symlink("a.txt", filepath.Join(src, "link1"))
+
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-rl", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rsync -rl 备份失败: %v\n%s", err, out)
+	}
+
+	sid, _ := r.LatestSnapshotID()
+	if sid == 0 {
+		t.Fatal("应产生快照")
+	}
+	files, _ := r.GetFilesForTest(sid)
+	got := map[string]string{}
+	for _, f := range files {
+		got[f.Path] = f.LinkTarget
+	}
+	if got["link1"] != "a.txt" {
+		t.Fatalf("-rl 时 symlink target 应落库: %v", files)
+	}
+}
+
+// TestRsyncBackupSubpathPrefix P0#2：子路径备份落库必须带前缀。
+// `rsync -a src/ host::mod/sub1/` 的 flist 条目名相对传输根（a.txt 等），
+// 落库路径应为 sub1/a.txt；两个子路径备份互不覆盖；quick check 基准也按
+// 子路径前缀查询（二次备份子路径零传输，且不误命中其他子路径的旧文件）。
+func TestRsyncBackupSubpathPrefix(t *testing.T) {
+	port, r := startTestServer(t)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	src1 := t.TempDir()
+	os.MkdirAll(filepath.Join(src1, "sub"), 0o755)
+	os.WriteFile(filepath.Join(src1, "a.txt"), []byte("from sub1"), 0o644)
+	os.WriteFile(filepath.Join(src1, "sub", "b.txt"), []byte("nested sub1"), 0o644)
+
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src1+"/", "backup@127.0.0.1::home/sub1/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("子路径备份失败: %v\n%s", err, out)
+	}
+
+	sid, _ := r.LatestSnapshotID()
+	files, _ := r.GetFilesForTest(sid)
+	got := map[string]bool{}
+	for _, f := range files {
+		got[f.Path] = true
+	}
+	if !got["sub1/a.txt"] || !got["sub1/sub/b.txt"] || !got["sub1/sub"] {
+		t.Fatalf("子路径备份应带 sub1/ 前缀落库: %v", files)
+	}
+	if got["a.txt"] || got["sub/b.txt"] {
+		t.Fatalf("子路径备份不应落库到模块根: %v", files)
+	}
+	var out bytes.Buffer
+	if err := r.ReadFile(sid, "sub1/a.txt", &out); err != nil || out.String() != "from sub1" {
+		t.Fatalf("读取 sub1/a.txt: %v %q", err, out.String())
+	}
+
+	// 第二个子路径：同名文件不同内容，互不覆盖
+	src2 := t.TempDir()
+	os.WriteFile(filepath.Join(src2, "a.txt"), []byte("from sub2"), 0o644)
+	cmd = exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src2+"/", "backup@127.0.0.1::home/sub2/")
+	if out2, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("第二个子路径备份失败: %v\n%s", err, out2)
+	}
+	sid2, _ := r.LatestSnapshotID()
+	files2, _ := r.GetFilesForTest(sid2)
+	got2 := map[string]bool{}
+	for _, f := range files2 {
+		got2[f.Path] = true
+	}
+	if !got2["sub2/a.txt"] || !got2["sub1/a.txt"] {
+		t.Fatalf("两个子路径应并存: %v", files2)
+	}
+	var out2 bytes.Buffer
+	if err := r.ReadFile(sid2, "sub1/a.txt", &out2); err != nil || out2.String() != "from sub1" {
+		t.Fatalf("sub1/a.txt 被子路径备份覆盖: %v %q", err, out2.String())
+	}
+
+	// quick check 基准按前缀查询：再次备份 sub1（内容不变）零传输
+	cmd = exec.Command("rsync", "-a", "--stats", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src1+"/", "backup@127.0.0.1::home/sub1/")
+	outB, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("sub1 二次备份失败: %v\n%s", err, outB)
+	}
+	if !strings.Contains(string(outB), "Number of regular files transferred: 0") {
+		t.Fatalf("子路径 quick check 未生效（二次备份仍有传输）:\n%s", outB)
+	}
+}
+
+// TestRsyncSubpathRestore P0#2 端到端：子路径备份后从同一子路径恢复。
+func TestRsyncSubpathRestore(t *testing.T) {
+	port, _ := startLoggedRouterServer(t)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("subpath content"), 0o644)
+	os.WriteFile(filepath.Join(src, "sub", "b.txt"), []byte("nested"), 0o644)
+
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/sub1/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("子路径备份失败: %v\n%s", err, out)
+	}
+
+	dst := t.TempDir()
+	cmd = exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/sub1/", dst+"/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("子路径恢复失败: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if err != nil || string(data) != "subpath content" {
+		t.Fatalf("恢复 a.txt: %v %q", err, data)
+	}
+	data, err = os.ReadFile(filepath.Join(dst, "sub", "b.txt"))
+	if err != nil || string(data) != "nested" {
+		t.Fatalf("恢复 sub/b.txt: %v %q", err, data)
+	}
+}
+
+// TestRsyncSubpathDelta 子路径备份的 delta 增量：修改子路径下大文件后二次备份，
+// quick check/delta 基准必须按子路径前缀查询（basis 读取也按前缀路径）。
+func TestRsyncSubpathDelta(t *testing.T) {
+	port, r := startTestServer(t)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	src := t.TempDir()
+	big := make([]byte, 1<<20)
+	for i := range big {
+		big[i] = byte(i * 31)
+	}
+	os.WriteFile(filepath.Join(src, "big.bin"), big, 0o644)
+
+	run := func() string {
+		cmd := exec.Command("rsync", "-a", "--stats", "--password-file="+pw, "--port", fmt.Sprint(port),
+			src+"/", "backup@127.0.0.1::home/sub1/")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("子路径备份失败: %v\n%s", err, out)
+		}
+		return string(out)
+	}
+	run() // 首次全量
+
+	// 局部修改 → delta
+	mid := bytes.Repeat([]byte{0xAB}, 1024)
+	copy(big[1<<19:], mid)
+	os.WriteFile(filepath.Join(src, "big.bin"), big, 0o644)
+	stats := run()
+
+	if !strings.Contains(stats, "Number of regular files transferred: 1") {
+		t.Fatalf("修改后应有 1 个文件传输:\n%s", stats)
+	}
+	matched := parseStat(t, stats, "Matched data")
+	if matched < 900_000 {
+		t.Fatalf("delta 匹配字节过少: %d\n%s", matched, stats)
+	}
+	sid, _ := r.LatestSnapshotID()
+	var out bytes.Buffer
+	if err := r.ReadFile(sid, "sub1/big.bin", &out); err != nil || !bytes.Equal(out.Bytes(), big) {
+		t.Fatalf("读取 sub1/big.bin: %v (len=%d want=%d)", err, out.Len(), len(big))
+	}
+}
+
+// TestRsyncCompressRejected P0#3：-z 压缩会话被明确拒绝（此前压缩 token 流被当
+// 普通流解析 → "字面量块过大"崩溃）。要求：客户端收到明确错误文本、非零退出、
+// 不产生快照。
+func TestRsyncCompressRejected(t *testing.T) {
+	port, r := startTestServer(t)
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("compress me"), 0o644)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-az", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("-z 压缩会话应被拒绝:\n%s", out)
+	}
+	if !strings.Contains(strings.ToLower(string(out)), "compress") {
+		t.Fatalf("错误信息应说明压缩不支持:\n%s", out)
+	}
+	sid, _ := r.LatestSnapshotID()
+	if sid != 0 {
+		t.Fatalf("被拒绝的会话不应产生快照: %d", sid)
+	}
+}
+
+// TestRsyncCompressRestoreRejected 恢复方向 -az（客户端要求服务端 sender 压缩
+// 发送）同样拒绝。
+func TestRsyncCompressRestoreRejected(t *testing.T) {
+	port, _ := startLoggedRouterServer(t)
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("restore me"), 0o644)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("备份失败: %v\n%s", err, out)
+	}
+	dst := t.TempDir()
+	cmd = exec.Command("rsync", "-az", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/", dst+"/")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("恢复方向 -z 应被拒绝:\n%s", out)
+	}
+	if !strings.Contains(strings.ToLower(string(out)), "compress") {
+		t.Fatalf("错误信息应说明压缩不支持:\n%s", out)
+	}
+}
+
+// TestRsyncBackupChecksum P0#4：`rsync -ac` 备份——客户端每条 REGULAR flist 条目
+// 尾部附 16 字节内容 MD5，服务端须读掉保持流同步（此前字段错位误报
+// "暂不支持设备/特殊文件类型"）。
+func TestRsyncBackupChecksum(t *testing.T) {
+	port, r := startTestServer(t)
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("checksum mode"), 0o644)
+	os.WriteFile(filepath.Join(src, "sub", "b.txt"), []byte("nested"), 0o644)
+	os.Symlink("a.txt", filepath.Join(src, "link1"))
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-ac", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rsync -ac 备份失败: %v\n%s", err, out)
+	}
+	sid, _ := r.LatestSnapshotID()
+	if sid == 0 {
+		t.Fatal("应产生快照")
+	}
+	var out bytes.Buffer
+	if err := r.ReadFile(sid, "a.txt", &out); err != nil || out.String() != "checksum mode" {
+		t.Fatalf("读取 a.txt: %v %q", err, out.String())
+	}
+	files, _ := r.GetFilesForTest(sid)
+	got := map[string]bool{}
+	for _, f := range files {
+		got[f.Path] = true
+	}
+	if !got["sub/b.txt"] || !got["link1"] {
+		t.Fatalf("快照清单不完整: %v", files)
+	}
+}
+
+// TestRsyncRestoreChecksum 恢复方向 `rsync -ac`：客户端 argv 短包含 'c'，
+// 服务端 sender 发 flist 时每条 REGULAR 条目尾部同样须附 16 字节内容 MD5
+// （客户端 recv_file_entry 无条件读该段，缺失则整条流错位）。
+func TestRsyncRestoreChecksum(t *testing.T) {
+	port, _ := startLoggedRouterServer(t)
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("checksum restore"), 0o644)
+	os.WriteFile(filepath.Join(src, "sub", "b.txt"), []byte("nested"), 0o644)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("备份失败: %v\n%s", err, out)
+	}
+	dst := t.TempDir()
+	cmd = exec.Command("rsync", "-ac", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/", dst+"/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("rsync -ac 恢复失败: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if err != nil || string(data) != "checksum restore" {
+		t.Fatalf("恢复 a.txt: %v %q", err, data)
+	}
+	data, err = os.ReadFile(filepath.Join(dst, "sub", "b.txt"))
+	if err != nil || string(data) != "nested" {
+		t.Fatalf("恢复 sub/b.txt: %v %q", err, data)
+	}
+}
+
+// TestRsyncBackupFifoSpecial P0#5：源目录含 FIFO（-a 隐含 -D=--devices --specials）。
+// 此前 flist 解析遇 FIFO mode 直接报"暂不支持设备/特殊/其他文件类型"，整个备份
+// 会话失败（rsync rc=12）；修复后设备/特殊条目读完整字段流但跳过落库（警告日志 +
+// 客户端提示），其余文件正常备份，rsync rc=0，恢复结果中无 FIFO。
+func TestRsyncBackupFifoSpecial(t *testing.T) {
+	port, logBuf := startLoggedRouterServer(t)
+
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("fifo test"), 0o644)
+	if err := syscall.Mkfifo(filepath.Join(src, "myfifo"), 0o644); err != nil {
+		t.Skipf("mkfifo 失败: %v", err)
+	}
+
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("含 FIFO 的 -a 备份应成功: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "skipping non-regular file") {
+		t.Fatalf("客户端应收到跳过提示:\n%s", out)
+	}
+	if !strings.Contains(logBuf.String(), "skip_special_file") {
+		t.Fatalf("服务端日志应含 skip_special_file:\n%s", logBuf)
+	}
+
+	// 恢复对照：a.txt 内容一致，myfifo 不存在（即快照中无 FIFO 行）
+	dst := t.TempDir()
+	cmd = exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/", dst+"/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("恢复失败: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if err != nil || string(data) != "fifo test" {
+		t.Fatalf("恢复 a.txt: %v %q", err, data)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "myfifo")); err == nil {
+		t.Fatal("恢复结果不应包含 myfifo")
 	}
 }

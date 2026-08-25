@@ -191,6 +191,11 @@ func ReadArgvLine(r *bufio.Reader) ([]string, error) {
 type Negotiation struct {
 	PreserveUID    bool // argv 含 -o（uid/gid 映射表 id list 是否存在）
 	PreserveGID    bool // argv 含 -g
+	PreserveLinks  bool // argv 含 -l（flist symlink target 字段段是否出现）
+	PreserveDevices bool // argv 含 -D/--devices（CHR/BLK 条目 rdev 字段段是否出现；--specials 无 wire 影响）
+	Recurse        bool // argv 含 -r（flist 深度：false 时仅传输根下一层，--list-only 无 -r 等）
+	ChecksumMode   bool // argv 含 -c/--checksum（always_checksum：flist 每条 REGULAR 条目尾部附 16 字节内容 MD5）
+	Compression    bool // argv 含 -z/--old-compress/--new-compress/--compress-choice（v1 不支持，须拒绝）
 	DeleteMode     bool // argv 含 --delete*（filter 列表是否在网络上出现）
 	PruneEmptyDirs bool // argv 含 --prune-empty-dirs/-m（同上）
 	NumericIDs     bool // argv 含 --numeric-ids（id list 是否发送）
@@ -243,6 +248,17 @@ func NegotiateBinary(r *bufio.Reader, w io.Writer) (*Negotiation, error) {
 	return neg, nil
 }
 
+// rejectCompression 检测压缩选项并拒绝会话（mux 建立后调用）：v1 未实现 zlib
+// 解压（压缩 token 流为 deflate 编码，与普通 int32 token 流完全不同，误当普通
+// 流解析必然错乱崩溃）。错误经 mux MSG_ERROR_XFER 发送，客户端 stderr 显示。
+func rejectCompression(mw *MuxWriter, neg *Negotiation) error {
+	if !neg.Compression {
+		return nil
+	}
+	_ = mw.WriteMsg("ERROR: compression is not supported by this server; remove -z/--compress options\n")
+	return fmt.Errorf("客户端请求压缩传输（-z/--compress-choice），暂不支持")
+}
+
 // parseServerArgs 从服务端 argv 解析会话相关选项。
 // 真实客户端示例：["--server","--sender","-vlogDtpre.iLsfxCIvu",".","home/"]。
 // 短选项包中 'e' 带参数（其后 '.'+FLAGS 为 client_info），'o'/'g' 表示 preserve uid/gid。
@@ -264,6 +280,21 @@ func parseServerArgs(argv []string) *Negotiation {
 			if a == "--numeric-ids" {
 				neg.NumericIDs = true
 			}
+			if a == "--checksum" {
+				neg.ChecksumMode = true
+			}
+			// 设备文件保留（options.c:2843-2844，-D/--devices；--specials 在
+			// protocol 31 无 wire 影响，特殊条目本就无 rdev 段）
+			if a == "--devices" {
+				neg.PreserveDevices = true
+			}
+			// 压缩：短包 'z'（CPRES_ZLIB，options.c:2888-2889）或独立长选项
+			// --old-compress/--new-compress/--compress-choice（options.c:2984-2989）；
+			// --compress-level 仅在已开压缩时随 argv 发送（options.c:2921），一并防御。
+			if a == "--old-compress" || a == "--new-compress" ||
+				strings.HasPrefix(a, "--compress-choice") || strings.HasPrefix(a, "--compress-level") {
+				neg.Compression = true
+			}
 		case strings.HasPrefix(a, "-") && len(a) > 1:
 			// 短选项包：逐字符；'e' 之后的剩余字符是 -e 的参数（client_info），停止扫描
 			for _, c := range a[1:] {
@@ -272,6 +303,16 @@ func parseServerArgs(argv []string) *Negotiation {
 					neg.PreserveUID = true
 				case 'g':
 					neg.PreserveGID = true
+				case 'l':
+					neg.PreserveLinks = true
+				case 'D':
+					neg.PreserveDevices = true // -D = --devices --specials（options.c:2843-2844）
+				case 'r':
+					neg.Recurse = true
+				case 'c':
+					neg.ChecksumMode = true
+				case 'z':
+					neg.Compression = true
 				case 'm':
 					neg.PruneEmptyDirs = true
 				case 'e':

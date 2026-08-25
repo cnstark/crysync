@@ -21,7 +21,7 @@ func NewFlistWriter() *FlistWriter { return &FlistWriter{} }
 // WriteEntry 编码一条 flist 记录。目录路径去尾斜杠（落库格式）；普通目录
 // （content dir）xflags 为 0——接收侧 p>=30 时无 NO_CONTENT_DIR 位即视为有内容
 // 目录（flist.c:1081-1086）。
-func (w *FlistWriter) WriteEntry(dst io.Writer, e FileEntry, preserveUID, preserveGID bool) error {
+func (w *FlistWriter) WriteEntry(dst io.Writer, e FileEntry, preserveUID, preserveGID, preserveLinks bool) error {
 	var xflags uint32
 	if !preserveUID {
 		xflags |= XmitSameUID
@@ -107,8 +107,9 @@ func (w *FlistWriter) WriteEntry(dst io.Writer, e FileEntry, preserveUID, preser
 			return err
 		}
 	}
-	// symlink target：varint30(len) + 字节（flist.c:639-642；varint30 = varint）
-	if e.IsSymlink {
+	// symlink target：varint30(len) + 字节（flist.c:639-642；varint30 = varint）。
+	// preserve_links off 时不发该段（flist.c:625 前提），接收侧同样跳过——协议合法
+	if preserveLinks && e.IsSymlink {
 		if err := WriteVarint(dst, int32(len(e.LinkTarget))); err != nil {
 			return err
 		}

@@ -217,6 +217,11 @@ func (m *MuxWriter) writeFrame(typ byte, data []byte) error {
 func (m *MuxWriter) WriteData(data []byte) error { return m.writeFrame(muxTypeData, data) }
 func (m *MuxWriter) WriteMsg(msg string) error   { return m.writeFrame(muxTypeMsg, []byte(msg)) }
 
+// WriteInfoMsg 发送 MSG_INFO（code 2=FINFO，rsync.h:295）提示消息：客户端打印但不
+// 计入 io_error（MSG_ERROR_XFER=1 会使客户端 rc=23）。跳过设备/特殊文件等非错误
+// 场景的客户端可见提示用此通道。
+func (m *MuxWriter) WriteInfoMsg(msg string) error { return m.writeFrame(2, []byte(msg)) }
+
 // MuxStream 将 mux 帧按序拼接为连续字节流（真实 rsync 的帧可合并/拆分逻辑记录）。
 type MuxStream struct {
 	mr     *MuxReader

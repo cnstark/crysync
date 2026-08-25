@@ -17,7 +17,8 @@ const (
 	XmitSameName         = uint32(1 << 5)
 	XmitLongName         = uint32(1 << 6)
 	XmitSameTime         = uint32(1 << 7)
-	XmitNoContentDir     = uint32(1 << 8) // 目录专用，protocol 30+
+	XmitSameRdevMajor    = uint32(1 << 8) // 设备条目专用（protocols 28+）：rdev major 复用上一设备条目
+	XmitNoContentDir     = uint32(1 << 8) // 目录专用，protocol 30+（与 SAME_RDEV_MAJOR 同位不同义，按 mode 类型区分，rsync.h:57-58）
 	XmitHlinked          = uint32(1 << 9)
 	XmitUserNameFollows  = uint32(1 << 10) // 仅 inc_recurse 模式（本方案降级下不出现，防御性读取）
 	XmitGroupNameFollows = uint32(1 << 11)
@@ -271,7 +272,13 @@ type FlistParser struct {
 func NewFlistParser() *FlistParser { return &FlistParser{} }
 
 // Parse 解析一条记录；返回条目。遇到单个 0 字节哨兵返回 ErrFlistEnd。
-func (p *FlistParser) Parse(r io.Reader) (FileEntry, error) {
+// preserve 四参数对齐客户端 argv（-o/-g/-l/-D）：真实 rsync 的 recv_file_entry
+// 对 uid/gid/symlink target/rdev 的读取均有 preserve 前提（flist.c:880-902/925-929/
+// 1023-1042）——preserve off 时对端置 SAME 位且不发字段，无条件读取会错位/阻塞。
+// checksumMode 对齐 -c/--checksum（always_checksum）：每条 REGULAR 条目尾部附加
+// flist_csum_len=16 字节纯内容 MD5（flist.c:1365-1377 recv 侧无条件读，目录/链接
+// 不附）——v1 不使用其值，读掉保持流同步。
+func (p *FlistParser) Parse(r io.Reader, preserveUID, preserveGID, preserveLinks, preserveDevices, checksumMode bool) (FileEntry, error) {
 	var e FileEntry
 
 	// xflags：单字节；0 → 列表结束；& XMIT_EXTENDED_FLAGS(1<<2) → 高字节 <<8
@@ -378,8 +385,9 @@ func (p *FlistParser) Parse(r io.Reader) (FileEntry, error) {
 	} else {
 		e.Mode = p.lastMode
 	}
-	// [非 SAME_UID] uid = varint；SAME_UID 复用上一条；[USER_NAME_FOLLOWS] len=byte + len 字节名字
-	if xflags&XmitSameUID == 0 {
+	// [preserve_uid 且非 SAME_UID] uid = varint；SAME_UID 或 preserve off 复用上一条；
+	// [USER_NAME_FOLLOWS] len=byte + len 字节名字（与 uid 同前提，flist.c:890-902）
+	if preserveUID && xflags&XmitSameUID == 0 {
 		v, err := ReadVarint(r)
 		if err != nil {
 			return e, err
@@ -394,8 +402,8 @@ func (p *FlistParser) Parse(r io.Reader) (FileEntry, error) {
 	} else {
 		e.UID = p.lastUID
 	}
-	// [非 SAME_GID] gid = varint；SAME_GID 复用上一条；[GROUP_NAME_FOLLOWS]
-	if xflags&XmitSameGID == 0 {
+	// [preserve_gid 且非 SAME_GID] gid = varint；[GROUP_NAME_FOLLOWS]（flist.c:905-917）
+	if preserveGID && xflags&XmitSameGID == 0 {
 		v, err := ReadVarint(r)
 		if err != nil {
 			return e, err
@@ -410,19 +418,38 @@ func (p *FlistParser) Parse(r io.Reader) (FileEntry, error) {
 	} else {
 		e.GID = p.lastGID
 	}
-	// 设备/特殊文件（rdev 字段流）v1 不支持。注意 wire 上普通文件 mode
-	// 不带类型位（mt==0），目录带 S_IFDIR、符号链接带 S_IFLNK。
+	// 文件类型白名单（flist.c:967-983 真实 rsync 接受全部标准类型）：
+	// 普通文件（mt==0，mode 0 仅 delete-missing-args 用）、目录、链接、设备/特殊。
+	// 设备/特殊条目 v1 不落库（receiver 跳过），但字段流照常解析。
 	mt := e.Mode & sIfmt
 	switch mt {
-	case 0, sIfReg, sIfDir, sIfLnk:
-		// 允许：普通文件（mt==0）、目录、符号链接
+	case 0, sIfReg, sIfDir, sIfLnk, sIfChr, sIfBlk, sIfFifo, sIfSock:
 	default:
-		return e, protocolErr("v1 暂不支持设备/特殊/其他文件类型 (mode)")
+		return e, protocolErr("非法文件类型 (mode)")
 	}
-	// [symlink] target_len = varint30（flist.c:640 write_varint30，不含 '\0'）。
-	// 接收侧 read_varint30 得 symlink_len，linkname_len = len+1 为缓冲大小，
-	// read_sbuf(f, bp, linkname_len-1) 实际读 len 字节（flist.c:929/1153）。
-	if mt == sIfLnk {
+	// [preserve_devices 且 CHR/BLK] rdev 段（flist.c:1023-1042 接收侧，protocol 31）：
+	// !(XMIT_SAME_RDEV_MAJOR) 时 major=varint，minor 恒 varint；设备条目接收侧
+	// file_length 清零。FIFO/SOCK（IS_SPECIAL）在 protocol 31 无任何 rdev 字节
+	// （preserve_specials 的 rdev 段仅 protocol<31 出现）。v1 不使用 rdev 值，
+	// 读掉保持流同步。
+	if mt == sIfChr || mt == sIfBlk {
+		e.Size = 0
+		if preserveDevices {
+			if xflags&XmitSameRdevMajor == 0 {
+				if _, err := ReadVarint(r); err != nil { // major
+					return e, err
+				}
+			}
+			if _, err := ReadVarint(r); err != nil { // minor
+				return e, err
+			}
+		}
+	}
+	// [preserve_links 且 symlink] target_len = varint30（flist.c:640 write_varint30，
+	// 不含 '\0'）。接收侧 read_varint30 得 symlink_len，linkname_len = len+1 为缓冲
+	// 大小，read_sbuf(f, bp, linkname_len-1) 实际读 len 字节（flist.c:929/1153）。
+	// preserve_links off 时对端不发该段（flist.c:925 前提），IsSymlink 仍按 mode 判定。
+	if preserveLinks && mt == sIfLnk {
 		l, err := ReadVarint(r)
 		if err != nil {
 			return e, err
@@ -432,9 +459,16 @@ func (p *FlistParser) Parse(r io.Reader) (FileEntry, error) {
 			return e, err
 		}
 		e.LinkTarget = string(target)
-		e.IsSymlink = true
 	}
+	e.IsSymlink = mt == sIfLnk
 	e.IsDir = mt == sIfDir
+	// [--checksum 且 REGULAR] 尾部 flist_csum_len=16 字节内容 MD5（flist.c:1365-1377，
+	// recv_file_entry 之后 read_buf；v1 丢弃值仅保持流同步）
+	if checksumMode && !e.IsDir && !e.IsSymlink && isRegularMode(e.Mode) {
+		if _, err := io.ReadFull(r, make([]byte, 16)); err != nil {
+			return e, err
+		}
+	}
 	return e, nil
 }
 

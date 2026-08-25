@@ -2,6 +2,7 @@ package rsyncproto
 
 import (
 	"bytes"
+	"crypto/md5"
 	"testing"
 )
 
@@ -33,7 +34,7 @@ func buildRegularFileEntry(t *testing.T, name string, mode uint32, size int32, m
 func TestParseFileEntryRegular(t *testing.T) {
 	data := buildRegularFileEntry(t, "a.txt", 0o644, 3, 0)
 	p := NewFlistParser()
-	e, err := p.Parse(bytes.NewReader(data))
+	e, err := p.Parse(bytes.NewReader(data), true, true, true, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +49,7 @@ func TestParseFileEntryRegular(t *testing.T) {
 // 名字公共前缀：先 "a.txt" 再 "a.log"（前缀 "a."，SAME_NAME=0x20）
 func TestParseFileEntrySameName(t *testing.T) {
 	p := NewFlistParser()
-	e1, err := p.Parse(bytes.NewReader(buildRegularFileEntry(t, "a.txt", 0o644, 3, 0)))
+	e1, err := p.Parse(bytes.NewReader(buildRegularFileEntry(t, "a.txt", 0o644, 3, 0)), true, true, true, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +63,7 @@ func TestParseFileEntrySameName(t *testing.T) {
 	buf.WriteString("log")
 	WriteVarlong30(&buf, 3) // F_LENGTH
 	WriteInt32(&buf, 0o644) // mode（非 SAME）
-	e2, err := p.Parse(bytes.NewReader(buf.Bytes()))
+	e2, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +86,7 @@ func TestParseFileEntryDir(t *testing.T) {
 	WriteInt32(&buf, 0o040000|0o755) // mode（目录总是发送）
 	// mtime/uid/gid 全 SAME 不发
 	p := NewFlistParser()
-	e, err := p.Parse(bytes.NewReader(buf.Bytes()))
+	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,12 +108,98 @@ func TestParseFileEntrySymlink(t *testing.T) {
 	WriteVarint(&buf, 6)             // symlink_len = 6
 	buf.WriteString("target")
 	p := NewFlistParser()
-	e, err := p.Parse(bytes.NewReader(buf.Bytes()))
+	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !e.IsSymlink || e.LinkTarget != "target" || e.Path != "link1" {
 		t.Fatalf("符号链接解析错误: %+v", e)
+	}
+}
+
+// TestParsePreserveOff 模拟真实客户端 preserve off（如 `rsync -r`，无 -og/-l）发送的
+// flist 字节流：XMIT_SAME_UID/XMIT_SAME_GID 置位但 uid/gid 字段不发（flist.c
+// send_file_entry：!preserve_uid → 置位跳过），symlink 条目 mode 含 S_IFLNK 但
+// target 字段段不发（!preserve_links → 跳过）。F_LENGTH 恒为 target 长度。
+// 三条目 + 哨兵：普通文件 a.txt、symlink link1（无 target）、目录 sub。
+func TestParsePreserveOff(t *testing.T) {
+	var buf bytes.Buffer
+	// 条目 1：普通文件 "a.txt"
+	xflags := XmitSameUID | XmitSameGID // preserve off：客户端置 SAME 不发字段
+	buf.WriteByte(byte(xflags))
+	buf.WriteByte(5)
+	buf.WriteString("a.txt")
+	WriteVarlong30(&buf, 3)  // F_LENGTH
+	WriteVarlong(&buf, 1e9, 4) // mtime（非 SAME_TIME）
+	WriteInt32(&buf, 0o100644) // mode
+	// 无 uid/gid 字段
+	// 条目 2：symlink "link1"（preserve_links off：无 target 段）
+	buf.WriteByte(byte(xflags))
+	buf.WriteByte(5)
+	buf.WriteString("link1")
+	WriteVarlong30(&buf, 6)    // F_LENGTH = target 长度（恒发）
+	WriteVarlong(&buf, 1e9, 4) // mtime
+	WriteInt32(&buf, 0o120777) // mode：S_IFLNK
+	// 无 target 段
+	// 条目 3：目录 "sub"（xflags 高字节非 0 → EXTENDED + shortint 2 字节）
+	dirXflags := XmitNoContentDir | XmitSameUID | XmitSameGID
+	WriteShortint(&buf, uint16(dirXflags|XmitExtended))
+	buf.WriteByte(3)
+	buf.WriteString("sub")
+	WriteVarlong30(&buf, 0)
+	WriteVarlong(&buf, 1e9, 4)
+	WriteInt32(&buf, 0o040755)
+	// 哨兵
+	buf.WriteByte(0)
+
+	p := NewFlistParser()
+	r := bytes.NewReader(buf.Bytes())
+	e1, err := p.Parse(r, false, false, false, false, false)
+	if err != nil {
+		t.Fatalf("条目 1 解析失败: %v", err)
+	}
+	if e1.Path != "a.txt" || e1.IsSymlink || e1.Size != 3 {
+		t.Fatalf("条目 1 解析错误: %+v", e1)
+	}
+	e2, err := p.Parse(r, false, false, false, false, false)
+	if err != nil {
+		t.Fatalf("条目 2（symlink preserve off）解析失败: %v", err)
+	}
+	if e2.Path != "link1" || !e2.IsSymlink || e2.LinkTarget != "" {
+		t.Fatalf("条目 2 解析错误: %+v", e2)
+	}
+	e3, err := p.Parse(r, false, false, false, false, false)
+	if err != nil {
+		t.Fatalf("条目 3（目录）解析失败: %v", err)
+	}
+	if e3.Path != "sub" || !e3.IsDir {
+		t.Fatalf("条目 3 解析错误: %+v", e3)
+	}
+	if _, err := p.Parse(r, false, false, false, false, false); err != ErrFlistEnd {
+		t.Fatalf("应读到哨兵，得到 %v", err)
+	}
+}
+
+// TestParsePreserveOnUidGid preserve on 但 SAME 位未置（首条目）：uid/gid 正常读取。
+// xflags=TOP_DIR（非 0、无任何 SAME 位）：mtime/mode/uid/gid 全部发送。
+func TestParsePreserveOnUidGid(t *testing.T) {
+	var buf bytes.Buffer
+	buf.WriteByte(byte(XmitTopDir))
+	buf.WriteByte(5)
+	buf.WriteString("a.txt")
+	WriteVarlong30(&buf, 3)
+	WriteVarlong(&buf, 1e9, 4)
+	WriteInt32(&buf, 0o100644)
+	WriteVarint(&buf, 1000) // uid
+	WriteVarint(&buf, 1000) // gid
+
+	p := NewFlistParser()
+	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.UID != 1000 || e.GID != 1000 {
+		t.Fatalf("uid/gid 解析错误: %+v", e)
 	}
 }
 
@@ -189,4 +276,130 @@ func paths(es []FileEntry) []string {
 		ps[i] = e.Path
 	}
 	return ps
+}
+
+// TestParseChecksumMode P0#4：--checksum（-c）模式下客户端每条 REGULAR 条目尾部
+// 附加 flist_csum_len=16 字节纯内容 MD5（flist.c:757-766 always_checksum && S_ISREG），
+// 目录/符号链接不附。解析器必须读掉该段保持流同步（v1 不使用其值）。
+func TestParseChecksumMode(t *testing.T) {
+	var buf bytes.Buffer
+	// 条目 1：普通文件 "a.txt"（SAME_UID|SAME_GID 简化字段流）
+	buf.WriteByte(byte(XmitSameUID | XmitSameGID))
+	buf.WriteByte(5)
+	buf.WriteString("a.txt")
+	WriteVarlong30(&buf, 3)
+	WriteVarlong(&buf, 1e9, 4)
+	WriteInt32(&buf, 0o100644)
+	cs := md5.Sum([]byte("abc")) // 任意 16 字节（解析器不校验值）
+	buf.Write(cs[:])
+	// 条目 2：目录 "sub"（无校验和）
+	dirXflags := XmitNoContentDir | XmitSameUID | XmitSameGID
+	WriteShortint(&buf, uint16(dirXflags|XmitExtended))
+	buf.WriteByte(3)
+	buf.WriteString("sub")
+	WriteVarlong30(&buf, 0)
+	WriteVarlong(&buf, 1e9, 4)
+	WriteInt32(&buf, 0o040755)
+	// 哨兵
+	buf.WriteByte(0)
+
+	p := NewFlistParser()
+	r := bytes.NewReader(buf.Bytes())
+	e1, err := p.Parse(r, true, true, true, false, true)
+	if err != nil {
+		t.Fatalf("条目 1 解析失败: %v", err)
+	}
+	if e1.Path != "a.txt" || e1.IsDir {
+		t.Fatalf("条目 1 解析错误: %+v", e1)
+	}
+	e2, err := p.Parse(r, true, true, true, false, true)
+	if err != nil {
+		t.Fatalf("条目 2（目录，无校验和）解析失败: %v", err)
+	}
+	if e2.Path != "sub" || !e2.IsDir {
+		t.Fatalf("条目 2 解析错误: %+v", e2)
+	}
+	if _, err := p.Parse(r, true, true, true, false, true); err != ErrFlistEnd {
+		t.Fatalf("应读到哨兵，得到 %v", err)
+	}
+}
+
+// TestParseDeviceSpecial P0#5：设备/特殊条目的 rdev 字段流（flist.c:1023-1042 接收侧，
+// protocol 31）：preserve_devices 且 CHR/BLK 才有 rdev 段——major 仅在未置
+// XMIT_SAME_RDEV_MAJOR(1<<8) 时读 varint，minor 恒读 varint；FIFO/SOCK（IS_SPECIAL）
+// 完全无 rdev 字节。接收侧语义：设备条目 file_length 清零。三条目 + 哨兵验证流位置精确。
+func TestParseDeviceSpecial(t *testing.T) {
+	var buf bytes.Buffer
+	// 条目 1：CHR "chr0"，rdev major+minor 都发（SAME_RDEV_MAJOR 未置，高字节 0 → 1 字节 xflags）
+	buf.WriteByte(byte(XmitSameTime | XmitSameUID | XmitSameGID))
+	buf.WriteByte(4)
+	buf.WriteString("chr0")
+	WriteVarlong30(&buf, 7)            // F_LENGTH=7（接收侧应清零，flist.c:1042）
+	WriteInt32(&buf, int32(sIfChr|0o600)) // mode（非 SAME）
+	WriteVarint(&buf, 1)               // rdev major
+	WriteVarint(&buf, 5)               // rdev minor
+	// 条目 2：BLK "blk0"，SAME_RDEV_MAJOR 置位（1<<8 → 2 字节 xflags）只发 minor
+	blkXflags := XmitSameTime | XmitSameUID | XmitSameGID | XmitSameRdevMajor
+	WriteShortint(&buf, uint16(blkXflags|XmitExtended))
+	buf.WriteByte(4)
+	buf.WriteString("blk0")
+	WriteVarlong30(&buf, 0)
+	WriteInt32(&buf, int32(sIfBlk|0o600))
+	WriteVarint(&buf, 7) // rdev minor（major 复用上一条）
+	// 条目 3：FIFO "fifo0"，无任何 rdev 字节（IS_SPECIAL，protocol 31）
+	buf.WriteByte(byte(XmitSameTime | XmitSameUID | XmitSameGID))
+	buf.WriteByte(5)
+	buf.WriteString("fifo0")
+	WriteVarlong30(&buf, 0)
+	WriteInt32(&buf, int32(sIfFifo|0o600))
+	// 哨兵
+	buf.WriteByte(0)
+
+	p := NewFlistParser()
+	r := bytes.NewReader(buf.Bytes())
+	e1, err := p.Parse(r, true, true, true, true, false)
+	if err != nil {
+		t.Fatalf("条目 1（CHR）解析失败: %v", err)
+	}
+	if e1.Path != "chr0" || e1.Size != 0 || e1.Mode != sIfChr|0o600 || e1.IsDir || e1.IsSymlink {
+		t.Fatalf("条目 1 解析错误: %+v", e1)
+	}
+	e2, err := p.Parse(r, true, true, true, true, false)
+	if err != nil {
+		t.Fatalf("条目 2（BLK，SAME_RDEV_MAJOR）解析失败: %v", err)
+	}
+	if e2.Path != "blk0" || e2.Size != 0 || e2.Mode != sIfBlk|0o600 {
+		t.Fatalf("条目 2 解析错误: %+v", e2)
+	}
+	e3, err := p.Parse(r, true, true, true, true, false)
+	if err != nil {
+		t.Fatalf("条目 3（FIFO，无 rdev）解析失败: %v", err)
+	}
+	if e3.Path != "fifo0" || e3.Mode != sIfFifo|0o600 {
+		t.Fatalf("条目 3 解析错误: %+v", e3)
+	}
+	if _, err := p.Parse(r, true, true, true, true, false); err != ErrFlistEnd {
+		t.Fatalf("应读到哨兵，得到 %v", err)
+	}
+}
+
+// TestParseDeviceNoPreserveDevices preserve_devices off（如 `rsync -r`）时 CHR 条目
+// 无 rdev 字节（防御分支，flist.c:1043-1051：设备条目 file_length 仍清零）。
+func TestParseDeviceNoPreserveDevices(t *testing.T) {
+	var buf bytes.Buffer
+	buf.WriteByte(byte(XmitSameTime | XmitSameUID | XmitSameGID))
+	buf.WriteByte(4)
+	buf.WriteString("chr0")
+	WriteVarlong30(&buf, 0)
+	WriteInt32(&buf, int32(sIfChr|0o600))
+	buf.WriteByte(0) // 哨兵
+
+	p := NewFlistParser()
+	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if e.Path != "chr0" || e.Size != 0 || e.Mode != sIfChr|0o600 {
+		t.Fatalf("解析错误: %+v", e)
+	}
 }

@@ -35,6 +35,9 @@ func RunSession(ctx context.Context, br *bufio.Reader, w io.Writer, module *conf
 		return err
 	}
 	mw := NewMuxWriter(w)
+	if err := rejectCompression(mw, neg); err != nil {
+		return err
+	}
 	if module.ReadOnly && !neg.SenderMode {
 		return fmt.Errorf("模块 %s 只读，拒绝推送", module.Name)
 	}
@@ -65,6 +68,9 @@ func RunSender(ctx context.Context, br *bufio.Reader, w io.Writer, module *confi
 		return err
 	}
 	mw := NewMuxWriter(w)
+	if err := rejectCompression(mw, neg); err != nil {
+		return err
+	}
 	return processSendSession(ctx, mr, mw, module, r, neg, logger)
 }
 
@@ -147,6 +153,12 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 				name = strings.TrimPrefix(f.Path, prefix+"/")
 			}
 		}
+		// 非 -r（如 --list-only 无递归）：客户端隐含过滤为单层（exclude.c:633
+		// arg_len==0 时仅 "/*"），发深层条目会被拒（flist.c:1144 unrequested）。
+		// 只发传输根下一层："." 与不含 '/' 的名字。
+		if !neg.Recurse && name != "." && strings.Contains(name, "/") {
+			continue
+		}
 		items = append(items, flistItem{
 			entry: FileEntry{
 				Path: name, IsDir: f.IsDir, IsSymlink: f.IsSymlink,
@@ -167,8 +179,18 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 			return err
 		}
 		var buf bytesBuffer
-		if err := fw.WriteEntry(&buf, it.entry, neg.PreserveUID, neg.PreserveGID); err != nil {
+		if err := fw.WriteEntry(&buf, it.entry, neg.PreserveUID, neg.PreserveGID, neg.PreserveLinks); err != nil {
 			return fmt.Errorf("编码 flist 条目 %s: %w", it.entry.Path, err)
+		}
+		// --checksum（-c）：每条 REGULAR 条目尾部附 flist_csum_len=16 字节纯内容
+		// MD5（flist.c:757-766 file_checksum，无 seed；客户端 recv_file_entry
+		// 无条件读该段，缺失则整条流错位）。目录/符号链接不附。
+		if neg.ChecksumMode && !it.entry.IsDir && !it.entry.IsSymlink && isRegularMode(it.entry.Mode) {
+			_, fileSum, err := r.StreamFile(sid, it.snapPath, 0, io.Discard)
+			if err != nil {
+				return fmt.Errorf("计算 flist 校验和 %s: %w", it.entry.Path, err)
+			}
+			buf.Write(fileSum[:])
 		}
 		if err := out.WriteData(buf.Bytes()); err != nil {
 			return err

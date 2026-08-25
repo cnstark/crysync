@@ -21,7 +21,7 @@ func TestFlistWriterRegularGolden(t *testing.T) {
 		0x83, 0xE8,
 	}
 	var buf bytes.Buffer
-	if err := NewFlistWriter().WriteEntry(&buf, e, true, true); err != nil {
+	if err := NewFlistWriter().WriteEntry(&buf, e, true, true, true); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(buf.Bytes(), want) {
@@ -39,7 +39,7 @@ func TestFlistWriterNoPreserve(t *testing.T) {
 		0xA4, 0x01, 0x00, 0x00,
 	}
 	var buf bytes.Buffer
-	if err := NewFlistWriter().WriteEntry(&buf, e, false, false); err != nil {
+	if err := NewFlistWriter().WriteEntry(&buf, e, false, false, true); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(buf.Bytes(), want) {
@@ -61,7 +61,7 @@ func TestFlistWriterDirGolden(t *testing.T) {
 		0x83, 0xE8,
 	}
 	var buf bytes.Buffer
-	if err := NewFlistWriter().WriteEntry(&buf, e, true, true); err != nil {
+	if err := NewFlistWriter().WriteEntry(&buf, e, true, true, true); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(buf.Bytes(), want) {
@@ -84,7 +84,7 @@ func TestFlistWriterSymlinkGolden(t *testing.T) {
 		0x05, 'a', '.', 't', 'x', 't', // symlink target
 	}
 	var buf bytes.Buffer
-	if err := NewFlistWriter().WriteEntry(&buf, e, true, true); err != nil {
+	if err := NewFlistWriter().WriteEntry(&buf, e, true, true, true); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(buf.Bytes(), want) {
@@ -98,7 +98,7 @@ func TestFlistWriterModNsec(t *testing.T) {
 	e := FileEntry{Path: "n.txt", Mode: 0o644, Size: 1,
 		MTimeNs: 1700000000*1e9 + 123456789, UID: 1000, GID: 1000}
 	var buf bytes.Buffer
-	if err := NewFlistWriter().WriteEntry(&buf, e, true, true); err != nil {
+	if err := NewFlistWriter().WriteEntry(&buf, e, true, true, true); err != nil {
 		t.Fatal(err)
 	}
 	got := buf.Bytes()
@@ -131,7 +131,7 @@ func TestFlistWriterRoundTrip(t *testing.T) {
 		var buf bytes.Buffer
 		w := NewFlistWriter()
 		for _, e := range entries {
-			if err := w.WriteEntry(&buf, e, preserve, preserve); err != nil {
+			if err := w.WriteEntry(&buf, e, preserve, preserve, preserve); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -142,7 +142,7 @@ func TestFlistWriterRoundTrip(t *testing.T) {
 		rd := bytes.NewReader(buf.Bytes())
 		var got []FileEntry
 		for {
-			e, err := p.Parse(rd)
+			e, err := p.Parse(rd, preserve, preserve, preserve, false, false)
 			if err == ErrFlistEnd {
 				break
 			}
@@ -180,8 +180,13 @@ func TestFlistWriterRoundTrip(t *testing.T) {
 			if g.MTimeNs != want.MTimeNs {
 				t.Fatalf("[%d] mtime 不符 (preserve=%v): got %d want %d", i, preserve, g.MTimeNs, want.MTimeNs)
 			}
-			if g.LinkTarget != want.LinkTarget {
-				t.Fatalf("[%d] link target 不符 (preserve=%v): got %q want %q", i, preserve, g.LinkTarget, want.LinkTarget)
+			// preserve off 时 target 不发送，解析侧为空
+			wantTarget := want.LinkTarget
+			if !preserve {
+				wantTarget = ""
+			}
+			if g.LinkTarget != wantTarget {
+				t.Fatalf("[%d] link target 不符 (preserve=%v): got %q want %q", i, preserve, g.LinkTarget, wantTarget)
 			}
 			if preserve {
 				if g.UID != want.UID || g.GID != want.GID {
