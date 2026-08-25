@@ -32,6 +32,7 @@ func logNegotiated(logger *slog.Logger, neg *Negotiation) {
 		"preserve_uid", neg.PreserveUID,
 		"preserve_gid", neg.PreserveGID,
 		"preserve_devices", neg.PreserveDevices,
+		"preserve_atimes", neg.PreserveAtimes,
 		"delete_mode", neg.DeleteMode,
 		"numeric_ids", neg.NumericIDs,
 		"io_timeout", neg.IoTimeout,
@@ -105,6 +106,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		keepAlive = keeper.KeepAlive
 	}
 	stream := NewMuxStream(in)
+	stream.Logger = logger // 跳过的 mux 消息帧记 debug（P2#11）
 	// ndx 差分编码的读/写方向各自独立维护 prev 状态（io.c write_ndx/read_ndx 分方向）
 	ndxOut := newNdxCodec() // S->C：条目 ndx 与 NDX_DONE
 	ndxIn := newNdxCodec()  // C->S：客户端回显与 ACK
@@ -124,7 +126,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		e, err := parser.Parse(stream, neg.PreserveUID, neg.PreserveGID, neg.PreserveLinks, neg.PreserveDevices, neg.ChecksumMode)
+		e, err := parser.Parse(stream, neg.PreserveUID, neg.PreserveGID, neg.PreserveLinks, neg.PreserveDevices, neg.PreserveAtimes, neg.ChecksumMode)
 		if err == ErrFlistEnd {
 			break
 		}

@@ -34,7 +34,7 @@ func buildRegularFileEntry(t *testing.T, name string, mode uint32, size int32, m
 func TestParseFileEntryRegular(t *testing.T) {
 	data := buildRegularFileEntry(t, "a.txt", 0o644, 3, 0)
 	p := NewFlistParser()
-	e, err := p.Parse(bytes.NewReader(data), true, true, true, false, false)
+	e, err := p.Parse(bytes.NewReader(data), true, true, true, false, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestParseFileEntryRegular(t *testing.T) {
 // 名字公共前缀：先 "a.txt" 再 "a.log"（前缀 "a."，SAME_NAME=0x20）
 func TestParseFileEntrySameName(t *testing.T) {
 	p := NewFlistParser()
-	e1, err := p.Parse(bytes.NewReader(buildRegularFileEntry(t, "a.txt", 0o644, 3, 0)), true, true, true, false, false)
+	e1, err := p.Parse(bytes.NewReader(buildRegularFileEntry(t, "a.txt", 0o644, 3, 0)), true, true, true, false, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestParseFileEntrySameName(t *testing.T) {
 	buf.WriteString("log")
 	WriteVarlong30(&buf, 3) // F_LENGTH
 	WriteInt32(&buf, 0o644) // mode（非 SAME）
-	e2, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false)
+	e2, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestParseFileEntryDir(t *testing.T) {
 	WriteInt32(&buf, 0o040000|0o755) // mode（目录总是发送）
 	// mtime/uid/gid 全 SAME 不发
 	p := NewFlistParser()
-	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false)
+	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +108,7 @@ func TestParseFileEntrySymlink(t *testing.T) {
 	WriteVarint(&buf, 6)             // symlink_len = 6
 	buf.WriteString("target")
 	p := NewFlistParser()
-	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false)
+	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,28 +154,28 @@ func TestParsePreserveOff(t *testing.T) {
 
 	p := NewFlistParser()
 	r := bytes.NewReader(buf.Bytes())
-	e1, err := p.Parse(r, false, false, false, false, false)
+	e1, err := p.Parse(r, false, false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("条目 1 解析失败: %v", err)
 	}
 	if e1.Path != "a.txt" || e1.IsSymlink || e1.Size != 3 {
 		t.Fatalf("条目 1 解析错误: %+v", e1)
 	}
-	e2, err := p.Parse(r, false, false, false, false, false)
+	e2, err := p.Parse(r, false, false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("条目 2（symlink preserve off）解析失败: %v", err)
 	}
 	if e2.Path != "link1" || !e2.IsSymlink || e2.LinkTarget != "" {
 		t.Fatalf("条目 2 解析错误: %+v", e2)
 	}
-	e3, err := p.Parse(r, false, false, false, false, false)
+	e3, err := p.Parse(r, false, false, false, false, false, false)
 	if err != nil {
 		t.Fatalf("条目 3（目录）解析失败: %v", err)
 	}
 	if e3.Path != "sub" || !e3.IsDir {
 		t.Fatalf("条目 3 解析错误: %+v", e3)
 	}
-	if _, err := p.Parse(r, false, false, false, false, false); err != ErrFlistEnd {
+	if _, err := p.Parse(r, false, false, false, false, false, false); err != ErrFlistEnd {
 		t.Fatalf("应读到哨兵，得到 %v", err)
 	}
 }
@@ -194,7 +194,7 @@ func TestParsePreserveOnUidGid(t *testing.T) {
 	WriteVarint(&buf, 1000) // gid
 
 	p := NewFlistParser()
-	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false)
+	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,21 +305,21 @@ func TestParseChecksumMode(t *testing.T) {
 
 	p := NewFlistParser()
 	r := bytes.NewReader(buf.Bytes())
-	e1, err := p.Parse(r, true, true, true, false, true)
+	e1, err := p.Parse(r, true, true, true, false, false, true)
 	if err != nil {
 		t.Fatalf("条目 1 解析失败: %v", err)
 	}
 	if e1.Path != "a.txt" || e1.IsDir {
 		t.Fatalf("条目 1 解析错误: %+v", e1)
 	}
-	e2, err := p.Parse(r, true, true, true, false, true)
+	e2, err := p.Parse(r, true, true, true, false, false, true)
 	if err != nil {
 		t.Fatalf("条目 2（目录，无校验和）解析失败: %v", err)
 	}
 	if e2.Path != "sub" || !e2.IsDir {
 		t.Fatalf("条目 2 解析错误: %+v", e2)
 	}
-	if _, err := p.Parse(r, true, true, true, false, true); err != ErrFlistEnd {
+	if _, err := p.Parse(r, true, true, true, false, false, true); err != ErrFlistEnd {
 		t.Fatalf("应读到哨兵，得到 %v", err)
 	}
 }
@@ -357,28 +357,28 @@ func TestParseDeviceSpecial(t *testing.T) {
 
 	p := NewFlistParser()
 	r := bytes.NewReader(buf.Bytes())
-	e1, err := p.Parse(r, true, true, true, true, false)
+	e1, err := p.Parse(r, true, true, true, true, false, false)
 	if err != nil {
 		t.Fatalf("条目 1（CHR）解析失败: %v", err)
 	}
 	if e1.Path != "chr0" || e1.Size != 0 || e1.Mode != sIfChr|0o600 || e1.IsDir || e1.IsSymlink {
 		t.Fatalf("条目 1 解析错误: %+v", e1)
 	}
-	e2, err := p.Parse(r, true, true, true, true, false)
+	e2, err := p.Parse(r, true, true, true, true, false, false)
 	if err != nil {
 		t.Fatalf("条目 2（BLK，SAME_RDEV_MAJOR）解析失败: %v", err)
 	}
 	if e2.Path != "blk0" || e2.Size != 0 || e2.Mode != sIfBlk|0o600 {
 		t.Fatalf("条目 2 解析错误: %+v", e2)
 	}
-	e3, err := p.Parse(r, true, true, true, true, false)
+	e3, err := p.Parse(r, true, true, true, true, false, false)
 	if err != nil {
 		t.Fatalf("条目 3（FIFO，无 rdev）解析失败: %v", err)
 	}
 	if e3.Path != "fifo0" || e3.Mode != sIfFifo|0o600 {
 		t.Fatalf("条目 3 解析错误: %+v", e3)
 	}
-	if _, err := p.Parse(r, true, true, true, true, false); err != ErrFlistEnd {
+	if _, err := p.Parse(r, true, true, true, true, false, false); err != ErrFlistEnd {
 		t.Fatalf("应读到哨兵，得到 %v", err)
 	}
 }
@@ -401,14 +401,14 @@ func TestParseIoErrorEndlist(t *testing.T) {
 
 	p := NewFlistParser()
 	r := bytes.NewReader(buf.Bytes())
-	e, err := p.Parse(r, true, true, true, true, false)
+	e, err := p.Parse(r, true, true, true, true, false, false)
 	if err != nil {
 		t.Fatalf("条目 1 解析失败: %v", err)
 	}
 	if e.Path != "a.txt" {
 		t.Fatalf("条目 1 解析错误: %+v", e)
 	}
-	if _, err := p.Parse(r, true, true, true, true, false); err != ErrFlistEnd {
+	if _, err := p.Parse(r, true, true, true, true, false, false); err != ErrFlistEnd {
 		t.Fatalf("应识别 IO_ERROR_ENDLIST 为列表结束，得到 %v", err)
 	}
 	if p.IoError != 3 {
@@ -417,7 +417,7 @@ func TestParseIoErrorEndlist(t *testing.T) {
 	// 无 io_error 的普通哨兵不受影响
 	p2 := NewFlistParser()
 	r2 := bytes.NewReader([]byte{0})
-	if _, err := p2.Parse(r2, false, false, false, false, false); err != ErrFlistEnd {
+	if _, err := p2.Parse(r2, false, false, false, false, false, false); err != ErrFlistEnd {
 		t.Fatalf("普通哨兵应返回 ErrFlistEnd，得到 %v", err)
 	}
 	if p2.IoError != 0 {
@@ -437,11 +437,55 @@ func TestParseDeviceNoPreserveDevices(t *testing.T) {
 	buf.WriteByte(0) // 哨兵
 
 	p := NewFlistParser()
-	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false)
+	e, err := p.Parse(bytes.NewReader(buf.Bytes()), true, true, true, false, false, false)
 	if err != nil {
 		t.Fatalf("解析失败: %v", err)
 	}
 	if e.Path != "chr0" || e.Size != 0 || e.Mode != sIfChr|0o600 {
 		t.Fatalf("解析错误: %+v", e)
+	}
+}
+
+// TestParseAtimeField（P2#13）：--atimes（组合短选项 'U'）时非目录条目在 mode
+// 之后、uid 之前携带 varlong(4) atime 字段（flist.c:985-986）；SAME_ATIME(1<<14)
+// 置位时省略。不读该字段则 uid/gid/后续条目全部错位。v1 读掉丢弃（不落库）。
+func TestParseAtimeField(t *testing.T) {
+	var buf bytes.Buffer
+	// 条目 1：SAME_TIME|SAME_UID|SAME_GID，mode 非 SAME → mode 后跟 atime varlong(4)
+	xflags := XmitSameTime | XmitSameUID | XmitSameGID
+	buf.WriteByte(byte(xflags))
+	buf.WriteByte(5)
+	buf.WriteString("f.txt")
+	WriteVarlong30(&buf, 7)
+	WriteInt32(&buf, int32(0o644))
+	WriteVarlong(&buf, 1700000000, 4) // atime
+	// 条目 2：SAME_ATIME(1<<14) 置位 → 无 atime 字段（xflags > 0xFF 走 2 字节
+	// 扩展格式：低 8 位 | XMIT_EXTENDED_FLAGS + 高 8 位）
+	x2 := xflags | XmitSameMode | XmitSameAtime
+	buf.WriteByte(byte(x2&0xFF) | 0x04)
+	buf.WriteByte(byte(x2 >> 8))
+	buf.WriteByte(5)
+	buf.WriteString("g.txt")
+	WriteVarlong30(&buf, 9)
+	buf.WriteByte(0) // 哨兵
+
+	p := NewFlistParser()
+	r := bytes.NewReader(buf.Bytes())
+	e1, err := p.Parse(r, true, true, true, false, true, false)
+	if err != nil {
+		t.Fatalf("含 atime 字段条目应解析成功（读掉 atime 保持流同步）: %v", err)
+	}
+	if e1.Path != "f.txt" || e1.Size != 7 || e1.Mode != 0o644 {
+		t.Fatalf("条目 1 解析错误: %+v", e1)
+	}
+	e2, err := p.Parse(r, true, true, true, false, true, false)
+	if err != nil {
+		t.Fatalf("SAME_ATIME 条目应解析成功: %v", err)
+	}
+	if e2.Path != "g.txt" || e2.Size != 9 || e2.Mode != 0o644 {
+		t.Fatalf("条目 2 解析错误（atime 未读导致字段错位）: %+v", e2)
+	}
+	if _, err := p.Parse(r, true, true, true, false, true, false); err != ErrFlistEnd {
+		t.Fatalf("应以哨兵结束: %v", err)
 	}
 }

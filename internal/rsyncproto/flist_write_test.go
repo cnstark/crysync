@@ -142,7 +142,7 @@ func TestFlistWriterRoundTrip(t *testing.T) {
 		rd := bytes.NewReader(buf.Bytes())
 		var got []FileEntry
 		for {
-			e, err := p.Parse(rd, preserve, preserve, preserve, false, false)
+			e, err := p.Parse(rd, preserve, preserve, preserve, false, false, false)
 			if err == ErrFlistEnd {
 				break
 			}

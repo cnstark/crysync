@@ -96,7 +96,7 @@ func (c *senderClient) readFlist() []FileEntry {
 	p := NewFlistParser()
 	var out []FileEntry
 	for {
-		e, err := p.Parse(c.stream, true, true, true, false, false)
+		e, err := p.Parse(c.stream, true, true, true, false, false, false)
 		if err == ErrFlistEnd {
 			return out
 		}

@@ -282,7 +282,7 @@ func NewFlistParser() *FlistParser { return &FlistParser{} }
 // checksumMode 对齐 -c/--checksum（always_checksum）：每条 REGULAR 条目尾部附加
 // flist_csum_len=16 字节纯内容 MD5（flist.c:1365-1377 recv 侧无条件读，目录/链接
 // 不附）——v1 不使用其值，读掉保持流同步。
-func (p *FlistParser) Parse(r io.Reader, preserveUID, preserveGID, preserveLinks, preserveDevices, checksumMode bool) (FileEntry, error) {
+func (p *FlistParser) Parse(r io.Reader, preserveUID, preserveGID, preserveLinks, preserveDevices, preserveAtimes, checksumMode bool) (FileEntry, error) {
 	var e FileEntry
 
 	// xflags：单字节；0 → 列表结束；& XMIT_EXTENDED_FLAGS(1<<2) → 高字节 <<8
@@ -400,6 +400,14 @@ func (p *FlistParser) Parse(r io.Reader, preserveUID, preserveGID, preserveLinks
 		p.lastMode = e.Mode
 	} else {
 		e.Mode = p.lastMode
+	}
+	// [--atimes 且非目录且非 SAME_ATIME] atime = varlong(4)（flist.c:985-986：
+	// atimes_ndx && !S_ISDIR(mode) && !(xflags & XMIT_SAME_ATIME)，位置在 mode
+	// 之后 uid 之前）。v1 不持久化 atime，读掉保持字段流同步。
+	if preserveAtimes && e.Mode&sIfmt != sIfDir && xflags&XmitSameAtime == 0 {
+		if _, err := ReadVarlong(r, 4); err != nil {
+			return e, err
+		}
 	}
 	// [preserve_uid 且非 SAME_UID] uid = varint；SAME_UID 或 preserve off 复用上一条；
 	// [USER_NAME_FOLLOWS] len=byte + len 字节名字（与 uid 同前提，flist.c:890-902）

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 )
 
@@ -258,6 +259,9 @@ type MuxStream struct {
 	mr     *MuxReader
 	remain []byte
 	eof    bool
+	// Logger 非 nil 时，跳过的 mux 消息帧记 debug 日志（code+摘要，P2#11：
+	// MSG_INFO/MSG_ERROR 等静默丢弃排障困难）；nil 无日志。
+	Logger *slog.Logger
 }
 
 func NewMuxStream(mr *MuxReader) *MuxStream { return &MuxStream{mr: mr} }
@@ -279,6 +283,10 @@ func (s *MuxStream) Read(p []byte) (int, error) {
 				return 0, &noSendError{ndx: int32(binary.LittleEndian.Uint32(data))}
 			}
 			// 其余消息帧（MSG_INFO/MSG_ERROR/MSG_NOOP 等）：跳过，不得拼入数据流
+			if s.Logger != nil {
+				s.Logger.Debug("mux_msg_frame",
+					"code", tag, "payload", fmt.Sprintf("%.64q", data))
+			}
 			continue
 		}
 		s.remain = data

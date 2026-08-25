@@ -753,3 +753,98 @@ func TestSessionIoTimeout(t *testing.T) {
 		})
 	}
 }
+
+// TestReadOnlyRejectMessage（P2#12）：只读模块拒绝推送时应先向客户端发送
+// 错误文本（真实 rsyncd：do_server_recv 报 "ERROR: module is read only"）
+// 再断连，而非静默关闭（客户端只见 connection unexpectedly closed）。
+func TestReadOnlyRejectMessage(t *testing.T) {
+	r, m := newTestRepoFull(t)
+	m.ReadOnly = true
+	server, out := pipeConn(t, []byte("--server\x00-vlogDtpre.iLs\x00.\x00home/\x00\x00"))
+	done := make(chan error, 1)
+	go func() {
+		done <- RunSession(context.Background(), bufio.NewReader(server), server, m, r, nil)
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "只读") {
+			t.Fatalf("应返回只读错误: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("会话未返回")
+	}
+	// 帧经 TCP 回读 goroutine 异步落 buffer，轮询等待
+	deadline := time.Now().Add(2 * time.Second)
+	for !bytes.Contains(out.Bytes(), []byte("module is read only")) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("module is read only")) {
+		t.Fatalf("客户端应收到 read only 错误文本再断连: % x", out.Bytes())
+	}
+}
+
+// TestAppendRejected（P2#14）：--append/--append-verify（wire 上为 1/2 个独立
+// "--append" 项）语义是数据从客户端已有偏移开始（receiver offset=sum.flength），
+// 与本项目"从 0 全量重组"假设冲突，须明确拒绝并告知客户端，而非误接受产出错误数据。
+func TestAppendRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		argv string
+	}{
+		{"append", "--server\x00--append\x00-vlogDtpre.iLs\x00.\x00home/\x00\x00"},
+		{"append-verify 两个 --append 项", "--server\x00--append\x00--append\x00-vlogDtpre.iLs\x00.\x00home/\x00\x00"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, m := newTestRepoFull(t)
+			server, out := pipeConn(t, []byte(tc.argv))
+			done := make(chan error, 1)
+			go func() {
+				done <- RunSession(context.Background(), bufio.NewReader(server), server, m, r, nil)
+			}()
+			select {
+			case err := <-done:
+				if err == nil || !strings.Contains(err.Error(), "--append") {
+					t.Fatalf("应拒绝 --append: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				server.Close()
+				t.Fatal("会话未返回（--append 未检测，误入会话等待数据）")
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for !bytes.Contains(out.Bytes(), []byte("--append is not supported")) && time.Now().Before(deadline) {
+				time.Sleep(50 * time.Millisecond)
+			}
+			if !bytes.Contains(out.Bytes(), []byte("--append is not supported")) {
+				t.Fatalf("客户端应收到 --append 拒绝文本: % x", out.Bytes())
+			}
+		})
+	}
+}
+
+// TestRestoreAtimesRejected（P2#13 恢复方向）：服务端为 sender 时客户端带 -U
+// （--atimes）会期待 flist 携带 atime 字段；快照未持久化 atime 无法提供，
+// 不拒绝会导致客户端解码错位，须明确拒绝。备份方向不拒绝（Parse 读掉字段）。
+func TestRestoreAtimesRejected(t *testing.T) {
+	r, m := newTestRepoFull(t)
+	server, out := pipeConn(t, []byte("--server\x00--sender\x00-vlogDUtpre.iLs\x00.\x00home/\x00\x00"))
+	done := make(chan error, 1)
+	go func() {
+		done <- RunSession(context.Background(), bufio.NewReader(server), server, m, r, nil)
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "--atimes") {
+			t.Fatalf("应拒绝恢复方向 --atimes: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		server.Close()
+		t.Fatal("会话未返回")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for !bytes.Contains(out.Bytes(), []byte("--atimes is not supported on restore")) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("--atimes is not supported on restore")) {
+		t.Fatalf("客户端应收到 --atimes 拒绝文本: % x", out.Bytes())
+	}
+}

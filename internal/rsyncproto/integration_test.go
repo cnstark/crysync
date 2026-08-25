@@ -57,7 +57,7 @@ func startTestServer(t *testing.T) (int, *repo.Repo) {
 				br := bufio.NewReader(c)
 				// 注意：服务端不预先发 greeting——rsync 客户端先发自己的版本行，
 				// HandleModuleRequest 收到后回版本行（双向 greeting）。
-				if _, err := HandleModuleRequest(br, c, cfg); err != nil {
+				if _, err := HandleModuleRequest(br, c, cfg, nil); err != nil {
 					log.Printf("握手失败: %v", err)
 					return
 				}

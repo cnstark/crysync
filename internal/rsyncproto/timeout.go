@@ -30,8 +30,9 @@ import (
 
 // 协议消息码（rsync.h:294-308）。
 const (
-	msgIoTimeout byte = 33 // MSG_IO_TIMEOUT：daemon 宣告自身超时值（非超时告警）
-	msgError     byte = 3  // MSG_ERROR：FERROR 级错误文本（stderr，不计 io_error）
+	msgIoTimeout  byte = 33 // MSG_IO_TIMEOUT：daemon 宣告自身超时值（非超时告警）
+	msgError      byte = 3  // MSG_ERROR：FERROR 级错误文本（stderr，不计 io_error）
+	msgErrorExit  byte = 86 // MSG_ERROR_EXIT：payload 4 字节 LE exit code，客户端收到后以该码退出（read_only 等用法错误路径）
 )
 
 // maxSessionDuration：未协商 --timeout 时的连接级兜底上限（server 层同值）。

@@ -31,7 +31,7 @@ func TestHandleModuleList(t *testing.T) {
 	}}
 	r := bufio.NewReader(strings.NewReader(clientGreeting + "#list\n"))
 	var buf bytes.Buffer
-	if _, err := HandleModuleRequest(r, &buf, cfg); err == nil {
+	if _, err := HandleModuleRequest(r, &buf, cfg, nil); err == nil {
 		t.Fatal("#list 应返回错误（调用方关闭连接）")
 	}
 	if !strings.Contains(buf.String(), "home\t/") || !strings.Contains(buf.String(), "www\t/srv/www") ||
@@ -53,7 +53,7 @@ func TestHandleModuleListEmptyName(t *testing.T) {
 	for _, line := range []string{"\n", "  \n"} { // 空行与纯空白行
 		r := bufio.NewReader(strings.NewReader(clientGreeting + line))
 		var buf bytes.Buffer
-		if _, err := HandleModuleRequest(r, &buf, cfg); err == nil {
+		if _, err := HandleModuleRequest(r, &buf, cfg, nil); err == nil {
 			t.Fatalf("空模块名 %q 应返回错误（调用方关闭连接）", line)
 		}
 		if !strings.Contains(buf.String(), "home\t/") || !strings.Contains(buf.String(), "@RSYNCD: EXIT") {
@@ -82,7 +82,7 @@ func TestHandleModuleAuthFlow(t *testing.T) {
 	digest := authDigest("secret", seed)
 	r := bufio.NewReader(strings.NewReader(clientGreeting + "home\nbackup " + digest + "\n"))
 	var buf bytes.Buffer
-	m, err := HandleModuleRequest(r, &buf, cfg)
+	m, err := HandleModuleRequest(r, &buf, cfg, nil)
 	if err != nil {
 		t.Fatalf("认证失败: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestHandleModuleAuthReject(t *testing.T) {
 	seed := "12345678"
 	r := bufio.NewReader(strings.NewReader(clientGreeting + "home\nbackup " + authDigest("WRONG", seed) + "\n"))
 	var buf bytes.Buffer
-	if _, err := HandleModuleRequest(r, &buf, cfg); err == nil {
+	if _, err := HandleModuleRequest(r, &buf, cfg, nil); err == nil {
 		t.Fatal("错误密码应报错")
 	}
 	if !strings.Contains(buf.String(), "@ERROR") {
@@ -112,7 +112,7 @@ func TestHandleModuleUnknown(t *testing.T) {
 	cfg := &config.Config{Modules: []config.ModuleConfig{{Name: "home", Path: "/"}}}
 	r := bufio.NewReader(strings.NewReader(clientGreeting + "nope\n"))
 	var buf bytes.Buffer
-	if _, err := HandleModuleRequest(r, &buf, cfg); err == nil {
+	if _, err := HandleModuleRequest(r, &buf, cfg, nil); err == nil {
 		t.Fatal("未知模块应报错")
 	}
 	if !strings.Contains(buf.String(), "@ERROR: Unknown module") {
@@ -125,7 +125,7 @@ func TestHandleModuleRejectsOldClient(t *testing.T) {
 	cfg := &config.Config{Modules: []config.ModuleConfig{{Name: "home", Path: "/"}}}
 	r := bufio.NewReader(strings.NewReader("@RSYNCD: 29.0 md5\nhome\n"))
 	var buf bytes.Buffer
-	if _, err := HandleModuleRequest(r, &buf, cfg); err == nil {
+	if _, err := HandleModuleRequest(r, &buf, cfg, nil); err == nil {
 		t.Fatal("旧协议客户端应报错")
 	}
 	if !strings.Contains(buf.String(), "@ERROR: protocol startup error") {
@@ -203,7 +203,7 @@ func TestHandleModuleRequest34Greeting(t *testing.T) {
 	cfg := &config.Config{Modules: []config.ModuleConfig{{Name: "home", Path: "/"}}}
 	r := bufio.NewReader(strings.NewReader(clientGreeting + "home\n"))
 	var buf bytes.Buffer
-	m, err := HandleModuleRequest(r, &buf, cfg)
+	m, err := HandleModuleRequest(r, &buf, cfg, nil)
 	if err != nil {
 		t.Fatalf("握手失败: %v", err)
 	}
@@ -242,5 +242,27 @@ func TestParseServerArgs(t *testing.T) {
 	neg = parseServerArgs([]string{"--server", "-voge.iLsfxCIvu", ".", "home/"})
 	if !neg.PreserveUID || !neg.PreserveGID {
 		t.Fatalf("-e 参数截断解析错误: %+v", neg)
+	}
+}
+
+// TestHandleModuleMaxConnections（P2#15）：allowModule 返回 false（超限/负值禁用）
+// 时，在认证前写 @ERROR 文本行（对齐 rsyncd clientserver.c:796-799，客户端以
+// code 5 退出），不进入认证流程。
+func TestHandleModuleMaxConnections(t *testing.T) {
+	cfg := &config.Config{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+		Modules: []config.ModuleConfig{{Name: "home", Path: "/", MaxConnections: 1}}}
+	r := bufio.NewReader(strings.NewReader(clientGreeting + "home\n"))
+	var buf bytes.Buffer
+	_, err := HandleModuleRequest(r, &buf, cfg, func(m *config.ModuleConfig) bool {
+		return false // 已有 1 个连接占坑
+	})
+	if err == nil {
+		t.Fatal("超限应报错")
+	}
+	if !strings.Contains(buf.String(), "@ERROR: max connections (1) reached -- try again later") {
+		t.Fatalf("应返回 max connections 文本: %q", buf.String())
+	}
+	if strings.Contains(buf.String(), "@RSYNCD: AUTHREQD") {
+		t.Fatalf("超限应在认证前拒绝: %q", buf.String())
 	}
 }

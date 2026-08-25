@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crysync/internal/backend"
@@ -171,6 +172,9 @@ func Serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	// 模块并发连接计数（对齐 rsyncd max connections：0 = 无限制、负值 = 禁用模块、
+	// 正数 = 上限；claim_connection 语义，连接结束释放）
+	limiter := &moduleConnLimiter{}
 	// prune 调度：每模块独立 goroutine，按 schedule 每日执行
 	for i := range cfg.Modules {
 		m := &cfg.Modules[i]
@@ -201,7 +205,7 @@ func Serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 			defer wg.Done()
 			defer c.Close()
 			c.SetDeadline(time.Now().Add(24 * time.Hour))
-			if err := handleConn(ctx, c, cfg, logger); err != nil && !errors.Is(err, rsyncproto.ErrClientClosed) {
+			if err := handleConn(ctx, c, cfg, logger, limiter); err != nil && !errors.Is(err, rsyncproto.ErrClientClosed) {
 				logger.Warn("conn_error", "client", c.RemoteAddr().String(), "err", err.Error())
 			}
 		}(conn)
@@ -272,19 +276,50 @@ func sleepUntil(ctx context.Context, hhmm string) bool {
 	}
 }
 
+// moduleConnLimiter：模块并发连接计数。allow 在模块选定后、认证前占坑（须与
+// release 配对，由 handleConn 的 defer 保证）；计数随 Serve 生命周期（每次监听独立）。
+type moduleConnLimiter struct {
+	counts sync.Map // 模块名 -> *atomic.Int64
+}
+
+// allow 返回模块是否接受新连接；接受时已占坑。
+func (l *moduleConnLimiter) allow(m *config.ModuleConfig) bool {
+	if m.MaxConnections == 0 {
+		return true // 无限制（缺省）
+	}
+	if m.MaxConnections < 0 {
+		return false // 负值禁用模块（rsyncd.conf.5.md：for 循环体不执行恒失败）
+	}
+	v, _ := l.counts.LoadOrStore(m.Name, &atomic.Int64{})
+	n := v.(*atomic.Int64)
+	if n.Add(1) <= int64(m.MaxConnections) {
+		return true
+	}
+	n.Add(-1) // 超限回退，防计数虚高导致永久拒绝
+	return false
+}
+
+// release 连接结束时释放一个占坑。
+func (l *moduleConnLimiter) release(name string) {
+	if v, ok := l.counts.Load(name); ok {
+		v.(*atomic.Int64).Add(-1)
+	}
+}
+
 // handleConn：handshake 与协议共享同一个 bufio.Reader（buffer 可能预读协议字节，
 // 必须传给后续协议解析，否则预读字节丢失）。握手成功后派生会话级 logger
 //（module/client/session 字段贯穿该会话全部日志事件）。
-func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config, logger *slog.Logger) error {
+func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config, logger *slog.Logger, limiter *moduleConnLimiter) error {
 	// 握手阶段（greeting→模块选择→认证→argv 协商）读超时上限：防半开/挂死
 	// 客户端占住连接 24h（rsync 3.5.0 DAEMON_HANDSHAKE_TIMEOUT=60 同旨）；
 	// 协商完成后由 rsyncproto.applyIoTimeout 覆盖（--timeout=N 滚动或恢复 24h）
 	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	br := bufio.NewReader(conn)
-	module, err := rsyncproto.HandleModuleRequest(br, conn, cfg)
+	module, err := rsyncproto.HandleModuleRequest(br, conn, cfg, limiter.allow)
 	if err != nil {
 		return err
 	}
+	defer limiter.release(module.Name)
 	r, closeRepo, err := OpenRepoForModule(module)
 	if err != nil {
 		fmt.Fprintf(conn, "@ERROR: %v\n", err)

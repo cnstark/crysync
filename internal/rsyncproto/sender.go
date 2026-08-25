@@ -36,15 +36,26 @@ func RunSession(ctx context.Context, br *bufio.Reader, w io.Writer, module *conf
 	}
 	mw := NewMuxWriter(w)
 	if err := rejectCompression(mw, neg); err != nil {
-		return err
+		return rejectWait(err)
 	}
 	if module.ReadOnly && !neg.SenderMode {
-		return fmt.Errorf("模块 %s 只读，拒绝推送", module.Name)
+		// 对齐 rsyncd do_server_recv（main.c:1193-1197）：先经 MSG_ERROR(3) 告知
+		// 客户端再发 MSG_ERROR_EXIT(86, RERR_SYNTAX=1)（cleanup.c），客户端 stderr
+		// 可见明确原因并以退出码 1 结束，而非 connection unexpectedly closed
+		rejectWithExit(mw, "ERROR: module is read only\n", 1)
+		return rejectWait(fmt.Errorf("模块 %s 只读，拒绝推送", module.Name))
+	}
+	if err := rejectAppend(mw, neg); err != nil {
+		return rejectWait(err)
+	}
+	if err := rejectRestoreAtimes(mw, neg); err != nil {
+		return rejectWait(err)
 	}
 	k := applyIoTimeout(w, mr, mw, neg)
 	run := func() error {
 		if neg.SenderMode {
-			return processSendSession(ctx, mr, mw, module, r, neg, logger)
+			// 恢复方向错误路径可能已发拒绝帧，rejectWait 等客户端读到再断连
+			return rejectWait(processSendSession(ctx, mr, mw, module, r, neg, logger))
 		}
 		return processSession(ctx, mr, mw, module, r, neg, logger, k)
 	}
@@ -72,13 +83,19 @@ func RunSender(ctx context.Context, br *bufio.Reader, w io.Writer, module *confi
 		return err
 	}
 	mw := NewMuxWriter(w)
-	if err := rejectCompression(mw, neg); err != nil {
+	if err := rejectWait(rejectCompression(mw, neg)); err != nil {
+		return err
+	}
+	if err := rejectWait(rejectAppend(mw, neg)); err != nil {
+		return err
+	}
+	if err := rejectWait(rejectRestoreAtimes(mw, neg)); err != nil {
 		return err
 	}
 	// 恢复方向以写为主（每帧写即重置计时），无本地慢工作点，keeper 仅用于
 	// 挂载重置回调与宣告帧，返回值不需要
 	applyIoTimeout(w, mr, mw, neg)
-	return wrapIoTimeout(processSendSession(ctx, mr, mw, module, r, neg, logger), w, mw, neg)
+	return wrapIoTimeout(rejectWait(processSendSession(ctx, mr, mw, module, r, neg, logger)), w, mw, neg)
 }
 
 // RunSenderWithReader：与已进行握手/认证的 bufio.Reader 继续协议（避免预读丢失），
@@ -117,6 +134,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 	}()
 
 	stream := NewMuxStream(in)
+	stream.Logger = logger // 跳过的 mux 消息帧记 debug（P2#11）
 	// ndx 差分编码按方向独立：ndxIn 读客户端（generator 请求），ndxOut 写回复
 	ndxIn := newNdxCodec()  // C->S
 	ndxOut := newNdxCodec() // S->C
@@ -135,6 +153,8 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 		return err
 	}
 	if sid == 0 {
+		// 明确告知客户端再断连（静默断连客户端只见 connection unexpectedly closed）
+		rejectWithExit(out, "ERROR: module has no snapshot to restore\n", 1)
 		return fmt.Errorf("模块 %s 没有可恢复的快照", module.Name)
 	}
 	prefix := modulePrefix(neg.ModuleArg, module.Name)

@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"crypto/md5"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -35,9 +36,13 @@ var ErrClientClosed = errors.New("客户端已断开")
 var ErrAuthFailed = errors.New("认证失败")
 
 // HandleModuleRequest 处理 daemon 文本行阶段：
-// 服务端先发 greeting -> 读客户端 greeting（版本校验）-> 读模块行 -> #list/未知模块/认证 -> OK。
+// 服务端先发 greeting -> 读客户端 greeting（版本校验）-> 读模块行 -> #list/未知模块/
+// max connections 检查/认证 -> OK。
 // 返回选定模块；#list 时写入模块清单并返回 ErrClientClosed（调用方关闭连接）。
-func HandleModuleRequest(r *bufio.Reader, w io.Writer, cfg *config.Config) (*config.ModuleConfig, error) {
+// allowModule 非 nil 时在模块选定后、认证前调用（对齐 rsyncd 时序：clientserver.c:791
+// claim_connection 在 allow_access 之后 auth_server 之前）：返回 false 表示连接数
+// 超限/模块禁用，向客户端写 @ERROR 文本行（客户端以 code 5 退出）后拒绝。
+func HandleModuleRequest(r *bufio.Reader, w io.Writer, cfg *config.Config, allowModule func(*config.ModuleConfig) bool) (*config.ModuleConfig, error) {
 	// (a) 服务端 greeting 必须最先发出（不等待客户端）
 	if err := WriteGreeting(w); err != nil {
 		return nil, err
@@ -81,6 +86,12 @@ func HandleModuleRequest(r *bufio.Reader, w io.Writer, cfg *config.Config) (*con
 	if module == nil {
 		fmt.Fprintf(w, "@ERROR: Unknown module '%s'\n", name)
 		return nil, fmt.Errorf("未知模块 %s", name)
+	}
+	// max connections 检查（rsyncd 文本行，clientserver.c:796-799 io_printf）：
+	// 超限/负值禁用时客户端原样打印该行并以 RERR_STARTCLIENT=5 退出
+	if allowModule != nil && !allowModule(module) {
+		fmt.Fprintf(w, "@ERROR: max connections (%d) reached -- try again later\n", module.MaxConnections)
+		return nil, fmt.Errorf("模块 %s 连接数达到上限 (%d)", module.Name, module.MaxConnections)
 	}
 	// (d,e,f) 认证：配置存在认证用户时要求 challenge-response（备份工具单用户模型，
 	// 用户名与模块名相互独立，口令按用户名查）
@@ -196,6 +207,8 @@ type Negotiation struct {
 	PreserveDevices bool // argv 含 -D/--devices（CHR/BLK 条目 rdev 字段段是否出现；--specials 无 wire 影响）
 	Recurse        bool // argv 含 -r（flist 深度：false 时仅传输根下一层，--list-only 无 -r 等）
 	ChecksumMode   bool // argv 含 -c/--checksum（always_checksum：flist 每条 REGULAR 条目尾部附 16 字节内容 MD5）
+	PreserveAtimes bool // argv 组合短选项含 'U'（--atimes）：非目录条目 mode 后有 varlong(4) atime 字段（v1 读掉丢弃，不落库）
+	AppendMode     int  // argv 独立项 "--append" 出现次数（server_options：--append 发 1 个、--append-verify 发 2 个；v1 不支持须拒绝）
 	Compression    bool // argv 含 -z/--old-compress/--new-compress/--compress-choice（v1 不支持，须拒绝）
 	DeleteMode     bool // argv 含 --delete*（filter 列表是否在网络上出现）
 	PruneEmptyDirs bool // argv 含 --prune-empty-dirs/-m（同上）
@@ -261,6 +274,48 @@ func rejectCompression(mw *MuxWriter, neg *Negotiation) error {
 	return fmt.Errorf("客户端请求压缩传输（-z/--compress-choice），暂不支持")
 }
 
+// rejectWait 拒绝类错误返回前等待（对齐 rsyncd cleanup 的 noop_io_until_death）：
+// 错误帧已写出，立即关闭连接会 RST 丢弃客户端未读缓冲。err 为 nil 时原样返回。
+func rejectWait(err error) error {
+	if err != nil {
+		time.Sleep(time.Second)
+	}
+	return err
+}
+
+// rejectWithExit 拒绝路径三连帧（对齐 rsyncd exit_cleanup 链）：错误文本 +
+// log_exit 行（log.c:955-957 经 MSG_ERROR 送达客户端）+ MSG_ERROR_EXIT(code)
+//（cleanup.c send_msg_int，payload 4 字节 LE，客户端以该码退出）。
+func rejectWithExit(mw *MuxWriter, text string, code int32) {
+	_ = mw.writeFrame(msgError, []byte(text))
+	_ = mw.writeFrame(msgError, []byte(fmt.Sprintf("rsync error: syntax or usage error (code %d) [Receiver=crysync]\n", code)))
+	var b [4]byte
+	binary.LittleEndian.PutUint32(b[:], uint32(code))
+	_ = mw.writeFrame(msgErrorExit, b[:])
+}
+
+// rejectAppend 检测 --append/--append-verify 并拒绝会话：append 语义是"数据从客户端
+// 已有偏移开始"（receiver offset=sum.flength），与本项目重组假设"从 0 全量重组"冲突，
+// 误接受会产生错误数据。经 MSG_ERROR(3) 告知客户端（用法错误不计 io_error）。
+func rejectAppend(mw *MuxWriter, neg *Negotiation) error {
+	if neg.AppendMode == 0 {
+		return nil
+	}
+	rejectWithExit(mw, "ERROR: --append is not supported by this server; remove --append (or --append-verify) options\n", 1)
+	return fmt.Errorf("客户端请求 --append/--append-verify 增量追加传输，暂不支持")
+}
+
+// rejectRestoreAtimes 恢复方向（服务端为 sender）拒绝 --atimes：atime 未持久化，
+// 无法在 flist 中提供该字段；不拒绝会导致客户端解码错位。备份方向不拒绝
+// （flist 解析读掉 atime 字段保持流同步，值不落库）。
+func rejectRestoreAtimes(mw *MuxWriter, neg *Negotiation) error {
+	if !neg.SenderMode || !neg.PreserveAtimes {
+		return nil
+	}
+	rejectWithExit(mw, "ERROR: --atimes is not supported on restore; remove -U/--atimes options\n", 1)
+	return fmt.Errorf("客户端恢复方向请求 --atimes，快照未持久化 atime，暂不支持")
+}
+
 // parseServerArgs 从服务端 argv 解析会话相关选项。
 // 真实客户端示例：["--server","--sender","-vlogDtpre.iLsfxCIvu",".","home/"]。
 // 短选项包中 'e' 带参数（其后 '.'+FLAGS 为 client_info），'o'/'g' 表示 preserve uid/gid。
@@ -304,6 +359,12 @@ func parseServerArgs(argv []string) *Negotiation {
 				strings.HasPrefix(a, "--compress-choice") || strings.HasPrefix(a, "--compress-level") {
 				neg.Compression = true
 			}
+			// --append：精确全等匹配（options.c:3122-3125，server_options 生成独立项；
+			// --append-verify 在 wire 上是两个连续 "--append"，不出现 "--append-verify"
+			// 字面量）。服务端 OPT_APPEND 每见一次 append_mode++（两次复原 verify 语义）。
+			if a == "--append" {
+				neg.AppendMode++
+			}
 		case strings.HasPrefix(a, "-") && len(a) > 1:
 			// 短选项包：逐字符；'e' 之后的剩余字符是 -e 的参数（client_info），停止扫描
 			for _, c := range a[1:] {
@@ -324,6 +385,8 @@ func parseServerArgs(argv []string) *Negotiation {
 					neg.Compression = true
 				case 'm':
 					neg.PruneEmptyDirs = true
+				case 'U':
+					neg.PreserveAtimes = true // --atimes（options.c:2847-2851；两次 -U 为 "UU"）
 				case 'e':
 					goto nextArg
 				}

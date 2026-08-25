@@ -74,14 +74,17 @@ func (p *PruneConfig) Policy() prune.Policy {
 }
 
 type ModuleConfig struct {
-	Name      string        `yaml:"name"`
-	Path      string        `yaml:"path"`
-	ReadOnly  bool          `yaml:"read_only"`
-	Backend   BackendConfig `yaml:"backend"`
-	Keyfile   string        `yaml:"keyfile"`
-	Meta      string        `yaml:"meta"`
-	ChunkSize int           `yaml:"chunk_size"`
-	Prune     *PruneConfig  `yaml:"prune"`
+	Name      string `yaml:"name"`
+	Path      string `yaml:"path"`
+	ReadOnly  bool   `yaml:"read_only"`
+	// MaxConnections 模块并发连接上限（对齐 rsyncd max connections，
+	// daemon-parm.txt）：0 = 无限制（缺省），负值 = 禁用模块，正数 = 上限。
+	MaxConnections int           `yaml:"max_connections"`
+	Backend        BackendConfig `yaml:"backend"`
+	Keyfile        string        `yaml:"keyfile"`
+	Meta           string        `yaml:"meta"`
+	ChunkSize      int           `yaml:"chunk_size"`
+	Prune          *PruneConfig  `yaml:"prune"`
 }
 
 func (m *ModuleConfig) ChunkSizeBytes() int {

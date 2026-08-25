@@ -55,7 +55,7 @@ func startLoggedTestServer(t *testing.T) (int, *bytes.Buffer) {
 				defer c.Close()
 				c.SetDeadline(time.Now().Add(2 * time.Minute))
 				br := bufio.NewReader(c)
-				if _, err := HandleModuleRequest(br, c, cfg); err != nil {
+				if _, err := HandleModuleRequest(br, c, cfg, nil); err != nil {
 					return
 				}
 				_ = RunReceiver(context.Background(), br, c, module, r, logger)
@@ -97,7 +97,7 @@ func startLoggedRouterServer(t *testing.T) (int, *repo.Repo, *bytes.Buffer) {
 				defer c.Close()
 				c.SetDeadline(time.Now().Add(2 * time.Minute))
 				br := bufio.NewReader(c)
-				if _, err := HandleModuleRequest(br, c, cfg); err != nil {
+				if _, err := HandleModuleRequest(br, c, cfg, nil); err != nil {
 					return
 				}
 				_ = RunSession(context.Background(), br, c, module, r, logger)
