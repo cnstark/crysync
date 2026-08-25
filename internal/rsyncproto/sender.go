@@ -199,6 +199,42 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 	sort.SliceStable(items, func(i, j int) bool { return fNameCmp(items[i].entry, items[j].entry) < 0 })
 	logger.Info("session_start", "dir", "restore", "argv", strings.Join(neg.Argv, " "), "entries", len(items))
 
+	// 恢复路径不存在（子路径前缀不在快照）：对齐真实 rsyncd——send_file_list 中
+	// change_dir/link_stat 失败经 MSG_ERROR_XFER 报错（flist.c:462-466 chdir_error /
+	// flist.c:2705，rsyserr FERROR_XFER → log.c:361 转发，客户端打印并 rc=23），
+	// 空 flist 发完直接断连（main.c:993-999 do_server_sender 空 flist
+	// exit_cleanup，不进 send_files/goodbye）。错误形态按请求拆分（send_file_list
+	// 的 dir/fn 拆分语义）：尾斜杠（目录请求）或父目录缺失 → change_dir(父目录)
+	// ENOENT；父路径是文件 → change_dir ENOTDIR；父目录在而条目不在 →
+	// link_stat(全路径) ENOENT。UGOS（极空间）以 rc=23 感知远端备份目录不存在，
+	// 此前返回 rc=0 空列表导致其探测后放弃后续备份。
+	var missingErr error
+	if prefix != "" && len(items) == 0 {
+		op, arg, serr := "link_stat", prefix, "No such file or directory (2)"
+		switch {
+		case strings.HasSuffix(neg.ModuleArg, "/"):
+			// 目录请求（DOTDIR）：dir 参数 = 传输根本身
+			op, arg = "change_dir", prefix
+		case strings.Contains(prefix, "/"):
+			dir := prefix[:strings.LastIndex(prefix, "/")]
+			row, ok, gerr := r.GetFileRow(sid, dir)
+			if gerr != nil {
+				return gerr
+			}
+			switch {
+			case !ok:
+				op, arg = "change_dir", dir
+			case !row.IsDir:
+				op, arg, serr = "change_dir", dir, "Not a directory (20)"
+			}
+		}
+		if werr := out.WriteErrorMsg(fmt.Sprintf(
+			"rsync: [sender] %s \"%s\" (in %s) failed: %s\n", op, arg, module.Name, serr)); werr != nil {
+			return werr
+		}
+		missingErr = fmt.Errorf("恢复路径不存在: %s", prefix)
+	}
+
 	// 发 flist：条目 + 哨兵（旧式路径，单字节 0）+ id list（数值直通：空段 varint 0）
 	fw := NewFlistWriter()
 	for _, it := range items {
@@ -245,6 +281,12 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 		if err := out.WriteData(buf.Bytes()); err != nil {
 			return err
 		}
+	}
+
+	// 路径不存在：空 flist（哨兵+id list）已发，对齐真实 rsyncd 直接断连
+	// （main.c:993-999，不进传输循环）
+	if missingErr != nil {
+		return missingErr
 	}
 
 	// 传输循环（send_files，sender.c:197-461）：响应客户端 generator 的每条消息。

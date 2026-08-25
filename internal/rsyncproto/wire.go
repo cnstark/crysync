@@ -254,6 +254,12 @@ func (m *MuxWriter) WriteMsg(msg string) error   { return m.writeFrame(muxTypeMs
 // 场景的客户端可见提示用此通道。
 func (m *MuxWriter) WriteInfoMsg(msg string) error { return m.writeFrame(2, []byte(msg)) }
 
+// WriteErrorMsg 发送 MSG_ERROR_XFER（code 1=FERROR_XFER，rsync.h:295）传输错误
+// 消息：客户端原样打印（rsyserr 格式 "rsync: [sender] ..."）并计入 io_error，
+// 会话以 RERR_PARTIAL=23 结束。daemon 侧 rsyserr(FERROR_XFER,...) 即走此通道
+// （log.c:361 send_msg 转发）。
+func (m *MuxWriter) WriteErrorMsg(msg string) error { return m.writeFrame(1, []byte(msg)) }
+
 // MuxStream 将 mux 帧按序拼接为连续字节流（真实 rsync 的帧可合并/拆分逻辑记录）。
 type MuxStream struct {
 	mr     *MuxReader

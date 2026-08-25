@@ -1251,3 +1251,81 @@ func TestRsyncDryRunRestore(t *testing.T) {
 		t.Fatalf("真实恢复 a.txt: %v %q", err, b)
 	}
 }
+
+// TestRsyncRestoreMissingPath 恢复方向请求不存在的路径：对齐真实 rsyncd——
+// MSG_ERROR_XFER 报 change_dir/link_stat 失败（客户端 rc=23），空 flist 发完直接
+// 断连（main.c:993-999 空 flist exit_cleanup，不进 goodbye）。此前返回 rc=0 空列表，
+// UGOS（极空间）探测 备份任务*.ubk/config 时误判后放弃备份。
+func TestRsyncRestoreMissingPath(t *testing.T) {
+	port, _, _ := startLoggedRouterServer(t)
+
+	src := t.TempDir()
+	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("hello"), 0o644)
+	os.WriteFile(filepath.Join(src, "sub", "b.txt"), []byte("nested"), 0o644)
+
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("备份失败: %v\n%s", err, out)
+	}
+
+	// 带目录的文件请求（UGOS 探测场景）：父目录不存在 → change_dir 错误
+	cmd = exec.Command("rsync", "--list-only", "-r", "--password-file="+pw,
+		"--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/备份任务1_20260825_16114230.ubk/config")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("路径不存在应 rc=23，实际成功:\n%s", out)
+	}
+	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 23 {
+		t.Fatalf("期待退出码 23，实际: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `change_dir "备份任务1_20260825_16114230.ubk" (in home) failed: No such file or directory (2)`) {
+		t.Fatalf("应含 change_dir 错误消息:\n%s", out)
+	}
+
+	// 顶层文件请求（无目录部分）：link_stat 错误
+	cmd = exec.Command("rsync", "--list-only", "-r", "--password-file="+pw,
+		"--port", fmt.Sprint(port), "backup@127.0.0.1::home/missing.txt")
+	out, err = cmd.CombinedOutput()
+	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 23 {
+		t.Fatalf("期待退出码 23，实际: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `link_stat "missing.txt" (in home) failed: No such file or directory (2)`) {
+		t.Fatalf("应含 link_stat 错误消息:\n%s", out)
+	}
+
+	// 父路径是文件（非目录）：change_dir + ENOTDIR（真实 rsyncd 同款：
+	// change_dir "a.txt" (in test) failed: Not a directory (20)）
+	cmd = exec.Command("rsync", "--list-only", "-r", "--password-file="+pw,
+		"--port", fmt.Sprint(port), "backup@127.0.0.1::home/a.txt/nope")
+	out, err = cmd.CombinedOutput()
+	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 23 {
+		t.Fatalf("期待退出码 23，实际: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `change_dir "a.txt" (in home) failed: Not a directory (20)`) {
+		t.Fatalf("应含 change_dir ENOTDIR 错误消息:\n%s", out)
+	}
+
+	// 父目录存在、文件不存在：link_stat + ENOENT
+	cmd = exec.Command("rsync", "--list-only", "-r", "--password-file="+pw,
+		"--port", fmt.Sprint(port), "backup@127.0.0.1::home/sub/nope.txt")
+	out, err = cmd.CombinedOutput()
+	if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 23 {
+		t.Fatalf("期待退出码 23，实际: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `link_stat "sub/nope.txt" (in home) failed: No such file or directory (2)`) {
+		t.Fatalf("应含 link_stat 错误消息:\n%s", out)
+	}
+
+	// 存在路径不受影响
+	cmd = exec.Command("rsync", "--list-only", "--password-file="+pw,
+		"--port", fmt.Sprint(port), "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "a.txt") {
+		t.Fatalf("正常列表失败: %v\n%s", err, out)
+	}
+}
