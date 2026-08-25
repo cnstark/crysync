@@ -370,6 +370,23 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 	}
 
+	// dry-run 会话（argv 'n'）：协议走完但不产生任何持久化——快照回滚、
+	// --delete 落库跳过（真实 rsync -n 同样只报告不执行）。dry_run 期间
+	// applyStaticEntry/UpsertFile 均未执行（dry-run 分支 updated=false，静态
+	// 条目虽经事务写入但整体 rollback 撤销）。
+	if neg.DryRun {
+		rollback()
+		logger.Info("session_done",
+			"snapshot_id", int64(0),
+			"files", st.files,
+			"transferred", st.transferred,
+			"skipped", st.skipped,
+			"dry_run", true,
+			"elapsed_ms", time.Since(started).Milliseconds(),
+		)
+		return nil
+	}
+
 	// --delete 语义（generator.c delete_in_dir/delete_missing，flist.c:1402）：
 	// 删除传输根（prefix 子树）内、本次 flist 未覆盖的文件与目录行——快照模型
 	// "新快照 = 上一快照完整清单 + 会话变更"下不删除则客户端删掉的文件恢复时复活。
@@ -680,6 +697,21 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 	// 不发出任何字节，返回 updated=false（CopyFiles 已继承旧行与 chunk 关联，不落库）。
 	if ok && !row.IsDir && !row.IsSymlink && row.MTimeNs == e.MTimeNs && row.Size == e.Size {
 		st.method = "quick_check"
+		st.elapsed = time.Since(started)
+		return nil, false, st, nil
+	}
+	// dry-run（argv 'n'）：真实 generator 不发 sum_head/sums（generator.c:2390
+	// !do_xfers 提前 cleanup），客户端 sender 对传输请求也只回显 ndx+iflags
+	// （sender.c:638-642）——不发 token 流与校验和。此处对齐：只发 ndx+iflags
+	// 并读回显，不落库（updated=false），会话尾统一 rollback 不提交快照。
+	if neg.DryRun {
+		if err := sendNdxIflags(out, ndxOut, index, itemTransfer|itemIsNew); err != nil {
+			return nil, false, st, err
+		}
+		if err := recvNdxEcho(stream, ndxIn); err != nil {
+			return nil, false, st, err
+		}
+		st.method = "dry_run"
 		st.elapsed = time.Since(started)
 		return nil, false, st, nil
 	}

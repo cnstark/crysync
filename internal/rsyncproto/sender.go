@@ -329,6 +329,17 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 			return fmt.Errorf("请求传输目录: %s", e.Path)
 		}
 
+		// dry-run（argv 'n'）：客户端 generator 只发 ndx+iflags 不发 sum_head
+		// （generator.c:2390 !do_xfers），daemon sender 同样只回显 ndx+iflags
+		// 不读 sums 不发文件数据（sender.c:638-642）。
+		if neg.DryRun {
+			logger.Info("file_sent", "path", e.Path, "size", e.Size, "dry_run", true)
+			if err := writeNdxAttrs(out, ndxOut, int32(ndx), iflags, basis, xname); err != nil {
+				return err
+			}
+			continue
+		}
+
 		// 传输请求：读 sum_head + 块校验和（v1 全部丢弃；接收侧读掉才能保持流同步）
 		sum, err := readSumHead(stream)
 		if err != nil {

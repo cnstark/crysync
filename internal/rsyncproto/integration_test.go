@@ -1140,3 +1140,114 @@ func TestRsyncFileOpenDeniedPartial(t *testing.T) {
 }
 
 
+
+// TestRsyncDryRunBackup dry-run 备份（argv 'n'，!do_xfers）：真实客户端 sender 对
+// 传输请求只回显 ndx+iflags（sender.c:638-642），不读 sum_head/不发 token 流；服务端
+// 须同样只发 ndx+iflags（generator.c:2390 !do_xfers 跳过 sums）且不落库不提交快照。
+// 复现来源：UGOS（极空间）备份任务先发 dry-run 会话，此前服务端照常发空 sum_head 并
+// 死等回显导致 EOF 报错。
+func TestRsyncDryRunBackup(t *testing.T) {
+	port, r, _ := startLoggedRouterServer(t)
+
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("v1"), 0o644)
+
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	// 先正常备份一次
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("首次备份失败: %v\n%s", err, out)
+	}
+	sid, err := r.LatestSnapshotID()
+	if err != nil || sid == 0 {
+		t.Fatalf("首次备份应产生快照: %d %v", sid, err)
+	}
+
+	// 新文件 + 变化文件后 dry-run 推送
+	os.WriteFile(filepath.Join(src, "new.txt"), []byte("brand new"), 0o644)
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("v2 changed"), 0o644)
+	cmd = exec.Command("rsync", "-n", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("dry-run 备份失败: %v\n%s", err, out)
+	}
+
+	// dry-run 不产生新快照、内容不落库
+	sid2, err := r.LatestSnapshotID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sid2 != sid {
+		t.Fatalf("dry-run 不应提交新快照: %d -> %d", sid, sid2)
+	}
+	files, _ := r.GetFilesForTest(sid2)
+	for _, f := range files {
+		if f.Path == "new.txt" {
+			t.Fatalf("dry-run 不应落库新文件: %v", files)
+		}
+	}
+	var out bytes.Buffer
+	if err := r.ReadFile(sid2, "a.txt", &out); err != nil || out.String() != "v1" {
+		t.Fatalf("dry-run 不应改变已备份内容: %v %q", err, out.String())
+	}
+
+	// dry-run 之后再真实备份，新内容正常入库（dry-run 无残留影响）
+	cmd = exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("dry-run 后真实备份失败: %v\n%s", err, out)
+	}
+	sid3, _ := r.LatestSnapshotID()
+	if sid3 == sid2 {
+		t.Fatalf("真实备份应提交新快照")
+	}
+	var out2 bytes.Buffer
+	if err := r.ReadFile(sid3, "new.txt", &out2); err != nil || out2.String() != "brand new" {
+		t.Fatalf("真实备份后应能读到新文件: %v %q", err, out2.String())
+	}
+}
+
+// TestRsyncDryRunRestore dry-run 恢复（rsync -n 拉取）：客户端 generator 对传输
+// 请求只发 ndx+iflags 不发 sum_head（generator.c:2390），服务端 sender 须只回显
+// ndx+iflags（sender.c:638-642）不读 sums 不发文件数据。
+func TestRsyncDryRunRestore(t *testing.T) {
+	port, _, _ := startLoggedRouterServer(t)
+
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("hello"), 0o644)
+	os.WriteFile(filepath.Join(src, "b.txt"), []byte("world"), 0o644)
+
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("备份失败: %v\n%s", err, out)
+	}
+
+	dst := t.TempDir()
+	cmd = exec.Command("rsync", "-n", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/", dst+"/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("dry-run 恢复失败: %v\n%s", err, out)
+	}
+	// dry-run 恢复不写任何文件
+	ents, _ := os.ReadDir(dst)
+	if len(ents) != 0 {
+		t.Fatalf("dry-run 恢复不应写目标目录: %v", ents)
+	}
+
+	// 真实恢复仍正常
+	cmd = exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/", dst+"/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("真实恢复失败: %v\n%s", err, out)
+	}
+	if b, err := os.ReadFile(filepath.Join(dst, "a.txt")); err != nil || string(b) != "hello" {
+		t.Fatalf("真实恢复 a.txt: %v %q", err, b)
+	}
+}

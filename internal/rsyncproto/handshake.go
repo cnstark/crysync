@@ -214,6 +214,7 @@ type Negotiation struct {
 	PruneEmptyDirs bool // argv 含 --prune-empty-dirs/-m（同上）
 	NumericIDs     bool // argv 含 --numeric-ids（id list 是否发送）
 	SenderMode     bool // argv 含 --sender（恢复方向，服务端为 sender）
+	DryRun         bool // argv 短包含 'n'（options.c:2800 !do_xfers，唯一来源 dry_run）：传输请求只回显/只发 ndx+iflags，不传数据不落库
 	IoTimeout      int  // argv 含 --timeout=N（秒）：会话空闲超时，0 = 无（daemon 模式下客户端 server_options 会透传给服务端）
 	ChecksumSeed   int32
 	ModuleArg      string
@@ -387,6 +388,8 @@ func parseServerArgs(argv []string) *Negotiation {
 					neg.PruneEmptyDirs = true
 				case 'U':
 					neg.PreserveAtimes = true // --atimes（options.c:2847-2851；两次 -U 为 "UU"）
+				case 'n':
+					neg.DryRun = true // dry_run（options.c:2800，!do_xfers；server_options 不生成独立长选项）
 				case 'e':
 					goto nextArg
 				}
