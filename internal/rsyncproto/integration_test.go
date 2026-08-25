@@ -824,6 +824,57 @@ func TestRsyncBackupFifoSpecial(t *testing.T) {
 	}
 }
 
+// TestRsyncBackupNoLinksSymlink 无 -l 备份含 symlink 源（rsync -r）：客户端 flist
+// 中 symlink 条目 mode 保留 S_IFLNK 但不带 target 段（flist.c:925 前提），服务端
+// 跳过落库。与真实 rsyncd 3.4.1 行为对照：rc=0，客户端经 MSG_INFO 收到
+// "skipping non-regular file"（generator.c:2113），恢复结果无该 symlink。
+// 回归背景：曾因解码侧无 -l 仍读 target 段导致流错位挂死（7d93a62 修复）。
+func TestRsyncBackupNoLinksSymlink(t *testing.T) {
+	port, _, logBuf := startLoggedRouterServer(t)
+
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("nolinks"), 0o644)
+	os.Symlink("a.txt", filepath.Join(src, "b.txt"))
+
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	cmd := exec.Command("rsync", "-r", "--password-file="+pw, "--port", fmt.Sprint(port),
+		src+"/", "backup@127.0.0.1::home/")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("无 -l 备份应成功: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), `skipping non-regular file "b.txt"`) {
+		t.Fatalf("客户端应收到跳过提示（对照真实 rsyncd generator.c:2113）:\n%s", out)
+	}
+	if !strings.Contains(logBuf.String(), "skip_link_no_target") {
+		t.Fatalf("服务端日志应含 skip_link_no_target:\n%s", logBuf)
+	}
+
+	// 无 -l 列目录（恢复方向 flist 编码不带 target 段）也应正常
+	cmd = exec.Command("rsync", "--list-only", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/")
+	if out, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(out), "a.txt") {
+		t.Fatalf("无 -l 列目录应正常列出:\n%v\n%s", err, out)
+	}
+
+	// 恢复对照：a.txt 内容一致，b.txt 不存在（快照中无 symlink 行）
+	dst := t.TempDir()
+	cmd = exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+		"backup@127.0.0.1::home/", dst+"/")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("恢复失败: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+	if err != nil || string(data) != "nolinks" {
+		t.Fatalf("恢复 a.txt: %v %q", err, data)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "b.txt")); err == nil {
+		t.Fatal("恢复结果不应包含未备份的 b.txt")
+	}
+}
+
 // TestRsyncEmptySessionNoSnapshot P1#6：空 flist 备份会话（无 -a 的空目录推送，
 // argv 形如 "--server -e.LsfxCIvu --stats . home/"，entries=0）不应提交快照——
 // 此前每次此类会话都新增一个无变化快照，污染快照历史与 prune 保留计算。

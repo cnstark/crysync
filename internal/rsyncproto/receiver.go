@@ -254,10 +254,13 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 		if e.IsDir || e.IsSymlink {
 			// preserve off（无 -l）收到的 symlink 无 target 字段，无法恢复——
-			// 跳过落库并警告（协议本身合法，客户端未发送该信息）
+			// 跳过落库并警告（协议本身合法，客户端未发送该信息）。MSG_INFO 提示
+			// 对齐真实 rsyncd（generator.c:2113 无 -l 时 FINFO 回显同文本）
 			if e.IsSymlink && e.LinkTarget == "" {
 				logger.Warn("skip_link_no_target",
 					"path", e.Path, "hint", "客户端未启用 -l（preserve links），symlink 未备份")
+				_ = out.WriteInfoMsg(fmt.Sprintf(
+					"skipping non-regular file %q\n", e.Path))
 				if err := driveEntry(out, stream, ndxOut, ndxIn, i, itemIsNew); err != nil {
 					rollback()
 					return fmt.Errorf("条目 %d: %w", i, err)
