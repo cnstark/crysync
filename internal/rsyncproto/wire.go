@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // 字节序：rsync 协议为 native endian；本项目目标平台 amd64/arm64 均为小端。
@@ -184,6 +185,8 @@ func (e *noSendError) Error() string {
 
 type MuxReader struct {
 	r io.Reader
+	// OnFrame 每次成功读出一帧后调用（io_timeout 空闲计时重置点；nil 无操作）。
+	OnFrame func()
 }
 
 func NewMuxReader(r io.Reader) (*MuxReader, error) { return &MuxReader{r: r}, nil }
@@ -205,16 +208,26 @@ func (m *MuxReader) Next() ([]byte, byte, error) {
 	if _, err := io.ReadFull(m.r, payload); err != nil {
 		return nil, 0, err
 	}
+	if m.OnFrame != nil {
+		m.OnFrame()
+	}
 	return payload, tag, nil
 }
 
 type MuxWriter struct {
 	w io.Writer
+	// mu 保护写互斥：keepalive 心跳 goroutine 会与会话主流程并发写帧，
+	// 无锁交错会损坏帧边界
+	mu sync.Mutex
+	// OnWrite 每次成功写出一帧后调用（io_timeout 空闲计时重置点；nil 无操作）。
+	OnWrite func()
 }
 
 func NewMuxWriter(w io.Writer) *MuxWriter { return &MuxWriter{w: w} }
 
 func (m *MuxWriter) writeFrame(typ byte, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if len(data) > 0xFFFFFF {
 		return fmt.Errorf("帧载荷过大: %d", len(data))
 	}
@@ -223,8 +236,13 @@ func (m *MuxWriter) writeFrame(typ byte, data []byte) error {
 	if _, err := m.w.Write(hdr[:]); err != nil {
 		return err
 	}
-	_, err := m.w.Write(data)
-	return err
+	if _, err := m.w.Write(data); err != nil {
+		return err
+	}
+	if m.OnWrite != nil {
+		m.OnWrite()
+	}
+	return nil
 }
 
 func (m *MuxWriter) WriteData(data []byte) error { return m.writeFrame(muxTypeData, data) }

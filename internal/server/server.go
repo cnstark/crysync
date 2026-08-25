@@ -276,6 +276,10 @@ func sleepUntil(ctx context.Context, hhmm string) bool {
 // 必须传给后续协议解析，否则预读字节丢失）。握手成功后派生会话级 logger
 //（module/client/session 字段贯穿该会话全部日志事件）。
 func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config, logger *slog.Logger) error {
+	// 握手阶段（greeting→模块选择→认证→argv 协商）读超时上限：防半开/挂死
+	// 客户端占住连接 24h（rsync 3.5.0 DAEMON_HANDSHAKE_TIMEOUT=60 同旨）；
+	// 协商完成后由 rsyncproto.applyIoTimeout 覆盖（--timeout=N 滚动或恢复 24h）
+	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	br := bufio.NewReader(conn)
 	module, err := rsyncproto.HandleModuleRequest(br, conn, cfg)
 	if err != nil {

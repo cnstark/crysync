@@ -693,3 +693,63 @@ func TestReceiverDeltaBadChecksumPartial(t *testing.T) {
 		t.Fatalf("a.txt 应保留旧版本: %v %d 字节", err, out.Len())
 	}
 }
+
+// TestSessionIoTimeout（P1#10）：客户端 argv 含 --timeout=N 且协商后停止发送时，
+// 服务端会话应在 N 秒空闲后超时退出（idle 语义，对齐 rsyncd check_timeout），
+// 而非挂死到 24h 硬 deadline。备份与恢复两个方向分别验证。
+func TestSessionIoTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		argv string // 协商 argv（NUL 分隔）
+		run  func(server net.Conn, r *repo.Repo, m *config.ModuleConfig) error
+	}{
+		{
+			name: "备份方向",
+			argv: "--server\x00--timeout=1\x00-vlogDtpre.iLsfxCIvu\x00.\x00home/\x00\x00",
+			run: func(server net.Conn, r *repo.Repo, m *config.ModuleConfig) error {
+				return RunReceiver(context.Background(), bufio.NewReader(server), server, m, r, nil)
+			},
+		},
+		{
+			name: "恢复方向",
+			argv: "--server\x00--sender\x00--timeout=1\x00-vlogDtpre.iLsfxCIvu\x00.\x00home/\x00\x00",
+			run: func(server net.Conn, r *repo.Repo, m *config.ModuleConfig) error {
+				return RunSession(context.Background(), bufio.NewReader(server), server, m, r, nil)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, m := newTestRepoFull(t)
+			// 客户端只完成协商（argv），之后不发任何数据（模拟挂死/半开连接）
+			server, out := pipeConn(t, []byte(tc.argv))
+			done := make(chan error, 1)
+			go func() { done <- tc.run(server, r, m) }()
+			select {
+			case err := <-done:
+				if err == nil || !strings.Contains(err.Error(), "超时") {
+					t.Fatalf("会话应因 io 空闲超时返回错误, got: %v", err)
+				}
+				// 协商完成后 daemon 立即主动发 MSG_IO_TIMEOUT(33) 宣告帧：
+				// 帧头 04 00 00 28（len=4, tag=7+33）+ payload LE32(1)
+				// （main.c start_server：multiplex 建立后先于任何数据发送）
+				announce := []byte{0x04, 0x00, 0x00, 0x28, 0x01, 0x00, 0x00, 0x00}
+				if !bytes.Contains(out.Bytes(), announce) {
+					t.Fatalf("服务端输出应含 MSG_IO_TIMEOUT 宣告帧: % x", out.Bytes())
+				}
+				// 超时后向客户端补发 FERROR 文本（code 3）再断连：
+				// "[server] io timeout after 1 seconds -- exiting\n" = 47 字节
+				ferr := []byte{0x2f, 0x00, 0x00, 0x0a} // len=47, tag=7+3
+				deadline := time.Now().Add(2 * time.Second)
+				for !bytes.Contains(out.Bytes(), ferr) && time.Now().Before(deadline) {
+					time.Sleep(50 * time.Millisecond)
+				}
+				if !bytes.Contains(out.Bytes(), ferr) {
+					t.Fatalf("超时后应补发 FERROR(MSG_ERROR) 帧: % x", out.Bytes())
+				}
+			case <-time.After(6 * time.Second):
+				server.Close()
+				t.Fatal("客户端 --timeout=1 停发后服务端未在空闲超时内退出（无 io_timeout 保护，将挂到 24h 硬 deadline）")
+			}
+		})
+	}
+}

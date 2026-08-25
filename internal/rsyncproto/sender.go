@@ -41,10 +41,14 @@ func RunSession(ctx context.Context, br *bufio.Reader, w io.Writer, module *conf
 	if module.ReadOnly && !neg.SenderMode {
 		return fmt.Errorf("模块 %s 只读，拒绝推送", module.Name)
 	}
-	if neg.SenderMode {
-		return processSendSession(ctx, mr, mw, module, r, neg, logger)
+	k := applyIoTimeout(w, mr, mw, neg)
+	run := func() error {
+		if neg.SenderMode {
+			return processSendSession(ctx, mr, mw, module, r, neg, logger)
+		}
+		return processSession(ctx, mr, mw, module, r, neg, logger, k)
 	}
-	return processSession(ctx, mr, mw, module, r, neg, logger)
+	return wrapIoTimeout(run(), w, mw, neg)
 }
 
 // RunSessionWithReader：与已进行握手/认证的 bufio.Reader 继续协议（避免预读丢失）。
@@ -71,7 +75,10 @@ func RunSender(ctx context.Context, br *bufio.Reader, w io.Writer, module *confi
 	if err := rejectCompression(mw, neg); err != nil {
 		return err
 	}
-	return processSendSession(ctx, mr, mw, module, r, neg, logger)
+	// 恢复方向以写为主（每帧写即重置计时），无本地慢工作点，keeper 仅用于
+	// 挂载重置回调与宣告帧，返回值不需要
+	applyIoTimeout(w, mr, mw, neg)
+	return wrapIoTimeout(processSendSession(ctx, mr, mw, module, r, neg, logger), w, mw, neg)
 }
 
 // RunSenderWithReader：与已进行握手/认证的 bufio.Reader 继续协议（避免预读丢失），

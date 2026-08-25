@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -200,6 +201,7 @@ type Negotiation struct {
 	PruneEmptyDirs bool // argv 含 --prune-empty-dirs/-m（同上）
 	NumericIDs     bool // argv 含 --numeric-ids（id list 是否发送）
 	SenderMode     bool // argv 含 --sender（恢复方向，服务端为 sender）
+	IoTimeout      int  // argv 含 --timeout=N（秒）：会话空闲超时，0 = 无（daemon 模式下客户端 server_options 会透传给服务端）
 	ChecksumSeed   int32
 	ModuleArg      string
 	Argv           []string // 原始客户端参数（日志/调试用）
@@ -279,6 +281,13 @@ func parseServerArgs(argv []string) *Negotiation {
 			}
 			if a == "--numeric-ids" {
 				neg.NumericIDs = true
+			}
+			// --timeout=N：客户端 io_timeout 透传（server_options 生成 --timeout=N
+			// 单项），daemon 侧同样启用空闲超时（io.c check_timeout）
+			if strings.HasPrefix(a, "--timeout=") {
+				if v, err := strconv.Atoi(strings.TrimPrefix(a, "--timeout=")); err == nil && v > 0 {
+					neg.IoTimeout = v
+				}
 			}
 			if a == "--checksum" {
 				neg.ChecksumMode = true

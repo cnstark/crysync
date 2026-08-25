@@ -34,6 +34,7 @@ func logNegotiated(logger *slog.Logger, neg *Negotiation) {
 		"preserve_devices", neg.PreserveDevices,
 		"delete_mode", neg.DeleteMode,
 		"numeric_ids", neg.NumericIDs,
+		"io_timeout", neg.IoTimeout,
 	)
 }
 
@@ -56,7 +57,8 @@ func RunReceiver(ctx context.Context, br *bufio.Reader, w io.Writer, module *con
 	if err := rejectCompression(mw, neg); err != nil {
 		return err
 	}
-	return processSession(ctx, mr, mw, module, r, neg, logger)
+	k := applyIoTimeout(w, mr, mw, neg)
+	return wrapIoTimeout(processSession(ctx, mr, mw, module, r, neg, logger, k), w, mw, neg)
 }
 
 // RunReceiverWithReader：与已进行握手/认证的 bufio.Reader 继续协议（避免预读丢失）。
@@ -93,9 +95,14 @@ type fileStats struct {
 // processSession 完整 mux 会话：
 // [条件]filter -> flist（逐条到哨兵）-> [条件]id list -> 传输阶段（generator 角色
 // 逐条 ndx/iflags/sums 驱动 + receiver 角色读回显与 token 流）-> goodbye -> 提交快照。
-func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *config.ModuleConfig, r *repo.Repo, neg *Negotiation, logger *slog.Logger) (err error) {
+// keeper 非 nil（客户端 --timeout=N）时经 KeepAlive 在块存储等本地慢工作点续期。
+func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *config.ModuleConfig, r *repo.Repo, neg *Negotiation, logger *slog.Logger, keeper *idleKeeper) (err error) {
 	if logger == nil {
 		logger = nopLogger
+	}
+	keepAlive := func() {}
+	if keeper != nil {
+		keepAlive = keeper.KeepAlive
 	}
 	stream := NewMuxStream(in)
 	// ndx 差分编码的读/写方向各自独立维护 prev 状态（io.c write_ndx/read_ndx 分方向）
@@ -276,7 +283,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 		// 普通文件：quick check 命中不发请求（不落库，CopyFiles 已继承旧行与 chunk 关联）；
 		// 变化文件发真实块校验和（delta）；新文件/空文件发空校验和请求（全量 literal）
-		refs, updated, fs, err := receiveFileDelta(ctx, stream, out, ndxOut, ndxIn, r, neg, activeID, e, i, prefix)
+		refs, updated, fs, err := receiveFileDelta(ctx, stream, out, ndxOut, ndxIn, r, neg, activeID, e, i, prefix, keepAlive)
 		if err != nil {
 			// 客户端 MSG_NO_SEND（open 失败/vanished，sender.c:722-724）：该文件被
 			// 跳过（无回显无 token 流），客户端已报错（rc=23）——不落库，会话继续
@@ -524,7 +531,7 @@ func applyStaticEntry(txn *repo.SnapshotTxn, e FileEntry, path string) error {
 // receiveFileLegacy 全量传输路径（v1）：发 ndx + iflags(ITEM_TRANSFER|ITEM_IS_NEW)
 // + write_sum_head(NULL)（16 字节全 0）→ 客户端 count==0 全量 literal 发送。
 // 用于新文件/空文件/旧行类型不一致（无可作 basis 的旧文件）场景。
-func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, index int) ([]meta.ChunkRef, fileStats, error) {
+func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, index int, keepAlive func()) ([]meta.ChunkRef, fileStats, error) {
 	started := time.Now()
 	st := fileStats{method: "full"}
 	// ndx + iflags + 空校验和请求（count/blength/s2length/remainder 各 int32 0 = 16 字节）
@@ -564,6 +571,7 @@ func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, n
 		if len(data) == 0 {
 			return nil
 		}
+		keepAlive() // StoreChunk 可能写慢后端（WebDAV）：续期 + 心跳防客户端超时误断
 		id, reused, err := r.StoreChunk(data)
 		if err != nil {
 			return err
@@ -652,7 +660,7 @@ func writeNullSumHead(w io.Writer) error {
 //     StoreChunk → 读 16B 整文件 MD5 与重组累计比对。
 //
 // 查询/落库均用库内全路径（prefix + e.Path），与 sender 方向子路径恢复对称。
-func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, neg *Negotiation, activeID int64, e FileEntry, index int, prefix string) ([]meta.ChunkRef, bool, fileStats, error) {
+func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, neg *Negotiation, activeID int64, e FileEntry, index int, prefix string, keepAlive func()) ([]meta.ChunkRef, bool, fileStats, error) {
 	started := time.Now()
 	st := fileStats{method: "delta"}
 	fullPath := e.Path
@@ -672,7 +680,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 	}
 	// 全量路径：无旧行 / 空文件（新旧任一为空都无 delta 基础）/ 旧行类型不一致
 	if !ok || e.Size == 0 || row.Size == 0 || row.IsDir || row.IsSymlink {
-		legacyRefs, lst, lerr := receiveFileLegacy(ctx, stream, out, ndxOut, ndxIn, r, index)
+		legacyRefs, lst, lerr := receiveFileLegacy(ctx, stream, out, ndxOut, ndxIn, r, index, keepAlive)
 		lst.elapsed = time.Since(started)
 		return legacyRefs, true, lst, lerr
 	}
@@ -734,6 +742,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 		if len(data) == 0 {
 			return nil
 		}
+		keepAlive() // StoreChunk 可能写慢后端（WebDAV）：续期 + 心跳防客户端超时误断
 		id, reused, err := r.StoreChunk(data)
 		if err != nil {
 			return err
