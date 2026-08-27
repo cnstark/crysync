@@ -445,6 +445,15 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		"chunks_stored", st.chunksStored,
 		"elapsed_ms", time.Since(started).Milliseconds(),
 	)
+	// 单份模式（模块 snapshot: false）收尾：删除更早的全部快照只保留本份。
+	// 失败仅记日志不报错客户端——数据已提交，残留旧快照无害，下次会话收敛。
+	if !module.Snapshot {
+		if removed, blobs, terr := r.KeepOnlySnapshot(sid); terr != nil {
+			logger.Error("single_copy_trim_error", "err", terr.Error())
+		} else if removed > 0 || blobs > 0 {
+			logger.Info("single_copy_trim", "removed_snapshots", removed, "reclaimed_blobs", blobs)
+		}
+	}
 	return nil
 }
 

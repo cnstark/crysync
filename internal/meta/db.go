@@ -363,29 +363,42 @@ func nullString(s string) any {
 
 // DeleteSnapshot 删除快照及其文件行；快照引用的全部 chunk refcount 递减
 // （按每个文件关联计数，去重同 chunk 多文件引用），归零者删除 chunk 行——
-// 对应 blob 成为孤儿，由 GC 回收。
-func (d *DB) DeleteSnapshot(snapshotID int64) error {
+// 对应 blob 成为孤儿，由 GC 回收。返回删除的 chunk 行数（调用方据此判断
+// 是否产生了新孤儿、是否需要触发后端回收）。
+func (d *DB) DeleteSnapshot(snapshotID int64) (int, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	if _, err := tx.Exec(`UPDATE chunks SET refcount = refcount - (
 		SELECT COUNT(*) FROM file_chunks fc JOIN files f ON f.id = fc.file_id
 		WHERE f.snapshot_id = ? AND fc.chunk_id = chunks.id)`,
 		snapshotID); err != nil {
-		return err
+		return 0, err
+	}
+	// 同事务内先数出将删除的 chunk 行（UPDATE 之后 refcount 已递减，
+	// SELECT 与 DELETE 的 WHERE 完全一致）
+	var deletedChunks int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM chunks WHERE refcount <= 0 AND id IN (
+		SELECT DISTINCT fc.chunk_id FROM file_chunks fc
+		JOIN files f ON f.id = fc.file_id WHERE f.snapshot_id = ?)`,
+		snapshotID).Scan(&deletedChunks); err != nil {
+		return 0, err
 	}
 	if _, err := tx.Exec(`DELETE FROM chunks WHERE refcount <= 0 AND id IN (
 		SELECT DISTINCT fc.chunk_id FROM file_chunks fc
 		JOIN files f ON f.id = fc.file_id WHERE f.snapshot_id = ?)`,
 		snapshotID); err != nil {
-		return err
+		return 0, err
 	}
 	if _, err := tx.Exec(`DELETE FROM snapshots WHERE id = ?`, snapshotID); err != nil {
-		return err
+		return 0, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return deletedChunks, nil
 }
 
 func (d *DB) QueryRow(q string, args ...any) *sql.Row { return d.db.QueryRow(q, args...) }

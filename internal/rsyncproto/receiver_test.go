@@ -58,7 +58,7 @@ func newTestRepoFull(t *testing.T) (*repo.Repo, *config.ModuleConfig) {
 	key, _ := crypto.GenerateKey()
 	be := backend.NewInMemory()
 	r := repo.New(db, be, key, 64)
-	m := &config.ModuleConfig{Name: "home", Path: "/"}
+	m := &config.ModuleConfig{Name: "home", Path: "/", Snapshot: true}
 	return r, m
 }
 
@@ -77,7 +77,7 @@ func newTestRepoLarge(t *testing.T) (*repo.Repo, *config.ModuleConfig) {
 	key, _ := crypto.GenerateKey()
 	be := backend.NewInMemory()
 	r := repo.New(db, be, key, 4<<20)
-	m := &config.ModuleConfig{Name: "home", Path: "/"}
+	m := &config.ModuleConfig{Name: "home", Path: "/", Snapshot: true}
 	return r, m
 }
 

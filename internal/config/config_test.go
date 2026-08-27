@@ -189,6 +189,35 @@ modules:
 
 // TestEnvExpansion：配置文本在 yaml 解析前做 ${VAR} 环境变量展开——
 // 引号内引用可安全承载含特殊字符（#、:）的值；未定义变量展开为空。
+// TestSnapshotToggle：snapshot 缺省 false（单份模式），显式 true 解析为 true。
+func TestSnapshotToggle(t *testing.T) {
+	p := writeTemp(t, `
+listen: "127.0.0.1:873"
+modules:
+  - name: a
+    path: /
+    backend: { type: dir, path: /x }
+    keyfile: /k
+    meta: /m
+  - name: b
+    path: /
+    backend: { type: dir, path: /x }
+    keyfile: /k
+    meta: /m
+    snapshot: true
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Modules[0].Snapshot {
+		t.Fatal("缺省 snapshot 应为 false（单份模式）")
+	}
+	if !c.Modules[1].Snapshot {
+		t.Fatal("显式 snapshot: true 应解析为 true")
+	}
+}
+
 func TestEnvExpansion(t *testing.T) {
 	t.Setenv("CS_TEST_RSYNC_PASS", "p#ss:word")
 	t.Setenv("CS_TEST_WEBDAV_URL", "http://quarkdav:8080/crysync/")

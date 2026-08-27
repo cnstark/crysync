@@ -513,6 +513,79 @@ func TestPrune(t *testing.T) {
 	}
 }
 
+// TestKeepOnlySnapshot：单份模式收尾。三个内容各异的快照 + 一个纯复制
+// （无变化）快照：裁剪删旧快照、回收独占 blob、共享 chunk 保留；随后再来
+// 一个无变化快照时裁剪不产生孤儿 chunk，跳过 GC（后端零访问）。
+func TestKeepOnlySnapshot(t *testing.T) {
+	r, be := newTestRepo(t)
+	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.Local)
+	contents := []string{"snap one", "snap two", "snap three"}
+	for i, data := range contents {
+		txn, err := r.BeginSnapshot(base.Add(time.Duration(i) * time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, _, _ := r.StoreChunk([]byte(data))
+		if err := txn.UpsertFile(meta.FileRow{Path: "f.txt", Mode: 0o644, Size: int64(len(data))},
+			[]meta.ChunkRef{{ChunkID: c, IDX: 0}}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := txn.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 快照 4：纯无变化会话（复制快照 3 清单，共享其 chunk）
+	txn4, err := r.BeginSnapshot(base.Add(3 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s4, err := txn4.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	removed, blobs, err := r.KeepOnlySnapshot(s4)
+	if err != nil {
+		t.Fatalf("KeepOnlySnapshot: %v", err)
+	}
+	// 删除 3 个旧快照；snap one/two 的 chunk 归零回收（2 blob），
+	// snap three 的 chunk 被快照 4 共享保留（GC 不动其 blob）
+	if removed != 3 || blobs != 2 {
+		t.Fatalf("应删 3 快照 2 blob: %d %d", removed, blobs)
+	}
+	var buf bytes.Buffer
+	if err := r.ReadFile(s4, "f.txt", &buf); err != nil || buf.String() != "snap three" {
+		t.Fatalf("保留快照读取失败: %v %q", err, buf.String())
+	}
+	if got, _ := be.List(); len(got) != 1 {
+		t.Fatalf("后端应只剩 1 个 blob: %v", got)
+	}
+	infos, _ := r.meta.SnapshotList()
+	if len(infos) != 1 || infos[0].ID != s4 {
+		t.Fatalf("应只剩快照 %d: %+v", s4, infos)
+	}
+
+	// 再来一个无变化快照：裁剪不删 chunk 行（共享），不触发 GC、后端无变化
+	txn5, err := r.BeginSnapshot(base.Add(4 * time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s5, err := txn5.Commit()
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, blobs, err = r.KeepOnlySnapshot(s5)
+	if err != nil {
+		t.Fatalf("KeepOnlySnapshot 无变化: %v", err)
+	}
+	if removed != 1 || blobs != 0 {
+		t.Fatalf("无变化会话应删 1 快照 0 blob（跳过 GC）: %d %d", removed, blobs)
+	}
+	if got, _ := be.List(); len(got) != 1 {
+		t.Fatalf("后端 blob 不应变化: %v", got)
+	}
+}
+
 // TestGetFileRow：repo 层包装的 quick check 查询（UpsertFile 后可查回）。
 func TestGetFileRow(t *testing.T) {
 	r, _ := newTestRepo(t)

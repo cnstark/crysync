@@ -150,7 +150,7 @@ func TestDeleteSnapshotCascades(t *testing.T) {
 	if _, err := db.UpsertFile(s1, FileRow{Path: "a.txt", Mode: 0o644, Size: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.DeleteSnapshot(s1); err != nil {
+	if _, err := db.DeleteSnapshot(s1); err != nil {
 		t.Fatal(err)
 	}
 	var files int
@@ -160,6 +160,45 @@ func TestDeleteSnapshotCascades(t *testing.T) {
 	var snaps int
 	if err := db.db.QueryRow(`SELECT COUNT(*) FROM snapshots WHERE id = ?`, s1).Scan(&snaps); err != nil || snaps != 0 {
 		t.Fatalf("级联删除后 snapshots 应无 s1: %d %v", snaps, err)
+	}
+}
+
+// TestDeleteSnapshotReturnsChunkCount：返回值 = 本次删除快照导致 refcount 归零
+// 而删除的 chunk 行数（被其他快照继续引用的 chunk 不计入、不删除）。
+func TestDeleteSnapshotReturnsChunkCount(t *testing.T) {
+	db := openTemp(t)
+	var shared, excl [32]byte
+	shared[0], excl[0] = 1, 2
+	cShared, _ := db.InsertChunk(shared, "blob-shared", 10)
+	cExcl, _ := db.InsertChunk(excl, "blob-excl", 10)
+
+	s1, _ := db.CreateSnapshot(time.Now())
+	fid, _ := db.UpsertFile(s1, FileRow{Path: "a.txt", Mode: 0o644, Size: 10})
+	db.AttachChunks(fid, []ChunkRef{{ChunkID: cShared, IDX: 0}})
+	db.IncrRefcount(cShared)
+	fid2, _ := db.UpsertFile(s1, FileRow{Path: "b.txt", Mode: 0o644, Size: 10})
+	db.AttachChunks(fid2, []ChunkRef{{ChunkID: cExcl, IDX: 0}})
+	db.IncrRefcount(cExcl)
+
+	// s2 继续引用 shared：删 s1 后 shared refcount 2->1 保留，excl 归零删除
+	s2, _ := db.CreateSnapshot(time.Now())
+	fid3, _ := db.UpsertFile(s2, FileRow{Path: "a.txt", Mode: 0o644, Size: 10})
+	db.AttachChunks(fid3, []ChunkRef{{ChunkID: cShared, IDX: 0}})
+	db.IncrRefcount(cShared)
+
+	deleted, err := db.DeleteSnapshot(s1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("应只删 1 个 chunk 行（独占者），得到 %d", deleted)
+	}
+	var n int
+	if err := db.db.QueryRow(`SELECT COUNT(*) FROM chunks WHERE id = ?`, cShared).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("共享 chunk 应保留: %d %v", n, err)
+	}
+	if err := db.db.QueryRow(`SELECT COUNT(*) FROM chunks WHERE id = ?`, cExcl).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("独占 chunk 行应被删除: %d %v", n, err)
 	}
 }
 

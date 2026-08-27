@@ -5,7 +5,8 @@ auth:
 modules:
   - name: home
     path: "/"
+    snapshot: true                   # false（缺省）= 单份模式只保留最新一份；true = 多版本历史
     backend: { type: dir, path: /data/home }
     keyfile: /keys/home.key
     meta: /meta/home.db
-    prune: { keep_last: 7, keep_daily: 14, keep_weekly: 8, keep_monthly: 6, schedule: "03:00" }
+    prune: { keep_last: 7, keep_daily: 14, keep_weekly: 8, keep_monthly: 6, schedule: "03:00" }  # 仅多版本历史模式有意义

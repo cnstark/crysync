@@ -25,7 +25,20 @@ import (
 )
 
 // 起一个完整 daemon（握手+协商+receiver）监听随机端口，返回端口号。
+// 模块显式开快照历史（多版本断言依赖；单份模式见 startSingleCopyServer）。
 func startTestServer(t *testing.T) (int, *repo.Repo) {
+	t.Helper()
+	return startServerModule(t, &config.ModuleConfig{Name: "home", Path: "/", Snapshot: true})
+}
+
+// startSingleCopyServer 同 startTestServer 但模块为单份模式（snapshot: false
+// 缺省行为）：每次成功会话后仓库收敛为只保留最新一份快照。
+func startSingleCopyServer(t *testing.T) (int, *repo.Repo) {
+	t.Helper()
+	return startServerModule(t, &config.ModuleConfig{Name: "home", Path: "/"})
+}
+
+func startServerModule(t *testing.T, module *config.ModuleConfig) (int, *repo.Repo) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -41,7 +54,6 @@ func startTestServer(t *testing.T) (int, *repo.Repo) {
 	key, _ := crypto.GenerateKey()
 	be := backend.NewInMemory()
 	r := repo.New(db, be, key, 64)
-	module := &config.ModuleConfig{Name: "home", Path: "/"}
 	cfg := &config.Config{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}},
 		Modules: []config.ModuleConfig{*module}}
 
@@ -143,6 +155,69 @@ func TestRsyncClientSecondBackup(t *testing.T) {
 	files1, _ := r.GetFilesForTest(s2 - 1)
 	if len(files1) != 1 || files1[0].Path != "a.txt" {
 		t.Fatalf("第一次快照应有 a.txt: %v", files1)
+	}
+}
+
+// TestSingleCopySnapshotTrim：单份模式（snapshot: false 缺省）端到端：真实
+// rsync 客户端多次备份后仓库恒只保留最新一份快照，旧快照清单被裁剪、最新
+// 快照内容正确；无变化会话（纯 quick check）同样收敛为一份。
+func TestSingleCopySnapshotTrim(t *testing.T) {
+	port, r := startSingleCopyServer(t)
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("v1"), 0o644)
+	pw := filepath.Join(t.TempDir(), "pw")
+	os.WriteFile(pw, []byte("secret\n"), 0o600)
+
+	run := func() {
+		t.Helper()
+		cmd := exec.Command("rsync", "-a", "--password-file="+pw, "--port", fmt.Sprint(port),
+			src+"/", "backup@127.0.0.1::home/")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("rsync 备份失败: %v\n%s", err, out)
+		}
+	}
+	run()
+	s1, _ := r.LatestSnapshotID()
+	if n, _ := r.SnapshotCountForTest(); n != 1 {
+		t.Fatalf("首次备份后应恰 1 个快照: %d", n)
+	}
+
+	// 第二次：文件变化 + 新增一个 -> 提交新快照并裁掉旧快照
+	os.WriteFile(filepath.Join(src, "a.txt"), []byte("v2 changed"), 0o644)
+	os.WriteFile(filepath.Join(src, "new.txt"), []byte("new"), 0o644)
+	run()
+	s2, _ := r.LatestSnapshotID()
+	if n, _ := r.SnapshotCountForTest(); n != 1 {
+		t.Fatalf("二次备份后仍应恰 1 个快照: %d", n)
+	}
+	if s2 <= s1 {
+		t.Fatalf("新快照 ID 应递增: %d -> %d", s1, s2)
+	}
+	// 旧快照已裁剪（清单为空）
+	if files, _ := r.GetFilesForTest(s1); len(files) != 0 {
+		t.Fatalf("旧快照应已被裁剪: %v", files)
+	}
+	files2, _ := r.GetFilesForTest(s2)
+	if len(files2) != 2 {
+		t.Fatalf("最新快照应有 2 个文件: %v", files2)
+	}
+	var out bytes.Buffer
+	if err := r.ReadFile(s2, "a.txt", &out); err != nil || out.String() != "v2 changed" {
+		t.Fatalf("读取 a.txt: %v %q", err, out.String())
+	}
+
+	// 第三次：无变化（纯 quick check，无孤儿 chunk 不触发后端 GC）-> 仍恰 1 份
+	run()
+	s3, _ := r.LatestSnapshotID()
+	if n, _ := r.SnapshotCountForTest(); n != 1 {
+		t.Fatalf("无变化会话后仍应恰 1 个快照: %d", n)
+	}
+	if files, _ := r.GetFilesForTest(s2); len(files) != 0 {
+		t.Fatalf("上一份快照应已被裁剪: %v", files)
+	}
+	out.Reset()
+	if err := r.ReadFile(s3, "a.txt", &out); err != nil || out.String() != "v2 changed" {
+		t.Fatalf("读取最新快照 a.txt: %v %q", err, out.String())
 	}
 }
 

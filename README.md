@@ -1,6 +1,6 @@
 # CrySync
 
-加密备份工具：对外提供 rsyncd 风格的 rsync 协议服务（兼容 rsync 3.x 客户端，protocol 30/31）。服务端将文件内容 **AES-256-GCM 加密**后存入文件后端，目录树与属性明文存本地 SQLite，每次会话提交一个**多版本快照**，可按需恢复到任意时间点。
+加密备份工具：对外提供 rsyncd 风格的 rsync 协议服务（兼容 rsync 3.x 客户端，protocol 30/31）。服务端将文件内容 **AES-256-GCM 加密**后存入文件后端，目录树与属性明文存本地 SQLite，每次会话提交一个快照--缺省**单份模式**只保留最新一份，`snapshot: true` 开启多版本历史后可按需恢复到任意时间点。
 
 ## 特性
 
@@ -10,7 +10,7 @@
 - ✅ 只读模块：可拉不可推
 - ✅ 后端：本地目录 + WebDAV（v1）
 - ✅ 去重：4 MiB 分块 + SHA-256 明文哈希（增量重组后统一切块，内容寻址天然去重）
-- ✅ 快照：多版本 + 活跃快照切换（恢复到任意时间点）
+- ✅ 快照：`snapshot: true` 开启多版本历史 + 活跃快照切换（恢复到任意时间点）；缺省单份模式只保留最新一份
 - ✅ prune：restic 保留规则（keep_last/daily/weekly/monthly）+ 孤儿 blob 回收，每日调度
 - ✅ 认证：rsyncd 风格 challenge-response（MD5）
 - 🚧 未实现（v2）：xattr/硬链接/稀疏文件
@@ -97,6 +97,7 @@ modules:
   - name: home
     path: "/"                            # 客户端看到的模块根
     read_only: false                     # true = 只读模块（可拉不可推）
+    snapshot: false                      # 缺省单份模式；true = 保留多版本快照历史
     backend: { type: dir, path: /var/lib/crysync/data/home }
     # 或 WebDAV：backend: { type: webdav, url: https://dav.example.com/crysync, username: ..., password: ... }
     keyfile: /var/lib/crysync/keys/home.key
@@ -119,7 +120,16 @@ crysync snapshots --config crysync.yaml --module home --set-active 3   # 切换�
 crysync prune --config crysync.yaml --module home     # 手动执行保留策略 + 孤儿 blob 回收
 ```
 
-`set-active` 切换后，`rsync` 拉取即恢复该时间点的目录树。
+`set-active` 切换后，`rsync` 拉取即恢复该时间点的目录树（仅多版本历史模式有意义）。
+
+## 快照模式
+
+- **单份模式（缺省，`snapshot: false`）**：每次成功备份后仓库只保留最新一份快照，更早快照及其独占 blob 即时删除，镜像式语义。`snapshots` 列表恒为 1 行，`--set-active` 无意义，也无需配置 `prune`（无可清理）。适合同步/镜像场景，存储占用最小。
+- **多版本历史（`snapshot: true`）**：每次成功备份累积一个新快照，由 `prune` 保留策略清理；`--set-active` 切换恢复时间点。
+
+> ⚠️ **升级注意**：`snapshot` 为新增配置项且缺省单份模式。已有历史快照的部署升级后，若未显式配置 `snapshot: true`，**下一次成功备份会把全部历史裁剪到只剩一份**（被裁快照及其独占数据随即删除，不可恢复）。需要保留时间点历史的既有部署请显式配置。
+>
+> 单份模式下并发备份同一模块时后提交者胜（更早的在途会话可能报错，客户端重试即可）；要彻底规避可设 `max_connections: 1`。
 
 ## 存储架构
 

@@ -155,7 +155,8 @@ func (t *SnapshotTxn) Rollback() error {
 		return errors.New("快照事务已结束")
 	}
 	t.finalized = true
-	return t.repo.meta.DeleteSnapshot(t.snapshotID)
+	_, err := t.repo.meta.DeleteSnapshot(t.snapshotID)
+	return err
 }
 
 func (r *Repo) LatestSnapshotID() (int64, error) {
@@ -320,6 +321,12 @@ func (r *Repo) GetFilesForTest(snapshotID int64) ([]meta.FileRow, error) {
 	return r.meta.GetFiles(snapshotID)
 }
 
+// SnapshotCountForTest 临时公开包装，供测试断言（单份模式恒 1）。
+func (r *Repo) SnapshotCountForTest() (int, error) {
+	infos, err := r.meta.SnapshotList()
+	return len(infos), err
+}
+
 // Prune 按保留策略执行清理：删除被裁掉的快照（DeleteSnapshot 递减引用，
 // 归零的 chunk 行删除）-> 孤儿 blob 回收（GC）。返回删除的快照数与回收的 blob 数。
 func (r *Repo) Prune(p prune.Policy) (int, int, error) {
@@ -333,7 +340,7 @@ func (r *Repo) Prune(p prune.Policy) (int, int, error) {
 	}
 	_, remove := p.Apply(snaps)
 	for _, s := range remove {
-		if err := r.meta.DeleteSnapshot(s.ID); err != nil {
+		if _, err := r.meta.DeleteSnapshot(s.ID); err != nil {
 			return 0, 0, fmt.Errorf("删除快照 %d: %w", s.ID, err)
 		}
 	}
@@ -342,6 +349,44 @@ func (r *Repo) Prune(p prune.Policy) (int, int, error) {
 		return len(remove), 0, err
 	}
 	return len(remove), blobs, nil
+}
+
+// KeepOnlySnapshot 单份模式（模块配置 snapshot: false）会话收尾：删除
+// keepID 之前的全部快照，使仓库收敛为"只保留一份"。返回删除的快照数与
+// 回收的 blob 数。
+//
+// 语义要点：
+//   - 只删 ID 更小的快照（更早创建）。并发会话已提交的更新快照不殃及——
+//     同模块并发单份备份收敛为最后提交者；被裁掉在途快照的会话会在后续
+//     落库时报错（客户端重试即可）。要彻底规避可用 max_connections: 1。
+//   - 本次删除未产生孤儿 chunk（deletedChunks=0，如纯 quick check 的无变化
+//     会话）时跳过 GC，避免每次会话全量扫描后端；失败/中断会话的陈年孤儿
+//     由下一次确有删除的会话或 prune 调度兜底回收。
+func (r *Repo) KeepOnlySnapshot(keepID int64) (int, int, error) {
+	infos, err := r.meta.SnapshotList()
+	if err != nil {
+		return 0, 0, err
+	}
+	var removed, deletedChunks int
+	for _, s := range infos {
+		if s.ID >= keepID {
+			continue
+		}
+		n, err := r.meta.DeleteSnapshot(s.ID)
+		if err != nil {
+			return removed, 0, fmt.Errorf("删除快照 %d: %w", s.ID, err)
+		}
+		removed++
+		deletedChunks += n
+	}
+	if deletedChunks == 0 {
+		return removed, 0, nil
+	}
+	blobs, err := r.GC()
+	if err != nil {
+		return removed, 0, err
+	}
+	return removed, blobs, nil
 }
 
 // GC 回收孤儿 blob：后端存在但未被任何 chunk 引用的 blob（失败/中断会话的

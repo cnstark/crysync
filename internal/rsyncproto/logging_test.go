@@ -39,7 +39,7 @@ func startLoggedTestServer(t *testing.T) (int, *bytes.Buffer) {
 	t.Cleanup(func() { db.Close() })
 	key, _ := crypto.GenerateKey()
 	r := repo.New(db, backend.NewInMemory(), key, 64)
-	module := &config.ModuleConfig{Name: "home", Path: "/"}
+	module := &config.ModuleConfig{Name: "home", Path: "/", Snapshot: true}
 	cfg := &config.Config{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}},
 		Modules: []config.ModuleConfig{*module}}
 
@@ -81,7 +81,7 @@ func startLoggedRouterServer(t *testing.T) (int, *repo.Repo, *bytes.Buffer) {
 	t.Cleanup(func() { db.Close() })
 	key, _ := crypto.GenerateKey()
 	r := repo.New(db, backend.NewInMemory(), key, 64)
-	module := &config.ModuleConfig{Name: "home", Path: "/"}
+	module := &config.ModuleConfig{Name: "home", Path: "/", Snapshot: true}
 	cfg := &config.Config{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}},
 		Modules: []config.ModuleConfig{*module}}
 
