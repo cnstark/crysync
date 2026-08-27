@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"crysync/internal/config"
-	"crysync/internal/meta"
-	"crysync/internal/server"
+	"crysync/internal/core/meta"
+	"crysync/internal/front/rsync"
 )
 
 func TestBuildSmoke(t *testing.T) {
@@ -70,7 +70,7 @@ func TestCLIVersion(t *testing.T) {
 }
 
 // TestCLISnapshotsAndPrune：snapshots 列表 / set-active / prune 全流程。
-// 用 server.OpenRepoForModule 直接造快照（避免起 daemon），CLI 走真实二进制。
+// 用 rsync.OpenRepoForModule 直接造快照（避免起 daemon），CLI 走真实二进制。
 func TestCLISnapshotsAndPrune(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "crysync")
@@ -95,7 +95,7 @@ func TestCLISnapshotsAndPrune(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, closeRepo, err := server.OpenRepoForModule(&cfg.Modules[0])
+	r, closeRepo, err := rsync.OpenRepoForModule(&cfg.Modules[0])
 	if err != nil {
 		t.Fatal(err)
 	}

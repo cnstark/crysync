@@ -11,8 +11,8 @@ import (
 	"syscall"
 
 	"crysync/internal/config"
+	"crysync/internal/front/rsync"
 	"crysync/internal/logging"
-	"crysync/internal/server"
 )
 
 // version 由构建时注入（ldflags -X main.version=<tag>），本地构建缺省 dev。
@@ -41,7 +41,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := server.Serve(ctx, cfg, logger); err != nil {
+	if err := rsync.Serve(ctx, cfg, logger); err != nil {
 		fmt.Fprintf(os.Stderr, "crysyncd: %v\n", err)
 		os.Exit(1)
 	}

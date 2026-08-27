@@ -8,8 +8,8 @@ import (
 
 	"crysync/internal/backend"
 	"crysync/internal/config"
-	"crysync/internal/prune"
-	"crysync/internal/server"
+	"crysync/internal/core/prune"
+	"crysync/internal/front/rsync"
 )
 
 func main() {
@@ -67,7 +67,7 @@ func cmdInit(args []string) error {
 	// 与 daemon 启动共用同一套初始化逻辑（幂等；密钥缺失但元数据库已存在时拒绝）
 	for i := range cfg.Modules {
 		m := &cfg.Modules[i]
-		autoInit, err := server.EnsureModuleInit(m)
+		autoInit, err := rsync.EnsureModuleInit(m)
 		if err != nil {
 			return fmt.Errorf("模块 %s: %w", m.Name, err)
 		}
@@ -117,7 +117,7 @@ func cmdSnapshots(args []string) error {
 		return err
 	}
 	for _, m := range modules {
-		r, closeRepo, err := server.OpenRepoForModule(m)
+		r, closeRepo, err := rsync.OpenRepoForModule(m)
 		if err != nil {
 			return fmt.Errorf("模块 %s: %w", m.Name, err)
 		}
@@ -178,7 +178,7 @@ func cmdPrune(args []string) error {
 		return err
 	}
 	for _, m := range modules {
-		r, closeRepo, err := server.OpenRepoForModule(m)
+		r, closeRepo, err := rsync.OpenRepoForModule(m)
 		if err != nil {
 			return fmt.Errorf("模块 %s: %w", m.Name, err)
 		}

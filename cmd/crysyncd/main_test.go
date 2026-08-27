@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"crysync/internal/crypto"
+	"crysync/internal/core/crypto"
 )
 
 // TestDaemonVersion：--version 打印注入的版本号后退出（无需有效配置文件）。

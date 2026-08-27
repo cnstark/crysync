@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"crysync/internal/prune"
+	"crysync/internal/core/prune"
 
 	"gopkg.in/yaml.v3"
 )
