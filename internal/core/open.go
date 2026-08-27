@@ -6,6 +6,7 @@ package core
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -59,13 +60,62 @@ func OpenModule(module *config.ModuleConfig) (*Module, error) {
 		return nil, fmt.Errorf("模块 %s 后端不可用: %w", module.Name, err)
 	}
 	r := repo.New(db, be, key, module.ChunkSizeBytes())
+	// 单份模式裁剪写包装（模块 snapshot: false 缺省）：WebDAV 每次"写即快照"
+	// 提交后裁剪，只保留最新一份——与 rsync 会话收尾的 TrimAfterCommit 语义一致，
+	// 使两个前端在同模块下收敛到同一快照策略（集成测试对单份模式恒 1 快照断言）。
+	rw := &fileWriter{r: r, keepHistory: module.Snapshot}
 	return &Module{
 		Repo:       r,
 		Session:    r,
 		FileStore:  r,
-		FileWriter: r,
+		FileWriter: rw,
 		Close:      func() error { return db.Close() },
 	}, nil
+}
+
+// fileWriter 写即快照 + 单份模式裁剪：WebDAV 写完成后按模块快照开关裁剪快照
+// （keepHistory=false 只保留最新一份，与 receiver 会话收尾 TrimAfterCommit 一致）。
+// repo 写方法本身不感知 keepHistory（由前端/中端边界注入），此处封装承担该策略。
+type fileWriter struct {
+	r           *repo.Repo
+	keepHistory bool
+}
+
+func (w *fileWriter) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) error {
+	if err := w.r.PutFile(path, mode, mtimeNs, src); err != nil {
+		return err
+	}
+	return w.trim()
+}
+func (w *fileWriter) Mkcol(path string) error {
+	if err := w.r.Mkcol(path); err != nil {
+		return err
+	}
+	return w.trim()
+}
+func (w *fileWriter) DeletePath(path string) error {
+	if err := w.r.DeletePath(path); err != nil {
+		return err
+	}
+	return w.trim()
+}
+func (w *fileWriter) MovePath(src, dst string) error {
+	if err := w.r.MovePath(src, dst); err != nil {
+		return err
+	}
+	return w.trim()
+}
+
+// trim 写提交后裁剪：latest 即刚提交的快照，删除其之前全部快照（keepHistory 时 no-op）。
+func (w *fileWriter) trim() error {
+	id, err := w.r.LatestSnapshotID()
+	if err != nil {
+		return err
+	}
+	if _, _, err := w.r.TrimAfterCommit(id, w.keepHistory); err != nil {
+		return err
+	}
+	return nil
 }
 
 // keyfileMutexes 同进程内按密钥路径串行化自动初始化（多个连接同时首开同一模块）。

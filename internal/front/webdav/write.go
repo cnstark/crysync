@@ -68,7 +68,7 @@ func (w *writeFile) Close() error {
 		return err
 	}
 	defer f.Close()
-	return w.writer.PutFile(w.path, 0o644, time.Now().UnixNano(), f)
+	return w.writer.PutFile(w.path, 0o100644, time.Now().UnixNano(), f)
 }
 
 func (w *writeFile) Read(p []byte) (int, error) { return 0, os.ErrInvalid }

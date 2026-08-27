@@ -34,14 +34,11 @@ func New(cfg *config.Config, logger *slog.Logger) *Server {
 func (s *Server) Name() string { return "webdav" }
 
 // Serve 监听并服务 WebDAV 请求，直到 ctx 取消。
+// 顺序要点：先完成模块缓存（OpenModule）+ buildMux，再 net.Listen——
+// 保证监听建立时 mux 已就绪（若先监听后开模块，期间的并发请求会命中
+// 默认 mux 返回 404 page not found，并行套件负载下是不可靠的就绪窗口）。
 func (s *Server) Serve(ctx context.Context) error {
 	wd := s.cfg.Front.WebDAV
-	ln, err := net.Listen("tcp", wd.Listen)
-	if err != nil {
-		return fmt.Errorf("监听 %s: %w", wd.Listen, err)
-	}
-	defer ln.Close()
-	s.logger.Info("webdav_start", "listen", wd.Listen, "modules", len(s.cfg.Modules))
 
 	// 模块仓库缓存：启动时逐模块打开（失败记日志跳过，该模块请求 404）
 	modules := map[string]*core.Module{}
@@ -54,8 +51,20 @@ func (s *Server) Serve(ctx context.Context) error {
 		}
 		modules[m.Name] = mod
 	}
-
 	srv := &http.Server{Handler: s.buildMux(modules)}
+
+	ln, err := net.Listen("tcp", wd.Listen)
+	if err != nil {
+		// 监听失败：关闭已打开的模块仓库，避免句柄泄漏
+		//（正常退出不关闭——in-flight 请求可能仍在用，维持原语义）
+		for _, mod := range modules {
+			_ = mod.Close()
+		}
+		return fmt.Errorf("监听 %s: %w", wd.Listen, err)
+	}
+	defer ln.Close()
+	s.logger.Info("webdav_start", "listen", wd.Listen, "modules", len(modules))
+
 	go func() {
 		<-ctx.Done()
 		ln.Close()
@@ -86,9 +95,13 @@ func (s *Server) buildMux(modules map[string]*core.Module) http.Handler {
 			},
 		}
 		// 子树 pattern："/home/" 与 "/home/a.txt" 都命中；"/home" 由 ServeMux
-		// 301 重定向到 "/home/"（WebDAV 客户端访问根的标准形态）
+		// 301 重定向到 "/home/"（WebDAV 客户端访问根的标准形态）。
+		// Handler.Prefix 设为模块名，由 x/net/webdav 统一剥离请求路径与
+		// Destination 头的 /home 前缀（http.StripPrefix 只剥请求路径，不剥
+		// MOVE/COPY 的 Destination 头，会导致目标路径带模块前缀而写失败）。
 		prefix := "/" + m.Name
-		mux.Handle(prefix+"/", auth(readOnlyGuard(m.ReadOnly, http.StripPrefix(prefix, h))))
+		h.Prefix = prefix
+		mux.Handle(prefix+"/", auth(readOnlyGuard(m.ReadOnly, h)))
 	}
 	return mux
 }
