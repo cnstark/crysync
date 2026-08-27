@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"crysync/internal/config"
-	"crysync/internal/core/repo"
+	"crysync/internal/core/types"
 )
 
 // RunSession 完成 argv 读取与二进制协商，按方向路由：
@@ -21,7 +21,7 @@ import (
 //   - 否则 → 服务端为 receiver（备份方向）
 //
 // 只读模块拒绝推送（真实 rsyncd 对只读模块 push 报错退出，do_server_recv）。
-func RunSession(ctx context.Context, br *bufio.Reader, w io.Writer, module *config.ModuleConfig, r *repo.Repo, logger *slog.Logger) error {
+func RunSession(ctx context.Context, br *bufio.Reader, w io.Writer, module *config.ModuleConfig, rs types.RsyncService, logger *slog.Logger) error {
 	if logger == nil {
 		logger = nopLogger
 	}
@@ -55,21 +55,21 @@ func RunSession(ctx context.Context, br *bufio.Reader, w io.Writer, module *conf
 	run := func() error {
 		if neg.SenderMode {
 			// 恢复方向错误路径可能已发拒绝帧，rejectWait 等客户端读到再断连
-			return rejectWait(processSendSession(ctx, mr, mw, module, r, neg, logger))
+			return rejectWait(processSendSession(ctx, mr, mw, module, rs, neg, logger))
 		}
-		return processSession(ctx, mr, mw, module, r, neg, logger, k)
+		return processSession(ctx, mr, mw, module, rs, neg, logger, k)
 	}
 	return wrapIoTimeout(run(), w, mw, neg)
 }
 
 // RunSessionWithReader：与已进行握手/认证的 bufio.Reader 继续协议（避免预读丢失）。
-func RunSessionWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn, module *config.ModuleConfig, r *repo.Repo, logger *slog.Logger) error {
-	return RunSession(ctx, br, conn, module, r, logger)
+func RunSessionWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn, module *config.ModuleConfig, rs types.RsyncService, logger *slog.Logger) error {
+	return RunSession(ctx, br, conn, module, rs, logger)
 }
 
 // RunSender 处理一次恢复方向会话（客户端拉取，服务端为 sender）：argv/二进制协商
 // -> mux 会话。调用方需先完成：HandleModuleRequest（greeting/模块选择/认证）。
-func RunSender(ctx context.Context, br *bufio.Reader, w io.Writer, module *config.ModuleConfig, r *repo.Repo, logger *slog.Logger) error {
+func RunSender(ctx context.Context, br *bufio.Reader, w io.Writer, module *config.ModuleConfig, rs types.RsyncService, logger *slog.Logger) error {
 	if logger == nil {
 		logger = nopLogger
 	}
@@ -95,13 +95,13 @@ func RunSender(ctx context.Context, br *bufio.Reader, w io.Writer, module *confi
 	// 恢复方向以写为主（每帧写即重置计时），无本地慢工作点，keeper 仅用于
 	// 挂载重置回调与宣告帧，返回值不需要
 	applyIoTimeout(w, mr, mw, neg)
-	return wrapIoTimeout(rejectWait(processSendSession(ctx, mr, mw, module, r, neg, logger)), w, mw, neg)
+	return wrapIoTimeout(rejectWait(processSendSession(ctx, mr, mw, module, rs, neg, logger)), w, mw, neg)
 }
 
 // RunSenderWithReader：与已进行握手/认证的 bufio.Reader 继续协议（避免预读丢失），
 // 与 RunReceiverWithReader 对称。
-func RunSenderWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn, module *config.ModuleConfig, r *repo.Repo, logger *slog.Logger) error {
-	return RunSender(ctx, br, conn, module, r, logger)
+func RunSenderWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn, module *config.ModuleConfig, rs types.RsyncService, logger *slog.Logger) error {
+	return RunSender(ctx, br, conn, module, rs, logger)
 }
 
 // ITEM_* 标志补充（rsync.h:205-235；传输阶段 iflags）
@@ -121,7 +121,7 @@ const literalChunkSize = 32 << 10
 // processSendSession 完整 sender mux 会话（do_server_sender，main.c:908-967）：
 // filter 列表 -> flist + id list -> 传输循环（响应客户端 generator 的 ndx/sums
 // 请求并回送数据）-> 尾部 NDX_DONE + stats -> read_final_goodbye。
-func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *config.ModuleConfig, r *repo.Repo, neg *Negotiation, logger *slog.Logger) (err error) {
+func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *config.ModuleConfig, fs types.FileStore, neg *Negotiation, logger *slog.Logger) (err error) {
 	if logger == nil {
 		logger = nopLogger
 	}
@@ -148,7 +148,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 	// 快照清单 -> flist 条目 -> f_name_cmp 排序（ndx = 排序后索引，两端一致）。
 	// 子路径拉取（prefix 非空）时条目名相对传输根：目录化身 "."（DOTDIR_NAME
 	// 语义，客户端把其属性应用到目标目录），其下条目剥前缀。
-	sid, err := r.ActiveSnapshotID()
+	sid, err := fs.ActiveSnapshotID()
 	if err != nil {
 		return err
 	}
@@ -158,7 +158,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 		return fmt.Errorf("模块 %s 没有可恢复的快照", module.Name)
 	}
 	prefix := modulePrefix(neg.ModuleArg, module.Name)
-	rows, err := r.SnapshotFileRows(sid, prefix)
+	rows, err := fs.SnapshotFileRows(sid, prefix)
 	if err != nil {
 		return err
 	}
@@ -217,7 +217,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 			op, arg = "change_dir", prefix
 		case strings.Contains(prefix, "/"):
 			dir := prefix[:strings.LastIndex(prefix, "/")]
-			row, ok, gerr := r.GetFileRow(sid, dir)
+			row, ok, gerr := fs.GetFileRow(sid, dir)
 			if gerr != nil {
 				return gerr
 			}
@@ -249,7 +249,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 		// MD5（flist.c:757-766 file_checksum，无 seed；客户端 recv_file_entry
 		// 无条件读该段，缺失则整条流错位）。目录/符号链接不附。
 		if neg.ChecksumMode && !it.entry.IsDir && !it.entry.IsSymlink && isRegularMode(it.entry.Mode) {
-			_, fileSum, err := r.StreamFile(sid, it.snapPath, 0, io.Discard)
+			_, fileSum, err := fs.StreamFile(sid, it.snapPath, 0, io.Discard)
 			if err != nil {
 				return fmt.Errorf("计算 flist 校验和 %s: %w", it.entry.Path, err)
 			}
@@ -406,14 +406,14 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 
 		lw := &literalWriter{out: out}
 		fileStart := time.Now()
-		n, fileSum, err := r.StreamFile(sid, it.snapPath, neg.ChecksumSeed, lw)
+		n, fileSum, err := fs.StreamFile(sid, it.snapPath, neg.ChecksumSeed, lw)
 		if err != nil {
 			return fmt.Errorf("读取文件 %s: %w", e.Path, err)
 		}
 		totalSize += n
 		filesSent++
 		logger.Info("file_sent", "path", e.Path, "size", n,
-			"chunks", (n+int64(r.ChunkSizeBytes())-1)/int64(r.ChunkSizeBytes()),
+			"chunks", (n+int64(fs.ChunkSizeBytes())-1)/int64(fs.ChunkSizeBytes()),
 			"elapsed_ms", time.Since(fileStart).Milliseconds())
 		// 文件数据结束标记 int32 0（token.c:319），随后整文件强校验和（xfer_sum_len=16）
 		if err := out.WriteData([]byte{0, 0, 0, 0}); err != nil {

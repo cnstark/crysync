@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"crysync/internal/config"
+	"crysync/internal/core"
 	"crysync/internal/core/crypto"
 	"crysync/internal/core/meta"
 )
@@ -33,10 +34,11 @@ func testModule(t *testing.T) *config.ModuleConfig {
 // TestOpenRepoAutoInitFresh：密钥与元数据库均不存在时自动创建。
 func TestOpenRepoAutoInitFresh(t *testing.T) {
 	m := testModule(t)
-	_, closeRepo, err := OpenRepoForModule(m)
+	mod, err := core.OpenModule(m)
 	if err != nil {
 		t.Fatalf("自动初始化失败: %v", err)
 	}
+	closeRepo := mod.Close
 	closeRepo()
 	fi, err := os.Stat(m.Keyfile)
 	if err != nil {
@@ -53,10 +55,11 @@ func TestOpenRepoAutoInitFresh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, closeRepo, err = OpenRepoForModule(m)
+	mod, err = core.OpenModule(m)
 	if err != nil {
 		t.Fatal(err)
 	}
+	closeRepo = mod.Close
 	closeRepo()
 	second, _ := os.ReadFile(m.Keyfile)
 	if string(first) != string(second) {
@@ -72,10 +75,11 @@ func TestOpenRepoMetaAutoCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 	before, _ := os.ReadFile(m.Keyfile)
-	_, closeRepo, err := OpenRepoForModule(m)
+	mod, err := core.OpenModule(m)
 	if err != nil {
 		t.Fatalf("密钥在而元数据缺失时应自动建库: %v", err)
 	}
+	closeRepo := mod.Close
 	closeRepo()
 	if _, err := os.Stat(m.Meta); err != nil {
 		t.Fatalf("元数据库未创建: %v", err)
@@ -95,7 +99,7 @@ func TestOpenRepoRejectKeyMissingMetaExists(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
-	_, _, err = OpenRepoForModule(m)
+	_, err = core.OpenModule(m)
 	if err == nil || !strings.Contains(err.Error(), "拒绝自动生成新密钥") {
 		t.Fatalf("应拒绝自动初始化，实际: %v", err)
 	}
@@ -114,12 +118,12 @@ func TestOpenRepoConcurrentAutoInit(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, closeRepo, err := OpenRepoForModule(m)
+			mod, err := core.OpenModule(m)
 			if err != nil {
 				errs <- err
 				return
 			}
-			closeRepo()
+			mod.Close()
 		}()
 	}
 	wg.Wait()
@@ -136,11 +140,11 @@ func TestOpenRepoConcurrentAutoInit(t *testing.T) {
 // TestEnsureModuleInitIdempotent：EnsureModuleInit 幂等（重复调用不换密钥）。
 func TestEnsureModuleInitIdempotent(t *testing.T) {
 	m := testModule(t)
-	if _, err := EnsureModuleInit(m); err != nil {
+	if _, err := core.EnsureModuleInit(m); err != nil {
 		t.Fatal(err)
 	}
 	first, _ := os.ReadFile(m.Keyfile)
-	if _, err := EnsureModuleInit(m); err != nil {
+	if _, err := core.EnsureModuleInit(m); err != nil {
 		t.Fatal(err)
 	}
 	second, _ := os.ReadFile(m.Keyfile)

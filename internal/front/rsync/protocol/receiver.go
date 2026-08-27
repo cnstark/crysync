@@ -16,7 +16,7 @@ import (
 
 	"crysync/internal/config"
 	"crysync/internal/core/meta"
-	"crysync/internal/core/repo"
+	"crysync/internal/core/types"
 )
 
 // nopLogger 丢弃全部输出（调用方未提供 logger 时兜底）。
@@ -41,7 +41,7 @@ func logNegotiated(logger *slog.Logger, neg *Negotiation) {
 
 // RunReceiver 处理一次备份方向会话（客户端推）：argv/二进制协商 -> mux 会话。
 // 调用方需先完成：HandleModuleRequest（greeting/模块选择/认证）。
-func RunReceiver(ctx context.Context, br *bufio.Reader, w io.Writer, module *config.ModuleConfig, r *repo.Repo, logger *slog.Logger) error {
+func RunReceiver(ctx context.Context, br *bufio.Reader, w io.Writer, module *config.ModuleConfig, s types.Session, logger *slog.Logger) error {
 	if logger == nil {
 		logger = nopLogger
 	}
@@ -59,14 +59,14 @@ func RunReceiver(ctx context.Context, br *bufio.Reader, w io.Writer, module *con
 		return err
 	}
 	k := applyIoTimeout(w, mr, mw, neg)
-	return wrapIoTimeout(processSession(ctx, mr, mw, module, r, neg, logger, k), w, mw, neg)
+	return wrapIoTimeout(processSession(ctx, mr, mw, module, s, neg, logger, k), w, mw, neg)
 }
 
 // RunReceiverWithReader：与已进行握手/认证的 bufio.Reader 继续协议（避免预读丢失）。
 // handleConn 已用同一个 br 读过文本行阶段，br 的 buffer 可能预读后续协议字节，
 // 必须原样传给 RunReceiver，否则预读字节丢失（RunReceiver 内部完成 NegotiateBinary + mux 会话）。
-func RunReceiverWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn, module *config.ModuleConfig, r *repo.Repo, logger *slog.Logger) error {
-	return RunReceiver(ctx, br, conn, module, r, logger)
+func RunReceiverWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn, module *config.ModuleConfig, s types.Session, logger *slog.Logger) error {
+	return RunReceiver(ctx, br, conn, module, s, logger)
 }
 
 // ITEM_* 标志（rsync.h:205-235，iflags 以 shortint 小端 2 字节发送）
@@ -97,7 +97,7 @@ type fileStats struct {
 // [条件]filter -> flist（逐条到哨兵）-> [条件]id list -> 传输阶段（generator 角色
 // 逐条 ndx/iflags/sums 驱动 + receiver 角色读回显与 token 流）-> goodbye -> 提交快照。
 // keeper 非 nil（客户端 --timeout=N）时经 KeepAlive 在块存储等本地慢工作点续期。
-func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *config.ModuleConfig, r *repo.Repo, neg *Negotiation, logger *slog.Logger, keeper *idleKeeper) (err error) {
+func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *config.ModuleConfig, s types.Session, neg *Negotiation, logger *slog.Logger, keeper *idleKeeper) (err error) {
 	if logger == nil {
 		logger = nopLogger
 	}
@@ -191,14 +191,14 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 	}()
 
-	txn, err := r.BeginSnapshot(time.Now())
+	txn, err := s.BeginSnapshot(time.Now())
 	if err != nil {
 		return err
 	}
 	rollback := func() { txn.Rollback() }
 
 	// 活跃快照（delta 的 quick check 基准）：会话开始取一次，之后不随 CLI 切换
-	activeID, err := r.ActiveSnapshotID()
+	activeID, err := s.ActiveSnapshotID()
 	if err != nil {
 		rollback()
 		return err
@@ -288,7 +288,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 		// 普通文件：quick check 命中不发请求（不落库，CopyFiles 已继承旧行与 chunk 关联）；
 		// 变化文件发真实块校验和（delta）；新文件/空文件发空校验和请求（全量 literal）
-		refs, updated, fs, err := receiveFileDelta(ctx, stream, out, ndxOut, ndxIn, r, neg, activeID, e, i, prefix, keepAlive)
+		refs, updated, fs, err := receiveFileDelta(ctx, stream, out, ndxOut, ndxIn, s, neg, activeID, e, i, prefix, keepAlive)
 		if err != nil {
 			// 客户端 MSG_NO_SEND（open 失败/vanished，sender.c:722-724）：该文件被
 			// 跳过（无回显无 token 流），客户端已报错（rc=23）——不落库，会话继续
@@ -448,7 +448,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 	// 单份模式（模块 snapshot: false）收尾：删除更早的全部快照只保留本份。
 	// 失败仅记日志不报错客户端——数据已提交，残留旧快照无害，下次会话收敛。
 	if !module.Snapshot {
-		if removed, blobs, terr := r.KeepOnlySnapshot(sid); terr != nil {
+		if removed, blobs, terr := s.KeepOnlySnapshot(sid); terr != nil {
 			logger.Error("single_copy_trim_error", "err", terr.Error())
 		} else if removed > 0 || blobs > 0 {
 			logger.Info("single_copy_trim", "removed_snapshots", removed, "reclaimed_blobs", blobs)
@@ -542,7 +542,7 @@ func (w *bytesBuffer) Bytes() []byte { return w.b }
 
 // applyStaticEntry：目录/符号链接条目（无内容传输）。path 为库内全路径
 // （已含子路径前缀；调用方对子路径备份的顶层 "." 传 prefix 自身）。
-func applyStaticEntry(txn *repo.SnapshotTxn, e FileEntry, path string) error {
+func applyStaticEntry(txn types.SessionTxn, e FileEntry, path string) error {
 	if e.IsSymlink {
 		return txn.UpsertFile(meta.FileRow{
 			Path: path, IsSymlink: true, Mode: e.Mode,
@@ -562,7 +562,7 @@ func applyStaticEntry(txn *repo.SnapshotTxn, e FileEntry, path string) error {
 // receiveFileLegacy 全量传输路径（v1）：发 ndx + iflags(ITEM_TRANSFER|ITEM_IS_NEW)
 // + write_sum_head(NULL)（16 字节全 0）→ 客户端 count==0 全量 literal 发送。
 // 用于新文件/空文件/旧行类型不一致（无可作 basis 的旧文件）场景。
-func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, index int, keepAlive func()) ([]meta.ChunkRef, fileStats, error) {
+func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, s types.Session, index int, keepAlive func()) ([]meta.ChunkRef, fileStats, error) {
 	started := time.Now()
 	st := fileStats{method: "full"}
 	// ndx + iflags + 空校验和请求（count/blength/s2length/remainder 各 int32 0 = 16 字节）
@@ -593,7 +593,7 @@ func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, n
 		echo[i] = v
 	}
 
-	chunkSize := r.ChunkSizeBytes()
+	chunkSize := s.ChunkSizeBytes()
 	data := make([]byte, 0, chunkSize)
 	var refs []meta.ChunkRef
 	var idx int
@@ -603,7 +603,7 @@ func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, n
 			return nil
 		}
 		keepAlive() // StoreChunk 可能写慢后端（WebDAV）：续期 + 心跳防客户端超时误断
-		id, reused, err := r.StoreChunk(data)
+		id, reused, err := s.StoreChunk(data)
 		if err != nil {
 			return err
 		}
@@ -691,14 +691,14 @@ func writeNullSumHead(w io.Writer) error {
 //     StoreChunk → 读 16B 整文件 MD5 与重组累计比对。
 //
 // 查询/落库均用库内全路径（prefix + e.Path），与 sender 方向子路径恢复对称。
-func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, r *repo.Repo, neg *Negotiation, activeID int64, e FileEntry, index int, prefix string, keepAlive func()) ([]meta.ChunkRef, bool, fileStats, error) {
+func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, ndxOut, ndxIn *ndxCodec, s types.Session, neg *Negotiation, activeID int64, e FileEntry, index int, prefix string, keepAlive func()) ([]meta.ChunkRef, bool, fileStats, error) {
 	started := time.Now()
 	st := fileStats{method: "delta"}
 	fullPath := e.Path
 	if prefix != "" {
 		fullPath = prefix + "/" + e.Path
 	}
-	row, ok, err := r.GetFileRow(activeID, fullPath)
+	row, ok, err := s.GetFileRow(activeID, fullPath)
 	if err != nil {
 		return nil, true, st, err
 	}
@@ -726,7 +726,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 	}
 	// 全量路径：无旧行 / 空文件（新旧任一为空都无 delta 基础）/ 旧行类型不一致
 	if !ok || e.Size == 0 || row.Size == 0 || row.IsDir || row.IsSymlink {
-		legacyRefs, lst, lerr := receiveFileLegacy(ctx, stream, out, ndxOut, ndxIn, r, index, keepAlive)
+		legacyRefs, lst, lerr := receiveFileLegacy(ctx, stream, out, ndxOut, ndxIn, s, index, keepAlive)
 		lst.elapsed = time.Since(started)
 		return legacyRefs, true, lst, lerr
 	}
@@ -734,7 +734,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 	// --- delta 路径：旧文件为 basis ---
 	// 第一遍读旧文件计算块校验和表（len 取旧文件大小：sum 表描述 basis 块结构，
 	// 客户端按收到的 blength 匹配自己的新文件）
-	tbl, err := calcBlockSumsFromRepo(r, activeID, fullPath, row.Size, neg.ChecksumSeed)
+	tbl, err := calcBlockSumsFromRepo(s, activeID, fullPath, row.Size, neg.ChecksumSeed)
 	if err != nil {
 		return nil, true, st, fmt.Errorf("计算块校验和: %w", err)
 	}
@@ -775,10 +775,10 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 		return nil, true, st, fmt.Errorf("回显 sum_head 与发送不一致: %v", echo)
 	}
 	// 第二遍读旧文件（basisReader 短连接逐块读）供 match 块复制
-	br := &basisReader{r: r, snapshotID: activeID, path: fullPath, fileSize: row.Size}
+	br := &basisReader{s: s, snapshotID: activeID, path: fullPath, fileSize: row.Size}
 
 	// token 循环 + 4MiB 重组 + MD5 累计
-	chunkSize := r.ChunkSizeBytes()
+	chunkSize := s.ChunkSizeBytes()
 	data := make([]byte, 0, chunkSize)
 	var refs []meta.ChunkRef
 	var idx int
@@ -789,7 +789,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 			return nil
 		}
 		keepAlive() // StoreChunk 可能写慢后端（WebDAV）：续期 + 心跳防客户端超时误断
-		id, reused, err := r.StoreChunk(data)
+		id, reused, err := s.StoreChunk(data)
 		if err != nil {
 			return err
 		}
@@ -808,7 +808,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 	flushFull := func() error {
 		for len(data) >= chunkSize {
 			full := data[:chunkSize]
-			id, reused, err := r.StoreChunk(full)
+			id, reused, err := s.StoreChunk(full)
 			if err != nil {
 				return err
 			}
@@ -923,7 +923,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 // 短连接读取（每块查询即查即关），避免 io.Pipe+StreamFile 长连接方案与
 // meta 层 MaxOpenConns=1 互锁。
 type basisReader struct {
-	r          *repo.Repo
+	s          types.Session
 	snapshotID int64
 	path       string
 	fileSize   int64
@@ -936,8 +936,8 @@ func (b *basisReader) Read(p []byte) (int, error) {
 		if b.pos >= b.fileSize {
 			return 0, io.EOF
 		}
-		idx := int(b.pos / int64(b.r.ChunkSizeBytes()))
-		blob, err := b.r.ReadChunkAt(b.snapshotID, b.path, idx)
+		idx := int(b.pos / int64(b.s.ChunkSizeBytes()))
+		blob, err := b.s.ReadChunkAt(b.snapshotID, b.path, idx)
 		if err != nil {
 			return 0, err
 		}
@@ -953,7 +953,7 @@ func (b *basisReader) Read(p []byte) (int, error) {
 // （len 取旧文件大小：sum 表描述 basis 块结构，客户端按收到的 blength 匹配
 // 自己的新文件），再流式读旧文件逐块计算 sum1+sum2（StreamFile 内部已校验
 // 内容与 files 表 size 一致，此处再按传入 size 复核）。
-func calcBlockSumsFromRepo(r *repo.Repo, snapshotID int64, path string, size int64, seed int32) (SumTable, error) {
+func calcBlockSumsFromRepo(s types.Session, snapshotID int64, path string, size int64, seed int32) (SumTable, error) {
 	count, blength, remainder, err := CalcSizes(size)
 	if err != nil {
 		return SumTable{}, err
@@ -963,7 +963,7 @@ func calcBlockSumsFromRepo(r *repo.Repo, snapshotID int64, path string, size int
 		seed:    seed,
 		fileLen: size,
 	}
-	if _, _, err := r.StreamFile(snapshotID, path, 0, w); err != nil {
+	if _, _, err := s.StreamFile(snapshotID, path, 0, w); err != nil {
 		return SumTable{}, err
 	}
 	return w.finish()

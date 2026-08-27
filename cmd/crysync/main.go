@@ -8,8 +8,8 @@ import (
 
 	"crysync/internal/backend"
 	"crysync/internal/config"
+	"crysync/internal/core"
 	"crysync/internal/core/prune"
-	"crysync/internal/front/rsync"
 )
 
 func main() {
@@ -67,7 +67,7 @@ func cmdInit(args []string) error {
 	// 与 daemon 启动共用同一套初始化逻辑（幂等；密钥缺失但元数据库已存在时拒绝）
 	for i := range cfg.Modules {
 		m := &cfg.Modules[i]
-		autoInit, err := rsync.EnsureModuleInit(m)
+		autoInit, err := core.EnsureModuleInit(m)
 		if err != nil {
 			return fmt.Errorf("模块 %s: %w", m.Name, err)
 		}
@@ -117,16 +117,16 @@ func cmdSnapshots(args []string) error {
 		return err
 	}
 	for _, m := range modules {
-		r, closeRepo, err := rsync.OpenRepoForModule(m)
+		mod, err := core.OpenModule(m)
 		if err != nil {
 			return fmt.Errorf("模块 %s: %w", m.Name, err)
 		}
-		defer closeRepo()
-		snaps, err := r.SnapshotList()
+		defer mod.Close()
+		snaps, err := mod.Repo.SnapshotList()
 		if err != nil {
 			return err
 		}
-		active, err := r.ActiveSnapshotID()
+		active, err := mod.Repo.ActiveSnapshotID()
 		if err != nil {
 			return err
 		}
@@ -142,7 +142,7 @@ func cmdSnapshots(args []string) error {
 			if !found {
 				return fmt.Errorf("模块 %s: 快照 %d 不存在", m.Name, *setActive)
 			}
-			if err := r.SetActiveSnapshot(*setActive); err != nil {
+			if err := mod.Repo.SetActiveSnapshot(*setActive); err != nil {
 				return err
 			}
 			fmt.Printf("模块 %s: 活跃快照已切换为 %d\n", m.Name, *setActive)
@@ -151,7 +151,7 @@ func cmdSnapshots(args []string) error {
 		fmt.Printf("模块 %s（%d 个快照）：\n", m.Name, len(snaps))
 		fmt.Printf("  %-4s %-26s %-8s %s\n", "ID", "创建时间", "文件数", "活跃")
 		for _, s := range snaps {
-			n, err := r.SnapshotFileCount(s.ID)
+			n, err := mod.Repo.SnapshotFileCount(s.ID)
 			if err != nil {
 				return err
 			}
@@ -178,12 +178,12 @@ func cmdPrune(args []string) error {
 		return err
 	}
 	for _, m := range modules {
-		r, closeRepo, err := rsync.OpenRepoForModule(m)
+		mod, err := core.OpenModule(m)
 		if err != nil {
 			return fmt.Errorf("模块 %s: %w", m.Name, err)
 		}
-		removed, blobs, err := r.Prune(modulePolicy(m))
-		closeRepo()
+		removed, blobs, err := mod.Repo.Prune(modulePolicy(m))
+		mod.Close()
 		if err != nil {
 			return fmt.Errorf("模块 %s: %w", m.Name, err)
 		}

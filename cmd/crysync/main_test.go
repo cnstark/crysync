@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"crysync/internal/config"
+	"crysync/internal/core"
 	"crysync/internal/core/meta"
-	"crysync/internal/front/rsync"
 )
 
 func TestBuildSmoke(t *testing.T) {
@@ -95,16 +95,16 @@ func TestCLISnapshotsAndPrune(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, closeRepo, err := rsync.OpenRepoForModule(&cfg.Modules[0])
+	mod, err := core.OpenModule(&cfg.Modules[0])
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, data := range []string{"snap a", "snap b"} {
-		txn, err := r.BeginSnapshot(time.Now())
+		txn, err := mod.Repo.BeginSnapshot(time.Now())
 		if err != nil {
 			t.Fatal(err)
 		}
-		c, _, _ := r.StoreChunk([]byte(data))
+		c, _, _ := mod.Repo.StoreChunk([]byte(data))
 		if err := txn.UpsertFile(meta.FileRow{Path: "f.txt", Mode: 0o644, Size: int64(len(data))},
 			[]meta.ChunkRef{{ChunkID: c, IDX: 0}}); err != nil {
 			t.Fatal(err)
@@ -113,7 +113,7 @@ func TestCLISnapshotsAndPrune(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	closeRepo()
+	mod.Close()
 
 	// snapshots 列表：应含 2 个快照行
 	out, err := exec.Command(bin, "snapshots", "--config", conf).CombinedOutput()

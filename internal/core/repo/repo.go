@@ -15,6 +15,7 @@ import (
 	"crysync/internal/core/crypto"
 	"crysync/internal/core/meta"
 	"crysync/internal/core/prune"
+	"crysync/internal/core/types"
 )
 
 type Repo struct {
@@ -69,8 +70,12 @@ type SnapshotTxn struct {
 	finalized  bool
 }
 
+// SnapshotID 返回本次事务创建的快照 ID（复制清单后即可用）。
+func (t *SnapshotTxn) SnapshotID() int64 { return t.snapshotID }
+
 // BeginSnapshot 创建新快照并复制上一快照的完整文件清单。
-func (r *Repo) BeginSnapshot(now time.Time) (*SnapshotTxn, error) {
+// 返回面向前端的 SessionTxn 接口（rsyncproto 等调用方只依赖接口方法）。
+func (r *Repo) BeginSnapshot(now time.Time) (types.SessionTxn, error) {
 	prev, err := r.LatestSnapshotID()
 	if err != nil {
 		return nil, err
