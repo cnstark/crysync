@@ -19,10 +19,11 @@ import (
 
 // Module 模块仓库服务视图：前端通过 Session/FileStore 访问，CLI 通过 Repo 访问完整能力。
 type Module struct {
-	Repo      *repo.Repo
-	Session   Session
-	FileStore FileStore
-	Close     func() error
+	Repo       *repo.Repo
+	Session    Session
+	FileStore  FileStore
+	FileWriter FileWriter
+	Close      func() error
 }
 
 // OpenModule 打开模块仓库：必要时自动初始化（密钥+元数据）、
@@ -59,10 +60,11 @@ func OpenModule(module *config.ModuleConfig) (*Module, error) {
 	}
 	r := repo.New(db, be, key, module.ChunkSizeBytes())
 	return &Module{
-		Repo:      r,
-		Session:   r,
-		FileStore: r,
-		Close:     func() error { return db.Close() },
+		Repo:       r,
+		Session:    r,
+		FileStore:  r,
+		FileWriter: r,
+		Close:      func() error { return db.Close() },
 	}, nil
 }
 

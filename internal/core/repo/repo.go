@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	pathpkg "path"
 	"strings"
 	"time"
 
@@ -217,6 +219,31 @@ func (r *Repo) SnapshotFileRows(snapshotID int64, prefix string) ([]meta.FileRow
 	return out, nil
 }
 
+// ListDir 返回快照中 path 的直接子项（非递归，不含自身）。path 为空 = 模块根。
+// 目录不存在时返回空切片（调用方先用 GetFileRow 判定存在性）。
+func (r *Repo) ListDir(snapshotID int64, path string) ([]meta.FileRow, error) {
+	files, err := r.meta.GetFiles(snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	prefix := path
+	if prefix != "" {
+		prefix += "/"
+	}
+	out := make([]meta.FileRow, 0)
+	for _, f := range files {
+		if !strings.HasPrefix(f.Path, prefix) {
+			continue
+		}
+		rest := f.Path[len(prefix):]
+		if rest == "" || strings.Contains(rest, "/") {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
 // GetFileRow 按快照路径查文件元数据（quick check 判定用）：旧快照存在同路径
 // 普通文件且 (mtime, size) 一致 → 未变化，无需传输。
 func (r *Repo) GetFileRow(snapshotID int64, path string) (meta.FileRow, bool, error) {
@@ -394,6 +421,151 @@ func (r *Repo) KeepOnlySnapshot(keepID int64) (int, int, error) {
 	return removed, blobs, nil
 }
 
+// TrimAfterCommit 快照提交后的收尾裁剪（receiver 与 WebDAV 写共用）：
+// keepHistory=true（多版本模式）时不动作；false（单份模式）时删除
+// snapshotID 之前的全部快照并回收孤儿 blob（语义与 KeepOnlySnapshot 相同）。
+func (r *Repo) TrimAfterCommit(snapshotID int64, keepHistory bool) (int, int, error) {
+	if keepHistory {
+		return 0, 0, nil
+	}
+	return r.KeepOnlySnapshot(snapshotID)
+}
+
+// fileChunk 文件块索引（OpenFile 时一次查全）。
+type fileChunk struct {
+	blobName string
+	size     int64
+}
+
+// FileReader 按块流式重组快照文件（解密后逐块输出），支持 Seek 定位到
+// 任意块重放（HTTP Range 下载用）。块定位 O(块数)，块内读取 O(1)。
+type FileReader struct {
+	r        *Repo
+	row      meta.FileRow
+	chunks   []fileChunk
+	pos      int64 // 文件内读取偏移
+	buf      []byte
+	bufChunk int // 当前块下标；-1 = 未加载
+	bufOff   int
+	closed   bool
+}
+
+// OpenFile 按路径打开快照文件：返回流式块重组 reader（Read/Seek/Close）与
+// 文件元数据。仅普通文件可打开；目录/符号链接由调用方先行判定。
+func (r *Repo) OpenFile(snapshotID int64, path string) (io.ReadSeekCloser, meta.FileRow, error) {
+	row, ok, err := r.meta.GetFileRow(snapshotID, path)
+	if err != nil {
+		return nil, meta.FileRow{}, err
+	}
+	if !ok {
+		return nil, meta.FileRow{}, os.ErrNotExist
+	}
+	if row.IsDir {
+		return nil, row, fmt.Errorf("%s 是目录", path)
+	}
+	rows, err := r.meta.Query(`SELECT c.blob_name, c.size FROM file_chunks fc
+		JOIN files f ON f.id = fc.file_id
+		JOIN chunks c ON c.id = fc.chunk_id
+		WHERE f.snapshot_id = ? AND f.path = ? ORDER BY fc.idx`, snapshotID, path)
+	if err != nil {
+		return nil, row, err
+	}
+	defer rows.Close()
+	chunks := make([]fileChunk, 0, 8)
+	for rows.Next() {
+		var c fileChunk
+		if err := rows.Scan(&c.blobName, &c.size); err != nil {
+			return nil, row, err
+		}
+		chunks = append(chunks, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, row, err
+	}
+	return &FileReader{r: r, row: row, chunks: chunks, bufChunk: -1}, row, nil
+}
+
+func (f *FileReader) loadChunk(ci int) error {
+	raw, err := f.r.backend.Get(f.chunks[ci].blobName)
+	if err != nil {
+		return fmt.Errorf("读取块 %s: %w", f.chunks[ci].blobName, err)
+	}
+	pt, err := f.r.key.Decrypt(raw, f.chunks[ci].blobName)
+	if err != nil {
+		return err
+	}
+	f.buf, f.bufChunk, f.bufOff = pt, ci, 0
+	return nil
+}
+
+func (f *FileReader) Read(p []byte) (int, error) {
+	if f.closed {
+		return 0, errors.New("文件已关闭")
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	for f.bufOff >= len(f.buf) { // 当前块耗尽 → 下一块
+		next := f.bufChunk + 1
+		if next >= len(f.chunks) {
+			return 0, io.EOF
+		}
+		if err := f.loadChunk(next); err != nil {
+			return 0, err
+		}
+	}
+	n := copy(p, f.buf[f.bufOff:])
+	f.bufOff += n
+	f.pos += int64(n)
+	return n, nil
+}
+
+func (f *FileReader) Seek(offset int64, whence int) (int64, error) {
+	if f.closed {
+		return 0, errors.New("文件已关闭")
+	}
+	var target int64
+	switch whence {
+	case io.SeekStart:
+		target = offset
+	case io.SeekCurrent:
+		target = f.pos + offset
+	case io.SeekEnd:
+		target = f.row.Size + offset
+	default:
+		return f.pos, fmt.Errorf("非法 whence %d", whence)
+	}
+	if target < 0 {
+		return f.pos, fmt.Errorf("偏移越界: %d", target)
+	}
+	if target > f.row.Size {
+		target = f.row.Size
+	}
+	// 定位目标块（累计块大小，找到第一个包含 target 的块）
+	var acc int64
+	ci := 0
+	for ci < len(f.chunks) && acc+int64(f.chunks[ci].size) <= target {
+		acc += int64(f.chunks[ci].size)
+		ci++
+	}
+	if ci >= len(f.chunks) { // 定位到 EOF（块边界）
+		f.buf, f.bufChunk, f.bufOff = nil, len(f.chunks), 0
+		f.pos = target
+		return f.pos, nil
+	}
+	if err := f.loadChunk(ci); err != nil {
+		return f.pos, err
+	}
+	f.bufOff = int(target - acc)
+	f.pos = target
+	return f.pos, nil
+}
+
+func (f *FileReader) Close() error {
+	f.closed = true
+	return nil
+}
+
 // GC 回收孤儿 blob：后端存在但未被任何 chunk 引用的 blob（失败/中断会话的
 // 残留，设计文档 §4.2：blob 先写后端、快照提交失败即孤儿）。引用判定以
 // chunks 表为准——chunk 一旦入库即保留（refcount 归零与否由 prune 策略决定，
@@ -441,4 +613,190 @@ func (r *Repo) GC() (int, error) {
 		return deleted, fmt.Errorf("删除孤儿 blob 失败（%d 个）: %s", len(failed), strings.Join(failed, "; "))
 	}
 	return deleted, nil
+}
+
+// checkParentDir 校验 path 的父目录在最新快照中存在（WebDAV PUT 语义：
+// 父目录缺失 → 409；适配层同样前置检查以映射状态码）。
+// 仓库为空时除根外任何父目录都不存在。
+func checkParentDir(r *Repo, path string) error {
+	parent := pathpkg.Dir(path)
+	if parent == "." || parent == "/" {
+		return nil
+	}
+	latest, err := r.LatestSnapshotID()
+	if err != nil {
+		return err
+	}
+	if latest == 0 {
+		return os.ErrNotExist
+	}
+	row, ok, err := r.meta.GetFileRow(latest, parent)
+	if err != nil {
+		return err
+	}
+	if !ok || !row.IsDir {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
+// PutFile 以"写即快照"语义写入（或覆盖）path：请求体流式分块去重存储，
+// 提交一个新快照。mode 为文件权限位，mtimeNs 为修改时间（纳秒）。
+func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) error {
+	if err := checkParentDir(r, path); err != nil {
+		return err
+	}
+	txn, err := r.BeginSnapshot(time.Now())
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = txn.Rollback()
+		}
+	}()
+	buf := make([]byte, r.chunkSize)
+	var chunks []meta.ChunkRef
+	var total int64
+	for {
+		n, err := io.ReadFull(src, buf)
+		if n > 0 {
+			id, _, err2 := r.StoreChunk(buf[:n])
+			if err2 != nil {
+				return err2
+			}
+			chunks = append(chunks, meta.ChunkRef{ChunkID: id, IDX: len(chunks)})
+			total += int64(n)
+		}
+		if err == nil {
+			continue
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		return err
+	}
+	row := meta.FileRow{Path: path, Mode: mode, Size: total, MTimeNs: mtimeNs}
+	if err := txn.UpsertFile(row, chunks); err != nil {
+		return err
+	}
+	if _, err := txn.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// Mkcol 以"写即快照"语义创建目录条目；已存在返回 os.ErrExist。
+func (r *Repo) Mkcol(path string) error {
+	if err := checkParentDir(r, path); err != nil {
+		return err
+	}
+	txn, err := r.BeginSnapshot(time.Now())
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = txn.Rollback()
+		}
+	}()
+	if _, ok, err := r.meta.GetFileRow(txn.SnapshotID(), path); err != nil {
+		return err
+	} else if ok {
+		return os.ErrExist
+	}
+	if err := txn.UpsertFile(meta.FileRow{Path: path, IsDir: true, Mode: 0o40755, MTimeNs: time.Now().UnixNano()}, nil); err != nil {
+		return err
+	}
+	if _, err := txn.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// DeletePath 以"写即快照"语义删除 path（文件或目录，目录递归删整棵子树）；
+// 不存在返回 os.ErrNotExist。
+func (r *Repo) DeletePath(path string) error {
+	txn, err := r.BeginSnapshot(time.Now())
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = txn.Rollback()
+		}
+	}()
+	rows, err := r.SnapshotFileRows(txn.SnapshotID(), path)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return os.ErrNotExist
+	}
+	for _, row := range rows {
+		if err := txn.DeleteFile(row.Path); err != nil {
+			return err
+		}
+	}
+	if _, err := txn.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// MovePath 以"写即快照"语义移动/改名：目标新建条目（chunk 引用直接复制，
+// 净 refcount 不变、不产生新 blob），源删除。目录移动递归整棵子树，路径
+// 前缀整体替换。目标已存在时覆盖（WebDAV Overwrite 语义）。
+func (r *Repo) MovePath(src, dst string) error {
+	if err := checkParentDir(r, dst); err != nil {
+		return err
+	}
+	txn, err := r.BeginSnapshot(time.Now())
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = txn.Rollback()
+		}
+	}()
+	rows, err := r.SnapshotFileRows(txn.SnapshotID(), src)
+	if err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return os.ErrNotExist
+	}
+	for _, row := range rows {
+		var newPath string
+		if row.Path == src {
+			newPath = dst
+		} else {
+			newPath = dst + row.Path[len(src):]
+		}
+		chunks, err := r.meta.GetFileChunks(txn.SnapshotID(), row.Path)
+		if err != nil {
+			return err
+		}
+		newRow := row
+		newRow.Path = newPath
+		if err := txn.UpsertFile(newRow, chunks); err != nil {
+			return err
+		}
+		if err := txn.DeleteFile(row.Path); err != nil {
+			return err
+		}
+	}
+	if _, err := txn.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
 }

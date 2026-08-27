@@ -245,6 +245,26 @@ func (d *DB) GetFileRow(snapshotID int64, path string) (FileRow, bool, error) {
 	return f, true, nil
 }
 
+// GetFileChunks 返回快照文件中 (chunk_id, idx) 有序列表（MovePath 复制引用用）。
+func (d *DB) GetFileChunks(snapshotID int64, path string) ([]ChunkRef, error) {
+	rows, err := d.db.Query(`SELECT fc.chunk_id, fc.idx FROM file_chunks fc
+		JOIN files f ON f.id = fc.file_id
+		WHERE f.snapshot_id = ? AND f.path = ? ORDER BY fc.idx`, snapshotID, path)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ChunkRef
+	for rows.Next() {
+		var c ChunkRef
+		if err := rows.Scan(&c.ChunkID, &c.IDX); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (d *DB) SetMeta(key, value string) error {
 	_, err := d.db.Exec(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value)
 	return err

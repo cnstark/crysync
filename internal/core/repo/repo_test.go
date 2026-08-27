@@ -4,6 +4,8 @@ package repo
 import (
 	"bytes"
 	"crypto/md5"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -26,6 +28,104 @@ func newTestRepo(t *testing.T) (*Repo, *backend.InMemory) {
 	key, _ := crypto.GenerateKey()
 	be := backend.NewInMemory()
 	return New(db, be, key, 64), be
+}
+
+// TestListDir：快照中 path 的直接子项（非递归，不含自身）；path 为空 = 模块根。
+func TestListDir(t *testing.T) {
+	r, _ := newTestRepo(t)
+	txn, _ := r.BeginSnapshot(time.Now())
+	txn.UpsertFile(meta.FileRow{Path: "sub", IsDir: true, Mode: 0o40755}, nil)
+	txn.UpsertFile(meta.FileRow{Path: "sub/a.txt", Mode: 0o644, Size: 1}, nil)
+	txn.UpsertFile(meta.FileRow{Path: "sub/deep/b.txt", Mode: 0o644, Size: 2}, nil)
+	txn.UpsertFile(meta.FileRow{Path: "sub/deep", IsDir: true, Mode: 0o40755}, nil)
+	txn.UpsertFile(meta.FileRow{Path: "root.txt", Mode: 0o644, Size: 3}, nil)
+	sid, _ := txn.Commit()
+
+	// 模块根：直接子项（不含子孙）
+	rows, err := r.ListDir(sid, "")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("根子项应为 sub/root.txt, got %+v, %v", rows, err)
+	}
+	// 目录 sub：直接子项
+	rows, err = r.ListDir(sid, "sub")
+	if err != nil || len(rows) != 2 {
+		t.Fatalf("sub 子项应为 a.txt/deep, got %+v, %v", rows, err)
+	}
+	// 文件路径：返回空
+	rows, err = r.ListDir(sid, "root.txt")
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("文件路径子项应为空, got %+v, %v", rows, err)
+	}
+}
+
+// TestOpenFileSeek：块流式读取 + Seek 定位块重放（HTTP Range 下载语义）。
+func TestOpenFileSeek(t *testing.T) {
+	r, _ := newTestRepo(t)
+	// 3.5 块内容
+	cs := r.ChunkSizeBytes()
+	big := make([]byte, cs*3+cs/2)
+	for i := range big {
+		big[i] = byte(i % 251)
+	}
+	txn, _ := r.BeginSnapshot(time.Now())
+	var refs []meta.ChunkRef
+	for off := 0; off < len(big); off += cs {
+		end := off + cs
+		if end > len(big) {
+			end = len(big)
+		}
+		id, _, err := r.StoreChunk(big[off:end])
+		if err != nil {
+			t.Fatal(err)
+		}
+		refs = append(refs, meta.ChunkRef{ChunkID: id, IDX: len(refs)})
+	}
+	txn.UpsertFile(meta.FileRow{Path: "big.bin", Mode: 0o644, Size: int64(len(big))}, refs)
+	sid, _ := txn.Commit()
+
+	fr, row, err := r.OpenFile(sid, "big.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fr.Close()
+	if row.Size != int64(len(big)) {
+		t.Fatalf("size 不符: %d", row.Size)
+	}
+	// Seek 到第 2 块开头，读回比对
+	pos, err := fr.Seek(int64(2*cs), io.SeekStart)
+	if err != nil || pos != int64(2*cs) {
+		t.Fatalf("seek 失败: %d, %v", pos, err)
+	}
+	got := make([]byte, cs/2)
+	if _, err := io.ReadFull(fr, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, big[2*cs:2*cs+cs/2]) {
+		t.Fatal("seek 后内容不符")
+	}
+	// SeekEnd 负偏移
+	if _, err := fr.Seek(-10, io.SeekEnd); err != nil {
+		t.Fatal(err)
+	}
+	last := make([]byte, 10)
+	if _, err := io.ReadFull(fr, last); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(last, big[len(big)-10:]) {
+		t.Fatal("SeekEnd 内容不符")
+	}
+	// 从头顺序读与原始逐字节一致
+	if _, err := fr.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	all, err := io.ReadAll(fr)
+	if err != nil || !bytes.Equal(all, big) {
+		t.Fatal("全量读不符")
+	}
+	// 不存在文件报错
+	if _, _, err := r.OpenFile(sid, "nonexistent"); err == nil {
+		t.Fatal("不存在文件应报错")
+	}
 }
 
 func TestStoreChunkNewAndReused(t *testing.T) {
@@ -513,6 +613,39 @@ func TestPrune(t *testing.T) {
 	}
 }
 
+// TestTrimAfterCommit：快照提交后的收尾裁剪（receiver 与 WebDAV 写共用）。
+func TestTrimAfterCommit(t *testing.T) {
+	r, _ := newTestRepo(t)
+	// 三次提交产生 3 个快照
+	for i := 0; i < 3; i++ {
+		txn, err := r.BeginSnapshot(time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := txn.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	latest, err := r.LatestSnapshotID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// keepHistory=true：不裁剪
+	if _, _, err := r.TrimAfterCommit(latest, true); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.SnapshotCountForTest(); err != nil || n != 3 {
+		t.Fatalf("多版本模式应保留 3 个快照, got %d, %v", n, err)
+	}
+	// keepHistory=false：收敛到 1
+	if _, _, err := r.TrimAfterCommit(latest, false); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := r.SnapshotCountForTest(); err != nil || n != 1 {
+		t.Fatalf("单份模式应保留 1 个快照, got %d, %v", n, err)
+	}
+}
+
 // TestKeepOnlySnapshot：单份模式收尾。三个内容各异的快照 + 一个纯复制
 // （无变化）快照：裁剪删旧快照、回收独占 blob、共享 chunk 保留；随后再来
 // 一个无变化快照时裁剪不产生孤儿 chunk，跳过 GC（后端零访问）。
@@ -614,5 +747,109 @@ func TestGetFileRow(t *testing.T) {
 	}
 	if _, ok, err := r.GetFileRow(sid, "nope.txt"); err != nil || ok {
 		t.Fatalf("不存在路径: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestPutFileAndFriends：写即快照方法族（PutFile/Mkcol/DeletePath/MovePath）。
+func TestPutFileAndFriends(t *testing.T) {
+	r, _ := newTestRepo(t)
+	now := time.Now().UnixNano()
+
+	// 根文件 PUT
+	if err := r.PutFile("a.txt", 0o644, now, strings.NewReader("hello")); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ := r.LatestSnapshotID()
+	row, ok, err := r.GetFileRow(sid, "a.txt")
+	if err != nil || !ok {
+		t.Fatalf("a.txt 应存在: %v, %v", ok, err)
+	}
+	if row.Size != 5 {
+		t.Fatalf("size 不符: %d", row.Size)
+	}
+
+	// 父目录缺失 → os.ErrNotExist
+	if err := r.PutFile("sub/b.txt", 0o644, now, strings.NewReader("x")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("父目录缺失应 ErrNotExist, got %v", err)
+	}
+
+	// Mkcol + 目录内 PUT
+	if err := r.Mkcol("sub"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Mkcol("sub"); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("重复 Mkcol 应 ErrExist, got %v", err)
+	}
+	if err := r.PutFile("sub/b.txt", 0o644, now, strings.NewReader("xyz")); err != nil {
+		t.Fatal(err)
+	}
+
+	// MovePath 文件（内容 chunk 引用保持）
+	if err := r.MovePath("a.txt", "a2.txt"); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ = r.LatestSnapshotID()
+	if _, ok, _ := r.GetFileRow(sid, "a.txt"); ok {
+		t.Fatal("移动后源应不存在")
+	}
+	fr, _, err := r.OpenFile(sid, "a2.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(fr)
+	fr.Close()
+	if string(got) != "hello" {
+		t.Fatalf("移动后内容不符: %q", got)
+	}
+
+	// DeletePath 文件
+	if err := r.DeletePath("a2.txt"); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ = r.LatestSnapshotID()
+	if _, ok, _ := r.GetFileRow(sid, "a2.txt"); ok {
+		t.Fatal("删除后应不存在")
+	}
+	// DeletePath 目录（递归含 b.txt）
+	if err := r.DeletePath("sub"); err != nil {
+		t.Fatal(err)
+	}
+	sid, _ = r.LatestSnapshotID()
+	if _, ok, _ := r.GetFileRow(sid, "sub"); ok {
+		t.Fatal("删除后 sub 应不存在")
+	}
+	if _, ok, _ := r.GetFileRow(sid, "sub/b.txt"); ok {
+		t.Fatal("删除后 sub/b.txt 应不存在")
+	}
+	// DeletePath 不存在 → os.ErrNotExist
+	if err := r.DeletePath("nope"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("删除不存在应 ErrNotExist, got %v", err)
+	}
+}
+
+// TestPutFileChunkDedup：相同内容两次 PUT 复用 chunk（后端 blob 数不变）。
+func TestPutFileChunkDedup(t *testing.T) {
+	r, be := newTestRepo(t)
+	now := time.Now().UnixNano()
+	if err := r.PutFile("one.txt", 0o644, now, strings.NewReader("same")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PutFile("two.txt", 0o644, now, strings.NewReader("same")); err != nil {
+		t.Fatal(err)
+	}
+	blobs, err := be.List()
+	if err != nil || len(blobs) != 1 {
+		t.Fatalf("去重后应只有 1 个 blob, got %d, %v", len(blobs), err)
+	}
+	for _, p := range []string{"one.txt", "two.txt"} {
+		fr, _, err := r.OpenFile(mustLatest(t, r), p)
+		if err != nil {
+			t.Fatalf("打开 %s: %v", p, err)
+		}
+		got, _ := io.ReadAll(fr)
+		fr.Close()
+		if string(got) != "same" {
+			t.Fatalf("%s 内容不符: %q", p, got)
+		}
 	}
 }

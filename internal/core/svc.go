@@ -9,4 +9,5 @@ import "crysync/internal/core/types"
 type SessionTxn = types.SessionTxn
 type Session = types.Session
 type FileStore = types.FileStore
+type FileWriter = types.FileWriter
 type RsyncService = types.RsyncService

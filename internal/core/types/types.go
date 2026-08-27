@@ -30,7 +30,7 @@ type SessionTxn interface {
 
 // Session 备份方向服务：rsync receiver 使用。
 // 方法集合 = rsyncproto 当前实际调用的 repo 方法全集（Task 2 Step 6 逐一核对），
-// 不增不减。含 KeepOnlySnapshot（receiver 会话收尾单份模式裁剪用）。
+// 不增不减。含 TrimAfterCommit（receiver 会话收尾单份模式裁剪用）。
 type Session interface {
 	// BeginSnapshot 创建新快照并复制上一快照的完整文件清单，返回会话事务。
 	BeginSnapshot(now time.Time) (SessionTxn, error)
@@ -46,13 +46,14 @@ type Session interface {
 	ActiveSnapshotID() (int64, error)
 	// StreamFile 流式读取快照文件内容（整文件 MD5 强校验和），返回字节数与校验和。
 	StreamFile(snapshotID int64, path string, seed int32, w io.Writer) (int64, [16]byte, error)
-	// KeepOnlySnapshot 单份模式会话收尾：删除 keepID 之前的全部快照。
-	KeepOnlySnapshot(snapshotID int64) (removed int, blobs int, err error)
+	// TrimAfterCommit 快照提交后的收尾裁剪：keepHistory=true 不动作；
+	// false（单份模式）删除 snapshotID 之前的全部快照并回收孤儿 blob。
+	TrimAfterCommit(snapshotID int64, keepHistory bool) (removed int, blobs int, err error)
 }
 
 // FileStore 读路径服务：rsync 恢复方向（sender）+ 后续 WebDAV 读使用。
 // 方法集合 = sender.go processSendSession 的 repo 调用面（Step 6 核对），
-// 不增不减；不含任何写方法。
+// 加 ListDir/OpenFile（WebDAV 读最小必需），不含任何写方法。
 type FileStore interface {
 	// ActiveSnapshotID 返回活跃快照 ID（恢复以 CLI 切换的活跃快照为时间点）。
 	ActiveSnapshotID() (int64, error)
@@ -64,6 +65,22 @@ type FileStore interface {
 	StreamFile(snapshotID int64, path string, seed int32, w io.Writer) (int64, [16]byte, error)
 	// ChunkSizeBytes 返回分块大小（字节），sender 用它计算块数与日志统计。
 	ChunkSizeBytes() int
+	// ListDir 返回快照中 path 的直接子项（非递归，不含自身）。
+	ListDir(snapshotID int64, path string) ([]meta.FileRow, error)
+	// OpenFile 按路径打开快照文件：返回流式块重组 reader（Read/Seek/Close）与元数据。
+	OpenFile(snapshotID int64, path string) (io.ReadSeekCloser, meta.FileRow, error)
+}
+
+// FileWriter 写路径服务：WebDAV 写使用（写即快照：每个方法独立提交一个快照）。
+type FileWriter interface {
+	// PutFile 以"写即快照"语义写入（或覆盖）path 文件内容。
+	PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) error
+	// Mkcol 以"写即快照"语义创建目录条目；已存在返回 os.ErrExist。
+	Mkcol(path string) error
+	// DeletePath 以"写即快照"语义删除 path（文件或目录，目录递归删整棵子树）。
+	DeletePath(path string) error
+	// MovePath 以"写即快照"语义移动/改名 src 至 dst（目录移动递归整棵子树）。
+	MovePath(src, dst string) error
 }
 
 // RsyncService rsync 前端会话所需完整能力（Session ∪ FileStore）：

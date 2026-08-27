@@ -172,16 +172,16 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 	// 会话统计与错误上下文：任何 return 前的错误都记 session_error（含当前条目）
 	started := time.Now()
 	var st struct {
-		files      int   // flist 条目总数
-		transferred int  // 实际传输文件（full+delta）
-		skipped    int   // quick check 命中
-		dirs       int
-		links      int
-		matched    int64
-		literal    int64
+		files        int // flist 条目总数
+		transferred  int // 实际传输文件（full+delta）
+		skipped      int // quick check 命中
+		dirs         int
+		links        int
+		matched      int64
+		literal      int64
 		chunksStored int
-		deleted    int // --delete 移除的行（文件+目录）
-		failed     int // 失败文件（客户端 open 失败 MSG_NO_SEND / 校验和不匹配）
+		deleted      int // --delete 移除的行（文件+目录）
+		failed       int // 失败文件（客户端 open 失败 MSG_NO_SEND / 校验和不匹配）
 	}
 	st.files = len(entries)
 	var curPath string
@@ -232,7 +232,7 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 				st.dirs++
 				logger.Info("entry", "path", prefix, "type", "dir",
 					"mode", fmt.Sprintf("%o", e.Mode), "uid", e.UID, "gid", e.GID,
-					"mtime", e.MTimeNs / 1e9)
+					"mtime", e.MTimeNs/1e9)
 			}
 			continue
 		}
@@ -447,12 +447,10 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 	)
 	// 单份模式（模块 snapshot: false）收尾：删除更早的全部快照只保留本份。
 	// 失败仅记日志不报错客户端——数据已提交，残留旧快照无害，下次会话收敛。
-	if !module.Snapshot {
-		if removed, blobs, terr := s.KeepOnlySnapshot(sid); terr != nil {
-			logger.Error("single_copy_trim_error", "err", terr.Error())
-		} else if removed > 0 || blobs > 0 {
-			logger.Info("single_copy_trim", "removed_snapshots", removed, "reclaimed_blobs", blobs)
-		}
+	if removed, blobs, terr := s.TrimAfterCommit(sid, module.Snapshot); terr != nil {
+		logger.Error("single_copy_trim_error", "err", terr.Error())
+	} else if removed > 0 || blobs > 0 {
+		logger.Info("single_copy_trim", "removed_snapshots", removed, "reclaimed_blobs", blobs)
 	}
 	return nil
 }

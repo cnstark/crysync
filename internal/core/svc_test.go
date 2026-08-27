@@ -10,3 +10,4 @@ import (
 var _ Session = (*repo.Repo)(nil)
 var _ FileStore = (*repo.Repo)(nil)
 var _ SessionTxn = (*repo.SnapshotTxn)(nil)
+var _ FileWriter = (*repo.Repo)(nil)

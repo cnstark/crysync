@@ -283,7 +283,46 @@ func TestUpsertDecrementsOldRefs(t *testing.T) {
 	}
 }
 
-// TestGetFileRow：按 (snapshot_id, path) 单行查询（quick check 用）。
+// TestGetFileChunks：按 (snapshot_id, path) 查文件块引用（MovePath 复制引用用）。
+func TestGetFileChunks(t *testing.T) {
+	db := openTemp(t)
+	sid, err := db.CreateSnapshot(time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fid, err := db.UpsertFile(sid, FileRow{Path: "a.txt", Mode: 0o644, Size: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 先建 chunk 行（AttachChunks 的 file_chunks.chunk_id 外键引用 chunks.id）
+	var h1, h2 [32]byte
+	h1[0], h2[0] = 1, 2
+	c1, err := db.InsertChunk(h1, "blob1", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := db.InsertChunk(h2, "blob2", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := []ChunkRef{{ChunkID: c1, IDX: 0}, {ChunkID: c2, IDX: 1}}
+	if err := db.AttachChunks(fid, refs); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.GetFileChunks(sid, "a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].ChunkID != c1 || got[0].IDX != 0 || got[1].ChunkID != c2 || got[1].IDX != 1 {
+		t.Fatalf("chunks 不符: %+v", got)
+	}
+	// 不存在文件返回空
+	got, err = db.GetFileChunks(sid, "nope.txt")
+	if err != nil || len(got) != 0 {
+		t.Fatalf("不存在文件应返回空: %+v, %v", got, err)
+	}
+}
+
 func TestGetFileRow(t *testing.T) {
 	db := openTemp(t)
 	now := time.Unix(1700000000, 0).UTC()
