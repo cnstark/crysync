@@ -353,6 +353,16 @@ func (d *DB) IncrRefcount(chunkID int64) error {
 	return err
 }
 
+// DeleteChunkIfZero 删除 refcount 为 0 的 chunk 行（未附任何文件引用的孤儿）。
+// 写即快照失败收口用：本次事务新建但未 AttachChunks 的 chunk 行残留（其 blob
+// 因 chunks 表仍引用而 GC 无法回收），出错路径显式清理。已在快照中引用
+// （refcount>0）的由 Rollback/DeleteSnapshot 递减归零后另行删除，本方法只补
+// 漏网之鱼，绝不误删有引用的 chunk。
+func (d *DB) DeleteChunkIfZero(chunkID int64) error {
+	_, err := d.db.Exec(`DELETE FROM chunks WHERE id = ? AND refcount <= 0`, chunkID)
+	return err
+}
+
 func (d *DB) AttachChunks(fileID int64, refs []ChunkRef) error {
 	tx, err := d.db.Begin()
 	if err != nil {

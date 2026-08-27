@@ -853,3 +853,109 @@ func TestPutFileChunkDedup(t *testing.T) {
 		}
 	}
 }
+
+// failReader 输出部分数据后 mid-stream 返回错误（模拟请求体/源断流）。
+type failReader struct {
+	total int // 输出字节数上限
+	err   error
+	pos   int
+}
+
+func (r *failReader) Read(p []byte) (int, error) {
+	if r.pos >= r.total {
+		return 0, r.err
+	}
+	n := r.total - r.pos
+	if n > len(p) {
+		n = len(p)
+	}
+	r.pos += n
+	return n, nil
+}
+
+// TestPutFileFailureCleanup：PutFile 中途失败（src mid-stream 报错）时，
+// 已 StoreChunk 的新建 chunk 行（refcount=0）必须被清理——否则残留行让 GC
+// 按 chunks 表判定其 blob 非孤儿而无法回收，形成泄漏。
+func TestPutFileFailureCleanup(t *testing.T) {
+	r, be := newTestRepo(t)
+	now := time.Now().UnixNano()
+	// 构造 2.5 块的源，读到中途报错
+	errPut := errors.New("mid-stream failure")
+	src := &failReader{total: r.ChunkSizeBytes()*2 + r.ChunkSizeBytes()/2, err: errPut}
+	if err := r.PutFile("half.bin", 0o644, now, src); err == nil {
+		t.Fatal("PutFile 应返回错误")
+	}
+	// 1) 回滚后不应有新快照（仓库空）
+	if id, err := r.LatestSnapshotID(); err != nil || id != 0 {
+		t.Fatalf("快照应已回滚: id=%d err=%v", id, err)
+	}
+	// 2) 新建的 chunk 行（refcount=0）必须清掉，不残留于 chunks 表
+	var n int
+	if err := r.meta.QueryRow(`SELECT COUNT(*) FROM chunks`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("chunks 表应无残留行, got %d, %v", n, err)
+	}
+	// 3) blob 已写后端但因 chunk 行已删而成为孤儿 → GC 可回收
+	blobs, _ := be.List()
+	if len(blobs) == 0 {
+		t.Fatal("失败前应已写后端 blob（GC 待回收）")
+	}
+	deleted, err := r.GC()
+	if err != nil || deleted != len(blobs) {
+		t.Fatalf("GC 应回收全部失败残留 blob: deleted=%d want=%d err=%v", deleted, len(blobs), err)
+	}
+	if blobs, _ = be.List(); len(blobs) != 0 {
+		t.Fatalf("GC 后后端应为空: %v", blobs)
+	}
+}
+
+// TestMovePathOverwriteDir：目录移动覆盖已有目标子树时，dst 旧子树必须
+// 整体删除（否则新旧混存），src 内容完整就位。
+func TestMovePathOverwriteDir(t *testing.T) {
+	r, _ := newTestRepo(t)
+	now := time.Now().UnixNano()
+	// src 目录 sub（含文件 sub/a.txt）
+	if err := r.Mkcol("sub"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PutFile("sub/a.txt", 0o644, now, strings.NewReader("from-src")); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PutFile("sub/deep.txt", 0o644, now, strings.NewReader("deep")); err != nil {
+		t.Fatal(err)
+	}
+	// dst 目标已有目录 sub2（含旧文件 sub2/x.txt）
+	if err := r.Mkcol("sub2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PutFile("sub2/x.txt", 0o644, now, strings.NewReader("OLD-DST")); err != nil {
+		t.Fatal(err)
+	}
+	// 把 sub 移动到 sub2（覆盖已有子树）
+	if err := r.MovePath("sub", "sub2"); err != nil {
+		t.Fatal(err)
+	}
+	sid := mustLatest(t, r)
+	// dst 原子文件（sub2/x.txt）应不存在——被覆盖删除
+	if _, ok, _ := r.GetFileRow(sid, "sub2/x.txt"); ok {
+		t.Fatal("覆盖后 dst 旧文件 sub2/x.txt 不应残留")
+	}
+	// src 内容就位：sub2/a.txt 与 sub2/deep.txt 迁移到位
+	for path, want := range map[string]string{"sub2/a.txt": "from-src", "sub2/deep.txt": "deep"} {
+		fr, _, err := r.OpenFile(sid, path)
+		if err != nil {
+			t.Fatalf("打开 %s: %v", path, err)
+		}
+		got, _ := io.ReadAll(fr)
+		fr.Close()
+		if string(got) != want {
+			t.Fatalf("%s 内容不符: got %q want %q", path, got, want)
+		}
+	}
+	// src 子树在移动后消失
+	if _, ok, _ := r.GetFileRow(sid, "sub"); ok {
+		t.Fatal("src 源目录 sub 应已消失")
+	}
+	if _, ok, _ := r.GetFileRow(sid, "sub/a.txt"); ok {
+		t.Fatal("src 源文件 sub/a.txt 应已消失")
+	}
+}

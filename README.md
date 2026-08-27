@@ -135,6 +135,8 @@ curl -u backup:pass http://host:8080/home/file
 
 也支持 MKCOL（建目录）、DELETE（删除）、COPY/MOVE（复制/移动）等方法；主流文件管理器/WebDAV 挂载工具与 curl 用法相同。
 
+> ⚠️ **PUT 请求体中断语义**：PUT 上传中途断流（客户端中断/网络抖动）时，已接收的部分内容仍会被提交为一条新快照——x/net/webdav 库在 `io.Copy` 出错后仍会调用 `Close`，适配层无法感知 copy 失败。单份模式下该提交不会留下旧版本的完整副本。**重要数据建议使用 rsync 会话上传**（传输中断自动回滚，不产生快照）；WebDAV 适合即席小文件操作。
+
 ## CLI
 
 ```bash

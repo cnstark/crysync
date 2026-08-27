@@ -500,7 +500,7 @@ func (f *FileReader) loadChunk(ci int) error {
 
 func (f *FileReader) Read(p []byte) (int, error) {
 	if f.closed {
-		return 0, errors.New("文件已关闭")
+		return 0, io.ErrClosedPipe
 	}
 	if len(p) == 0 {
 		return 0, nil
@@ -522,7 +522,7 @@ func (f *FileReader) Read(p []byte) (int, error) {
 
 func (f *FileReader) Seek(offset int64, whence int) (int64, error) {
 	if f.closed {
-		return 0, errors.New("文件已关闭")
+		return 0, io.ErrClosedPipe
 	}
 	var target int64
 	switch whence {
@@ -651,9 +651,16 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 		return err
 	}
 	committed := false
+	var newChunks []int64 // 本次新建且未复用的 chunk（出错时回收，防 refcount=0 行残留）
 	defer func() {
-		if !committed {
-			_ = txn.Rollback()
+		if committed {
+			return
+		}
+		_ = txn.Rollback()
+		// 回滚已删除快照内被引用的 chunk 行；未附引用的新建 chunk 行在此补删，
+		// 其 blob 随之脱离 chunks 表 → 由 GC 回收（否则 refcount=0 行+blob 泄漏）。
+		for _, id := range newChunks {
+			_ = r.meta.DeleteChunkIfZero(id)
 		}
 	}()
 	buf := make([]byte, r.chunkSize)
@@ -662,9 +669,12 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 	for {
 		n, err := io.ReadFull(src, buf)
 		if n > 0 {
-			id, _, err2 := r.StoreChunk(buf[:n])
+			id, reused, err2 := r.StoreChunk(buf[:n])
 			if err2 != nil {
 				return err2
+			}
+			if !reused {
+				newChunks = append(newChunks, id)
 			}
 			chunks = append(chunks, meta.ChunkRef{ChunkID: id, IDX: len(chunks)})
 			total += int64(n)
@@ -752,7 +762,8 @@ func (r *Repo) DeletePath(path string) error {
 
 // MovePath 以"写即快照"语义移动/改名：目标新建条目（chunk 引用直接复制，
 // 净 refcount 不变、不产生新 blob），源删除。目录移动递归整棵子树，路径
-// 前缀整体替换。目标已存在时覆盖（WebDAV Overwrite 语义）。
+// 前缀整体替换。目标已存在时覆盖（WebDAV Overwrite 语义）：先删除 dst 原
+// 子树（与 src 重叠部分除外）再搬入 src，保证 dst 不残留旧内容。
 func (r *Repo) MovePath(src, dst string) error {
 	if err := checkParentDir(r, dst); err != nil {
 		return err
@@ -773,6 +784,27 @@ func (r *Repo) MovePath(src, dst string) error {
 	}
 	if len(rows) == 0 {
 		return os.ErrNotExist
+	}
+	// 覆盖语义：dst 若已存在（文件或目录子树），先整体删除——保证移动后
+	// dst 子树纯粹由 src 内容构成，旧 dst 子树不残留（新旧混存）。
+	dstRows, err := r.SnapshotFileRows(txn.SnapshotID(), dst)
+	if err != nil {
+		return err
+	}
+	// 注意：src 与 dst 可能同子树（原地改名/前缀替换），删除 dst 时必须
+	// 排除与 src 重叠的行，否则会把待移动的 src 行也删掉。下面按 src 路径
+	// 集合过滤。
+	srcSet := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		srcSet[row.Path] = true
+	}
+	for _, drow := range dstRows {
+		if srcSet[drow.Path] {
+			continue // 与 src 重叠的行（src 自身或其子树内容已由 upsert 处理）
+		}
+		if err := txn.DeleteFile(drow.Path); err != nil {
+			return err
+		}
 	}
 	for _, row := range rows {
 		var newPath string

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -50,9 +51,15 @@ modules:
 }
 
 func TestValidateErrors(t *testing.T) {
-	p := writeTemp(t, "front:\\n  rsync:\\n    listen: \\\"\\\"\\nmodules: []\\n")
-	if _, err := Load(p); err == nil {
-		t.Fatal("空配置应报错")
+	p := writeTemp(t, "front:\n  rsync:\n    listen: \"\"\nmodules:\n  - name: a\n    path: /\n    backend: { type: dir, path: /x }\n    keyfile: /k\n    meta: /m\n")
+	c, err := Load(p)
+	if err != nil {
+		t.Fatalf("合法结构（空 listen + 一个模块）应通过 Load: %v", err)
+	}
+	if err := c.Validate(); err == nil {
+		t.Fatal("空 listen 应校验失败")
+	} else if !strings.Contains(err.Error(), "listen") {
+		t.Fatalf("校验错误应提及 listen, got %v", err)
 	}
 	p = writeTemp(t, "modules:\n  - name: a\n    backend: { type: dir, path: /x }\n")
 	if _, err := Load(p); err == nil {
@@ -62,6 +69,9 @@ func TestValidateErrors(t *testing.T) {
 
 func TestDuplicateModuleName(t *testing.T) {
 	p := writeTemp(t, `
+front:
+  rsync:
+    listen: "127.0.0.1:873"
 modules:
   - name: a
     path: /
