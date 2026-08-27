@@ -12,10 +12,30 @@ import (
 const DefaultChunkSize = 4194304
 
 type Config struct {
+	Front   FrontConfig    `yaml:"front"`
 	Listen  string         `yaml:"listen"`
 	Auth    AuthConfig     `yaml:"auth"`
 	Log     LogConfig      `yaml:"log"`
 	Modules []ModuleConfig `yaml:"modules"`
+}
+
+// FrontConfig 前端层配置：每协议前端一节（缺省不启用）。
+// Task 4 新增：WebDAV 前端使用；Task 5 将把 Listen/Auth 移入各前端节。
+type FrontConfig struct {
+	Rsync  *RsyncFrontConfig  `yaml:"rsync"`
+	WebDAV *WebDAVFrontConfig `yaml:"webdav"`
+}
+
+// RsyncFrontConfig rsync 前端（challenge-response 认证）。
+type RsyncFrontConfig struct {
+	Listen string     `yaml:"listen"`
+	Auth   AuthConfig `yaml:"auth"`
+}
+
+// WebDAVFrontConfig WebDAV 前端（HTTP Basic 认证）。
+type WebDAVFrontConfig struct {
+	Listen string     `yaml:"listen"`
+	Auth   AuthConfig `yaml:"auth"`
 }
 
 // LogConfig 持久化日志配置：file 为空 = 仅 stderr（现状，向后兼容）；
