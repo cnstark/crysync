@@ -47,7 +47,7 @@ func TestDaemonSmoke(t *testing.T) {
 	ln.Close()
 
 	conf := filepath.Join(dir, "crysync.yaml")
-	confContent := fmt.Sprintf("listen: 127.0.0.1:%d\nauth:\n  users:\n    backup: secret\nmodules:\n  - name: home\n    path: /\n    backend: { type: dir, path: %s }\n    keyfile: %s\n    meta: %s\n",
+	confContent := fmt.Sprintf("front:\n  rsync:\n    listen: 127.0.0.1:%d\n    auth:\n      users:\n        backup: secret\nmodules:\n  - name: home\n    path: /\n    backend: { type: dir, path: %s }\n    keyfile: %s\n    meta: %s\n",
 		port, filepath.Join(dir, "data"), keyPath, filepath.Join(dir, "home.db"))
 	os.WriteFile(conf, []byte(confContent), 0o600)
 

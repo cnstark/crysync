@@ -1,0 +1,12 @@
+front:
+  rsync:
+    listen: "0.0.0.0:873"
+    auth: { users: { backup: "secret" } }
+  webdav:
+    listen: "0.0.0.0:8080"
+    auth: { users: { backup: "secret" } }
+modules:
+  - name: home
+    backend: { type: dir, path: /tmp/data }
+    keyfile: /tmp/home.key
+    meta: /tmp/home.db

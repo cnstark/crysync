@@ -63,7 +63,7 @@ func TestHandleModuleListEmptyName(t *testing.T) {
 }
 
 func TestHandleModuleAuthFlow(t *testing.T) {
-	cfg := &config.Config{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+	cfg := &config.Config{Front: config.FrontConfig{Rsync: &config.RsyncFrontConfig{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}}}},
 		Modules: []config.ModuleConfig{{Name: "home", Path: "/"}}}
 
 	// 固定 seed 生成器：4 字节 0x12 -> 十进制 "303174162"（0x12121212 & 0x7FFFFFFF）
@@ -95,7 +95,7 @@ func TestHandleModuleAuthFlow(t *testing.T) {
 }
 
 func TestHandleModuleAuthReject(t *testing.T) {
-	cfg := &config.Config{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+	cfg := &config.Config{Front: config.FrontConfig{Rsync: &config.RsyncFrontConfig{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}}}},
 		Modules: []config.ModuleConfig{{Name: "home", Path: "/"}}}
 	seed := "12345678"
 	r := bufio.NewReader(strings.NewReader(clientGreeting + "home\nbackup " + authDigest("WRONG", seed) + "\n"))
@@ -249,7 +249,7 @@ func TestParseServerArgs(t *testing.T) {
 // 时，在认证前写 @ERROR 文本行（对齐 rsyncd clientserver.c:796-799，客户端以
 // code 5 退出），不进入认证流程。
 func TestHandleModuleMaxConnections(t *testing.T) {
-	cfg := &config.Config{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+	cfg := &config.Config{Front: config.FrontConfig{Rsync: &config.RsyncFrontConfig{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}}}},
 		Modules: []config.ModuleConfig{{Name: "home", Path: "/", MaxConnections: 1}}}
 	r := bufio.NewReader(strings.NewReader(clientGreeting + "home\n"))
 	var buf bytes.Buffer

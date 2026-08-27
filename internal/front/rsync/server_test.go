@@ -33,8 +33,12 @@ func TestServeEndToEnd(t *testing.T) {
 	ln.Close()
 
 	cfg := &config.Config{
-		Listen: fmt.Sprintf("127.0.0.1:%d", port),
-		Auth:   config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+		Front: config.FrontConfig{
+			Rsync: &config.RsyncFrontConfig{
+				Listen: fmt.Sprintf("127.0.0.1:%d", port),
+				Auth:   config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+			},
+		},
 		Modules: []config.ModuleConfig{{
 			Name: "home", Path: "/",
 			Backend: config.BackendConfig{Type: "dir", Path: filepath.Join(dir, "data")},
@@ -46,7 +50,7 @@ func TestServeEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- Serve(ctx, cfg, nil) }()
+	go func() { errCh <- New(cfg, nil).Serve(ctx) }()
 	time.Sleep(200 * time.Millisecond) // 等监听就绪
 
 	src := t.TempDir()
@@ -104,8 +108,12 @@ func startDaemon(t *testing.T) (int, *config.Config) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	cfg := &config.Config{
-		Listen: fmt.Sprintf("127.0.0.1:%d", port),
-		Auth:   config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+		Front: config.FrontConfig{
+			Rsync: &config.RsyncFrontConfig{
+				Listen: fmt.Sprintf("127.0.0.1:%d", port),
+				Auth:   config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+			},
+		},
 		Modules: []config.ModuleConfig{{
 			Name: "home", Path: "/",
 			Backend: config.BackendConfig{Type: "dir", Path: filepath.Join(dir, "data")},
@@ -116,7 +124,7 @@ func startDaemon(t *testing.T) (int, *config.Config) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	errCh := make(chan error, 1)
-	go func() { errCh <- Serve(ctx, cfg, nil) }()
+	go func() { errCh <- New(cfg, nil).Serve(ctx) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -350,7 +358,11 @@ func TestServeWebDAVBackend(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	cfg := &config.Config{
-		Listen: fmt.Sprintf("127.0.0.1:%d", port),
+		Front: config.FrontConfig{
+			Rsync: &config.RsyncFrontConfig{
+				Listen: fmt.Sprintf("127.0.0.1:%d", port),
+			},
+		},
 		Modules: []config.ModuleConfig{{
 			Name: "home", Path: "/",
 			Backend: config.BackendConfig{Type: "webdav", URL: davURL},
@@ -360,7 +372,7 @@ func TestServeWebDAVBackend(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Serve(ctx, cfg, nil)
+	go New(cfg, nil).Serve(ctx)
 	time.Sleep(200 * time.Millisecond)
 
 	src := t.TempDir()
@@ -392,7 +404,11 @@ func TestServeReadOnlyModule(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	cfg := &config.Config{
-		Listen: fmt.Sprintf("127.0.0.1:%d", port),
+		Front: config.FrontConfig{
+			Rsync: &config.RsyncFrontConfig{
+				Listen: fmt.Sprintf("127.0.0.1:%d", port),
+			},
+		},
 		Modules: []config.ModuleConfig{{
 			Name: "ro", Path: "/", ReadOnly: true,
 			Backend: config.BackendConfig{Type: "dir", Path: filepath.Join(dir, "data")},
@@ -402,7 +418,7 @@ func TestServeReadOnlyModule(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Serve(ctx, cfg, nil)
+	go New(cfg, nil).Serve(ctx)
 	time.Sleep(200 * time.Millisecond)
 
 	pw := filepath.Join(dir, "pw")

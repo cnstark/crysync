@@ -1,0 +1,8 @@
+front:
+  rsync:
+    listen: "0.0.0.0:873"
+modules:
+  - name: home
+    backend: { type: dir, path: /tmp/data }
+    keyfile: /tmp/home.key
+    meta: /tmp/home.db

@@ -55,29 +55,43 @@ func newSessionID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// Serve 监听并服务 rsync 连接，直到 ctx 取消；配置了 prune 的模块启动每日调度。
+// Server rsync 前端服务：监听并服务 rsync 协议连接（cfg.Front.Rsync 提供 listen/auth）。
+type Server struct {
+	cfg    *config.Config
+	logger *slog.Logger
+}
+
+// New 构造 rsync 前端（cfg.Front.Rsync 为 nil 时调用方不应构造）。
 // logger 为 nil 时全部日志丢弃（向后兼容测试/嵌入用法）。
-func Serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
+func New(cfg *config.Config, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = nopLogger
 	}
-	ln, err := net.Listen("tcp", cfg.Listen)
+	return &Server{cfg: cfg, logger: logger}
+}
+
+func (s *Server) Name() string { return "rsync" }
+
+// Serve 监听并服务 rsync 连接，直到 ctx 取消；配置了 prune 的模块启动每日调度。
+func (s *Server) Serve(ctx context.Context) error {
+	rc := s.cfg.Front.Rsync
+	ln, err := net.Listen("tcp", rc.Listen)
 	if err != nil {
-		return fmt.Errorf("监听 %s: %w", cfg.Listen, err)
+		return fmt.Errorf("监听 %s: %w", rc.Listen, err)
 	}
 	defer ln.Close()
-	logger.Info("daemon_start", "listen", cfg.Listen, "modules", len(cfg.Modules))
+	s.logger.Info("daemon_start", "listen", rc.Listen, "modules", len(s.cfg.Modules))
 
 	// 启动时逐模块自动初始化（密钥+元数据，幂等）；失败仅记日志不中断监听，
 	// 连接路径 core.OpenModule 会重试并通过 @ERROR 反馈客户端
-	for i := range cfg.Modules {
-		autoInit, err := core.EnsureModuleInit(&cfg.Modules[i])
+	for i := range s.cfg.Modules {
+		autoInit, err := core.EnsureModuleInit(&s.cfg.Modules[i])
 		if err != nil {
-			logger.Error("module_init_error", "module", cfg.Modules[i].Name, "err", err.Error())
+			s.logger.Error("module_init_error", "module", s.cfg.Modules[i].Name, "err", err.Error())
 			continue
 		}
 		if autoInit {
-			logger.Info("module_auto_init", "module", cfg.Modules[i].Name)
+			s.logger.Info("module_auto_init", "module", s.cfg.Modules[i].Name)
 		}
 	}
 
@@ -87,15 +101,15 @@ func Serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 	// 正数 = 上限；claim_connection 语义，连接结束释放）
 	limiter := &moduleConnLimiter{}
 	// prune 调度：每模块独立 goroutine，按 schedule 每日执行
-	for i := range cfg.Modules {
-		m := &cfg.Modules[i]
+	for i := range s.cfg.Modules {
+		m := &s.cfg.Modules[i]
 		if modulePrunePolicy(m) == (prune.Policy{}) {
 			continue
 		}
 		wg.Add(1)
 		go func(module *config.ModuleConfig) {
 			defer wg.Done()
-			runPruneLoop(ctx, module, logger)
+			runPruneLoop(ctx, module, s.logger)
 		}(m)
 	}
 	go func() {
@@ -108,7 +122,7 @@ func Serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 			if ctx.Err() != nil {
 				break
 			}
-			logger.Warn("conn_error", "err", err.Error())
+			s.logger.Warn("conn_error", "err", err.Error())
 			continue
 		}
 		wg.Add(1)
@@ -116,8 +130,8 @@ func Serve(ctx context.Context, cfg *config.Config, logger *slog.Logger) error {
 			defer wg.Done()
 			defer c.Close()
 			c.SetDeadline(time.Now().Add(24 * time.Hour))
-			if err := handleConn(ctx, c, cfg, logger, limiter); err != nil && !errors.Is(err, protocol.ErrClientClosed) {
-				logger.Warn("conn_error", "client", c.RemoteAddr().String(), "err", err.Error())
+			if err := handleConn(ctx, c, s.cfg, s.logger, limiter); err != nil && !errors.Is(err, protocol.ErrClientClosed) {
+				s.logger.Warn("conn_error", "client", c.RemoteAddr().String(), "err", err.Error())
 			}
 		}(conn)
 	}

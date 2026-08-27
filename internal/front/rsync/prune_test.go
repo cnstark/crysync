@@ -58,7 +58,11 @@ func TestPruneOnce(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	cfg := &config.Config{
-		Listen: fmt.Sprintf("127.0.0.1:%d", port),
+		Front: config.FrontConfig{
+			Rsync: &config.RsyncFrontConfig{
+				Listen: fmt.Sprintf("127.0.0.1:%d", port),
+			},
+		},
 		Modules: []config.ModuleConfig{{
 			Name: "home", Path: "/",
 			Backend: config.BackendConfig{Type: "dir", Path: filepath.Join(dir, "data")},
@@ -69,7 +73,7 @@ func TestPruneOnce(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go Serve(ctx, cfg, nil)
+	go New(cfg, nil).Serve(ctx)
 	time.Sleep(200 * time.Millisecond)
 
 	src := t.TempDir()

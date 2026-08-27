@@ -94,8 +94,9 @@ func HandleModuleRequest(r *bufio.Reader, w io.Writer, cfg *config.Config, allow
 		return nil, fmt.Errorf("模块 %s 连接数达到上限 (%d)", module.Name, module.MaxConnections)
 	}
 	// (d,e,f) 认证：配置存在认证用户时要求 challenge-response（备份工具单用户模型，
-	// 用户名与模块名相互独立，口令按用户名查）
-	if len(cfg.Auth.Users) > 0 {
+	// 用户名与模块名相互独立，口令按用户名查）；Front.Rsync 为 nil（未配置 rsync
+	// 前端）或未配置用户时跳过认证
+	if cfg.Front.Rsync != nil && len(cfg.Front.Rsync.Auth.Users) > 0 {
 		seed, err := randomSeed()
 		if err != nil {
 			return nil, err
@@ -111,7 +112,7 @@ func HandleModuleRequest(r *bufio.Reader, w io.Writer, cfg *config.Config, allow
 			return nil, ErrAuthFailed
 		}
 		user, digest := parts[0], parts[1]
-		pass, ok := cfg.Auth.Users[user]
+		pass, ok := cfg.Front.Rsync.Auth.Users[user]
 		if !ok || digest != authDigest(pass, seed) {
 			fmt.Fprintf(w, "@ERROR: auth failed on module %s\n", name)
 			return nil, ErrAuthFailed

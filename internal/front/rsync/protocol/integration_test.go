@@ -54,7 +54,7 @@ func startServerModule(t *testing.T, module *config.ModuleConfig) (int, *repo.Re
 	key, _ := crypto.GenerateKey()
 	be := backend.NewInMemory()
 	r := repo.New(db, be, key, 64)
-	cfg := &config.Config{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+	cfg := &config.Config{Front: config.FrontConfig{Rsync: &config.RsyncFrontConfig{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}}}},
 		Modules: []config.ModuleConfig{*module}}
 
 	go func() {

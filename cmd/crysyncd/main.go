@@ -11,7 +11,9 @@ import (
 	"syscall"
 
 	"crysync/internal/config"
+	"crysync/internal/front"
 	"crysync/internal/front/rsync"
+	"crysync/internal/front/webdav"
 	"crysync/internal/logging"
 )
 
@@ -39,10 +41,29 @@ func main() {
 		log.Fatalf("初始化日志: %v", err)
 	}
 
+	// 前端层组装：配置了哪个前端就启动哪个（至少一个，Validate 已保证）
+	var fronts []front.Front
+	if cfg.Front.Rsync != nil {
+		fronts = append(fronts, rsync.New(cfg, logger))
+	}
+	if cfg.Front.WebDAV != nil {
+		fronts = append(fronts, webdav.New(cfg, logger))
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	if err := rsync.Serve(ctx, cfg, logger); err != nil {
-		fmt.Fprintf(os.Stderr, "crysyncd: %v\n", err)
-		os.Exit(1)
+	errCh := make(chan error, len(fronts))
+	for _, f := range fronts {
+		go func(f front.Front) {
+			errCh <- f.Serve(ctx)
+		}(f)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "crysyncd: %v\n", err)
+			os.Exit(1)
+		}
+	case <-ctx.Done():
 	}
 }

@@ -17,10 +17,12 @@ func writeTemp(t *testing.T, content string) string {
 
 func TestLoadAndValidate(t *testing.T) {
 	p := writeTemp(t, `
-listen: "127.0.0.1:873"
-auth:
-  users:
-    backup: secret
+front:
+  rsync:
+    listen: "127.0.0.1:873"
+    auth:
+      users:
+        backup: secret
 modules:
   - name: home
     path: "/"
@@ -32,7 +34,7 @@ modules:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if c.Listen != "127.0.0.1:873" || c.Auth.Users["backup"] != "secret" {
+	if c.Front.Rsync.Listen != "127.0.0.1:873" || c.Front.Rsync.Auth.Users["backup"] != "secret" {
 		t.Fatalf("解析错误: %+v", c)
 	}
 	m := c.Modules[0]
@@ -48,7 +50,7 @@ modules:
 }
 
 func TestValidateErrors(t *testing.T) {
-	p := writeTemp(t, "listen: \"\"\nmodules: []\n")
+	p := writeTemp(t, "front:\\n  rsync:\\n    listen: \\\"\\\"\\nmodules: []\\n")
 	if _, err := Load(p); err == nil {
 		t.Fatal("空配置应报错")
 	}
@@ -84,7 +86,9 @@ modules:
 func TestLogConfigDefaults(t *testing.T) {
 	// 无 log 节：全部默认值（file 空 = 仅 stderr）
 	p := writeTemp(t, `
-listen: "127.0.0.1:873"
+front:
+  rsync:
+    listen: "127.0.0.1:873"
 modules:
   - name: home
     path: /
@@ -192,7 +196,9 @@ modules:
 // TestSnapshotToggle：snapshot 缺省 false（单份模式），显式 true 解析为 true。
 func TestSnapshotToggle(t *testing.T) {
 	p := writeTemp(t, `
-listen: "127.0.0.1:873"
+front:
+  rsync:
+    listen: "127.0.0.1:873"
 modules:
   - name: a
     path: /
@@ -218,13 +224,46 @@ modules:
 	}
 }
 
+// TestFrontConfig：front 节解析与 Validate 校验（至少一个前端）。
+func TestFrontConfig(t *testing.T) {
+	c, err := Load("testdata/front.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Front.Rsync == nil || c.Front.Rsync.Listen != "0.0.0.0:873" {
+		t.Fatalf("rsync front 不符: %+v", c.Front.Rsync)
+	}
+	if c.Front.WebDAV == nil || c.Front.WebDAV.Listen != "0.0.0.0:8080" {
+		t.Fatalf("webdav front 不符: %+v", c.Front.WebDAV)
+	}
+	if c.Front.WebDAV.Auth.Users["backup"] != "secret" {
+		t.Fatalf("webdav auth 不符: %+v", c.Front.WebDAV.Auth)
+	}
+	// 无 front → 校验失败
+	c2 := &Config{Modules: c.Modules}
+	if err := c2.Validate(); err == nil {
+		t.Fatal("无 front 应校验失败")
+	}
+}
+
+func TestFrontConfigNoWebDAV(t *testing.T) {
+	c, err := Load("testdata/front-rsync-only.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Front.WebDAV != nil {
+		t.Fatalf("未配置 webdav 应为 nil: %+v", c.Front.WebDAV)
+	}
+}
+
 func TestEnvExpansion(t *testing.T) {
 	t.Setenv("CS_TEST_RSYNC_PASS", "p#ss:word")
 	t.Setenv("CS_TEST_WEBDAV_URL", "http://quarkdav:8080/crysync/")
-	p := writeTemp(t, `
-listen: "0.0.0.0:873"
-auth:
-  users: { backup: "${CS_TEST_RSYNC_PASS}" }
+	p := writeTemp(t, `front:
+  rsync:
+    listen: "0.0.0.0:873"
+    auth:
+      users: { backup: "${CS_TEST_RSYNC_PASS}" }
 modules:
   - name: quark
     path: "/"
@@ -239,8 +278,8 @@ modules:
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if c.Auth.Users["backup"] != "p#ss:word" {
-		t.Fatalf("密码应展开为含特殊字符的 env 值: %q", c.Auth.Users["backup"])
+	if c.Front.Rsync.Auth.Users["backup"] != "p#ss:word" {
+		t.Fatalf("密码应展开为含特殊字符的 env 值: %q", c.Front.Rsync.Auth.Users["backup"])
 	}
 	if c.Modules[0].Backend.URL != "http://quarkdav:8080/crysync/" {
 		t.Fatalf("url 应展开: %q", c.Modules[0].Backend.URL)

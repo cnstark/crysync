@@ -167,8 +167,12 @@ func TestServeAutoInitEndToEnd(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	cfg := &config.Config{
-		Listen: fmt.Sprintf("127.0.0.1:%d", port),
-		Auth:   config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+		Front: config.FrontConfig{
+			Rsync: &config.RsyncFrontConfig{
+				Listen: fmt.Sprintf("127.0.0.1:%d", port),
+				Auth:   config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+			},
+		},
 		Modules: []config.ModuleConfig{{
 			Name: "home", Path: "/",
 			Backend: config.BackendConfig{Type: "dir", Path: filepath.Join(dir, "data")},
@@ -179,7 +183,7 @@ func TestServeAutoInitEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- Serve(ctx, cfg, nil) }()
+	go func() { errCh <- New(cfg, nil).Serve(ctx) }()
 	time.Sleep(200 * time.Millisecond) // 等监听就绪
 
 	// daemon 启动即完成初始化，无需手动 crysync init
@@ -228,8 +232,12 @@ func TestServeInitFailureDoesNotKillDaemon(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	cfg := &config.Config{
-		Listen: fmt.Sprintf("127.0.0.1:%d", port),
-		Auth:   config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+		Front: config.FrontConfig{
+			Rsync: &config.RsyncFrontConfig{
+				Listen: fmt.Sprintf("127.0.0.1:%d", port),
+				Auth:   config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+			},
+		},
 		Modules: []config.ModuleConfig{{
 			Name: "home", Path: "/",
 			Backend: config.BackendConfig{Type: "dir", Path: filepath.Join(dir, "data")},
@@ -240,7 +248,7 @@ func TestServeInitFailureDoesNotKillDaemon(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- Serve(ctx, cfg, nil) }()
+	go func() { errCh <- New(cfg, nil).Serve(ctx) }()
 	time.Sleep(200 * time.Millisecond)
 
 	select {
@@ -248,7 +256,7 @@ func TestServeInitFailureDoesNotKillDaemon(t *testing.T) {
 		t.Fatalf("初始化失败不应导致 daemon 退出: %v", err)
 	default:
 	}
-	conn, err := net.DialTimeout("tcp", cfg.Listen, time.Second)
+	conn, err := net.DialTimeout("tcp", cfg.Front.Rsync.Listen, time.Second)
 	if err != nil {
 		t.Fatalf("daemon 应仍在监听: %v", err)
 	}

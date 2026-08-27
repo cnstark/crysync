@@ -36,8 +36,12 @@ func startLoggedDaemon(t *testing.T) (int, *bytes.Buffer) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 	cfg := &config.Config{
-		Listen: fmt.Sprintf("127.0.0.1:%d", port),
-		Auth:   config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+		Front: config.FrontConfig{
+			Rsync: &config.RsyncFrontConfig{
+				Listen: fmt.Sprintf("127.0.0.1:%d", port),
+				Auth:   config.AuthConfig{Users: map[string]string{"backup": "secret"}},
+			},
+		},
 		Modules: []config.ModuleConfig{{
 			Name: "home", Path: "/",
 			Backend: config.BackendConfig{Type: "dir", Path: filepath.Join(dir, "data")},
@@ -51,7 +55,7 @@ func startLoggedDaemon(t *testing.T) (int, *bytes.Buffer) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	errCh := make(chan error, 1)
-	go func() { errCh <- Serve(ctx, cfg, logger) }()
+	go func() { errCh <- New(cfg, logger).Serve(ctx) }()
 	t.Cleanup(func() {
 		cancel()
 		select {

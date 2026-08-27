@@ -13,14 +13,11 @@ const DefaultChunkSize = 4194304
 
 type Config struct {
 	Front   FrontConfig    `yaml:"front"`
-	Listen  string         `yaml:"listen"`
-	Auth    AuthConfig     `yaml:"auth"`
 	Log     LogConfig      `yaml:"log"`
 	Modules []ModuleConfig `yaml:"modules"`
 }
 
 // FrontConfig 前端层配置：每协议前端一节（缺省不启用）。
-// Task 4 新增：WebDAV 前端使用；Task 5 将把 Listen/Auth 移入各前端节。
 type FrontConfig struct {
 	Rsync  *RsyncFrontConfig  `yaml:"rsync"`
 	WebDAV *WebDAVFrontConfig `yaml:"webdav"`
@@ -166,8 +163,14 @@ func (c *Config) validateLog() error {
 }
 
 func (c *Config) Validate() error {
-	if c.Listen == "" {
-		return fmt.Errorf("listen 不能为空")
+	if c.Front.Rsync == nil && c.Front.WebDAV == nil {
+		return fmt.Errorf("front 至少需要一个前端（rsync/webdav）")
+	}
+	if c.Front.Rsync != nil && c.Front.Rsync.Listen == "" {
+		return fmt.Errorf("front.rsync.listen 不能为空")
+	}
+	if c.Front.WebDAV != nil && c.Front.WebDAV.Listen == "" {
+		return fmt.Errorf("front.webdav.listen 不能为空")
 	}
 	if err := c.validateStructure(); err != nil {
 		return err
