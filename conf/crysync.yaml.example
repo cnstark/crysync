@@ -1,11 +1,21 @@
 # CrySync 配置示例（docker compose 部署时挂载到 /conf/crysync.yaml，权限 0600）
-listen: "0.0.0.0:873"
-auth:
-  users: { backup: "changeme" }   # rsyncd 协议限制：明文；配置权限收紧到 0600
+# front 节：rsync 与 webdav 两前端并列，各配 listen 与认证（至少启用一个）
+front:
+  rsync:
+    listen: "0.0.0.0:873"
+    auth:
+      users: { backup: "changeme" }   # rsyncd 协议限制：明文；配置权限收紧到 0600
+  webdav:
+    listen: "0.0.0.0:8080"
+    auth:
+      users: { user: "passwd" }       # Basic 认证（明文 base64），生产建议 TLS 反代
+log:
+  file: /var/log/crysync/crysyncd.log
+  level: info                         # debug/info/warn/error，缺省 info
 modules:
   - name: home
     path: "/"
-    snapshot: true                   # false（缺省）= 单份模式只保留最新一份；true = 多版本历史
+    snapshot: true                    # false（缺省）= 单份模式只保留最新一份；true = 多版本历史
     backend: { type: dir, path: /data/home }
     keyfile: /keys/home.key
     meta: /meta/home.db
