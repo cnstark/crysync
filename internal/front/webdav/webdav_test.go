@@ -176,6 +176,48 @@ func TestGetSymlink(t *testing.T) {
 	}
 }
 
+// TestIdempotentDelete 幂等 DELETE 中间件：不存在/存在的路径都 204（锁内
+// 幂等判定，无 404——x/net/webdav 库层 Stat 前置检查固定 404，绿联 restic
+// fork 对 404 敏感）；模块根删除拒绝；非 DELETE 透传。
+func TestIdempotentDelete(t *testing.T) {
+	writer := &fakeWriter{puts: map[string]string{}}
+	var nextCalled bool
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+	h := idempotentDelete(next, writer, "/home")
+
+	// 存在/不存在路径都 204（fakeWriter.DeletePath 恒 nil）
+	for _, p := range []string{"/home/a.txt", "/home/nope"} {
+		req := httptest.NewRequest(http.MethodDelete, p, nil)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("DELETE %s 应 204, got %d", p, rec.Code)
+		}
+	}
+	if len(writer.dels) != 2 {
+		t.Fatalf("DELETE 记录不符: %+v", writer.dels)
+	}
+	// 模块根拒绝删除
+	req := httptest.NewRequest(http.MethodDelete, "/home/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE 模块根应 405, got %d", rec.Code)
+	}
+	// 非 DELETE 透传
+	nextCalled = false
+	req = httptest.NewRequest(http.MethodPut, "/home/a.txt", strings.NewReader("x"))
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if !nextCalled {
+		t.Fatal("PUT 应透传 next")
+	}
+}
+
+// TestWriteOperations 写操作全流程（MKCOL/PUT/DELETE/MOVE）。
 func TestWriteOperations(t *testing.T) {
 	store := &fakeStore{rows: map[string]meta.FileRow{}, data: map[string]string{}}
 	writer := &fakeWriter{puts: map[string]string{}}

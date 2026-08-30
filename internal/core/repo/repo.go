@@ -726,12 +726,40 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 	return nil
 }
 
-// Mkcol 以"写即快照"语义创建目录条目；已存在返回 os.ErrExist。
+// pathExistsLocked 在写锁内判定 path 是否存在于最新快照（幂等 MKCOL/DELETE
+// 用）：仓库无任何快照时视为不存在。调用方必须持 writeMu——读的
+// LatestSnapshotID 与 BeginSnapshot 的复制源一致，无并发快照切换窗口。
+func (r *Repo) pathExistsLocked(path string) (bool, error) {
+	id, err := r.LatestSnapshotID()
+	if err != nil {
+		return false, err
+	}
+	if id == 0 {
+		return false, nil
+	}
+	_, ok, err := r.meta.GetFileRow(id, path)
+	return ok, err
+}
+
+// Mkcol 以"写即快照"语义创建目录条目；已存在时幂等返回 nil（目录已存在即
+// 目标状态已达成，x/net/webdav 映射为 201 Created）。
+// 幂等原因（NAS 实测）：绿联 NAS 定制 restic fork 把 MKCOL 405（目录已存在）
+// 当致命错误，mkdirAll 永不收敛——1.5 小时 442 次重试、零 PUT blob，任务报
+// "Path not found/No permission/Insufficient capacity"；官方 restic webdav
+// 后端则把 405 视为"已存在，继续"。幂等返回成功对 rclone/Windows/官方
+// restic 等标准客户端同样安全（RFC 4918 允许服务器宽容处理已存在目录）。
 func (r *Repo) Mkcol(path string) error {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 	if err := checkParentDir(r, path); err != nil {
 		return err
+	}
+	// 已存在检查前置到事务外：幂等请求零开销（不建快照、不复制清单），
+	// 且锁内判定与事务内判定结果一致
+	if ok, err := r.pathExistsLocked(path); err != nil {
+		return err
+	} else if ok {
+		return nil
 	}
 	txn, err := r.BeginSnapshot(time.Now())
 	if err != nil {
@@ -743,11 +771,6 @@ func (r *Repo) Mkcol(path string) error {
 			_ = txn.Rollback()
 		}
 	}()
-	if _, ok, err := r.meta.GetFileRow(txn.SnapshotID(), path); err != nil {
-		return err
-	} else if ok {
-		return os.ErrExist
-	}
 	if err := txn.UpsertFile(meta.FileRow{Path: path, IsDir: true, Mode: 0o40755, MTimeNs: time.Now().UnixNano()}, nil); err != nil {
 		return err
 	}
@@ -759,10 +782,18 @@ func (r *Repo) Mkcol(path string) error {
 }
 
 // DeletePath 以"写即快照"语义删除 path（文件或目录，目录递归删整棵子树）；
-// 不存在返回 os.ErrNotExist。
+// 不存在时幂等返回 nil（目标状态已达成，x/net/webdav 映射为 204 No Content）。
+// 幂等原因与 Mkcol 相同：绿联 restic fork 对 DELETE 404 同样敏感（删锁文件
+// 反复收到 404 会报错）；标准客户端不受影响。
 func (r *Repo) DeletePath(path string) error {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
+	// 不存在检查前置到事务外（幂等请求零开销），锁内判定与事务内一致
+	if ok, err := r.pathExistsLocked(path); err != nil {
+		return err
+	} else if !ok {
+		return nil
+	}
 	txn, err := r.BeginSnapshot(time.Now())
 	if err != nil {
 		return err
@@ -778,7 +809,7 @@ func (r *Repo) DeletePath(path string) error {
 		return err
 	}
 	if len(rows) == 0 {
-		return os.ErrNotExist
+		return nil // 防御性兜底：前置检查后正常不会到达（行存在即匹配自身）
 	}
 	for _, row := range rows {
 		if err := txn.DeleteFile(row.Path); err != nil {

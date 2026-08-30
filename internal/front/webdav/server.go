@@ -102,8 +102,11 @@ func (s *Server) buildMux(modules map[string]*core.Module) http.Handler {
 		prefix := "/" + m.Name
 		h.Prefix = prefix
 		// dirBrowse：浏览器 GET 目录渲染 HTML 文件列表（标准客户端走
-		// PROPFIND 不受影响；x/net/webdav 对目录 GET 固定 405）
-		mux.Handle(prefix+"/", auth(readOnlyGuard(m.ReadOnly, dirBrowse(h, mod.FileStore, prefix))))
+		// PROPFIND 不受影响；x/net/webdav 对目录 GET 固定 405）。
+		// idempotentDelete：短路 DELETE（x/net/webdav 的 Stat 前置检查
+		// 把"删除不存在"固定映射 404，绿联 restic fork 对 404 敏感）。
+		mux.Handle(prefix+"/", auth(readOnlyGuard(m.ReadOnly,
+			idempotentDelete(dirBrowse(h, mod.FileStore, prefix), mod.FileWriter, prefix))))
 	}
 	// 虚拟根（catch-all）：挂载服务器根的客户端 PROPFIND / 可见模块列表
 	//（按配置声明顺序，仅含已就绪模块）；未认证时先得 401 质询。

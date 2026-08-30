@@ -249,7 +249,31 @@ func TestWebDAVRsyncCrossFront(t *testing.T) {
 		t.Fatalf("单份模式应恒 1 个快照, got %d", n)
 	}
 
-	// 6) 404 不存在
+	// 6) 幂等 MKCOL/DELETE（绿联 NAS 定制 restic fork 兼容）：已存在目录重复
+	// MKCOL 必须 201（修复前 405 致 mkdirAll 重试风暴 1.5 小时、零 PUT blob）、
+	// DELETE 不存在必须 204（修复前 404 同样被 fork 当致命错误），且幂等请求
+	// 不得产生新快照（否则单份模式持续写放大 / 多快照模式无限膨胀）。
+	before, err := mod.Repo.SnapshotCountForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, _ = webdavDo(t, "MKCOL", davBase+"/home/newdir", nil, nil)
+	if code != http.StatusCreated {
+		t.Fatalf("重复 MKCOL 应幂等 201, got %d", code)
+	}
+	code, _ = webdavDo(t, http.MethodDelete, davBase+"/home/nonexistent", nil, nil)
+	if code != http.StatusNoContent {
+		t.Fatalf("DELETE 不存在应幂等 204, got %d", code)
+	}
+	n, err = mod.Repo.SnapshotCountForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != before {
+		t.Fatalf("幂等请求不应产生快照: before=%d after=%d", before, n)
+	}
+
+	// 7) 404 不存在
 	code, _ = webdavDo(t, http.MethodGet, davBase+"/home/nonexistent", nil, nil)
 	if code != http.StatusNotFound {
 		t.Fatalf("GET 不存在应 404, got %d", code)

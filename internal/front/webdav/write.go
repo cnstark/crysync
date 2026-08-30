@@ -4,7 +4,9 @@ package webdav
 
 import (
 	"context"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/net/webdav"
@@ -83,3 +85,31 @@ func (i *writeFileInfo) Mode() os.FileMode  { return 0o644 }
 func (i *writeFileInfo) ModTime() time.Time { return i.modTime }
 func (i *writeFileInfo) IsDir() bool        { return false }
 func (i *writeFileInfo) Sys() any           { return nil }
+
+// idempotentDelete 幂等 DELETE 中间件（绿联 NAS 定制 restic fork 兼容）：
+// x/net/webdav 的 handleDelete 在 RemoveAll 前强制 Stat（webdav.go:261-266），
+// 路径不存在即 404——repo 层 DeletePath 的幂等化覆盖不到库层，故在 Handler
+// 前短路 DELETE：writer.DeletePath 锁内判定（不存在返回 nil），统一 204
+// No Content（目标状态已达成即成功）。存在性判定与删除在同一写锁内，
+// 无锁外预检竞态（409 风暴教训）。模块根删除顺带拒绝（原库行为会
+// RemoveAll 模块根清空整仓）。
+func idempotentDelete(next http.Handler, writer core.FileWriter, prefix string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			next.ServeHTTP(w, r)
+			return
+		}
+		path := strings.TrimPrefix(r.URL.Path, prefix)
+		if path = strings.Trim(path, "/"); path == "" {
+			http.Error(w, "cannot delete module root", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := writer.DeletePath(path); err != nil {
+			// 与 x/net/webdav RemoveAll 错误映射一致（405）；DeletePath 失败
+			// 一般是 DB/后端错误，原库同样 405
+			http.Error(w, err.Error(), http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+}

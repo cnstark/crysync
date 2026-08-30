@@ -779,8 +779,10 @@ func TestPutFileAndFriends(t *testing.T) {
 	if err := r.Mkcol("sub"); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Mkcol("sub"); !errors.Is(err, os.ErrExist) {
-		t.Fatalf("重复 Mkcol 应 ErrExist, got %v", err)
+	// 重复 Mkcol 幂等成功（已存在即目标达成；绿联 restic fork 对 405 敏感，
+	// 服务端不再返回 ErrExist——见 TestMkcolDeleteIdempotent 的快照数断言）
+	if err := r.Mkcol("sub"); err != nil {
+		t.Fatalf("重复 Mkcol 应幂等成功, got %v", err)
 	}
 	if err := r.PutFile("sub/b.txt", 0o644, now, strings.NewReader("xyz")); err != nil {
 		t.Fatal(err)
@@ -823,10 +825,53 @@ func TestPutFileAndFriends(t *testing.T) {
 	if _, ok, _ := r.GetFileRow(sid, "sub/b.txt"); ok {
 		t.Fatal("删除后 sub/b.txt 应不存在")
 	}
-	// DeletePath 不存在 → os.ErrNotExist
-	if err := r.DeletePath("nope"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("删除不存在应 ErrNotExist, got %v", err)
+	// DeletePath 不存在幂等成功（同 Mkcol 理由，绿联 restic fork 对 DELETE
+	// 404 同样敏感；服务端不再返回 ErrNotExist）
+	if err := r.DeletePath("nope"); err != nil {
+		t.Fatalf("删除不存在应幂等成功, got %v", err)
 	}
+}
+
+// TestMkcolDeleteIdempotent 幂等请求不产生新快照：重复 MKCOL 已存在目录、
+// DELETE 不存在路径，快照数保持不变（若每次幂等请求都建快照，单份模式
+// trim 会制造持续写放大，多快照模式会无限膨胀）。
+func TestMkcolDeleteIdempotent(t *testing.T) {
+	r, _ := newTestRepo(t)
+	if err := r.Mkcol("data"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.PutFile("data/a.txt", 0o644, time.Now().UnixNano(), strings.NewReader("x")); err != nil {
+		t.Fatal(err)
+	}
+	before := snapCount(t, r)
+
+	// 幂等 MKCOL（目录已存在）与幂等 DELETE（不存在）都不应建快照
+	if err := r.Mkcol("data"); err != nil {
+		t.Fatalf("重复 Mkcol 应幂等成功, got %v", err)
+	}
+	if err := r.DeletePath("nope"); err != nil {
+		t.Fatalf("删除不存在应幂等成功, got %v", err)
+	}
+	if got := snapCount(t, r); got != before {
+		t.Fatalf("幂等请求不应产生快照: before=%d after=%d", before, got)
+	}
+	// 清单未受幂等请求影响
+	sid := mustLatest(t, r)
+	if _, ok, _ := r.GetFileRow(sid, "data"); !ok {
+		t.Fatal("幂等请求后 data 应仍在")
+	}
+	if _, ok, _ := r.GetFileRow(sid, "data/a.txt"); !ok {
+		t.Fatal("幂等请求后 data/a.txt 应仍在")
+	}
+}
+
+func snapCount(t *testing.T, r *Repo) int {
+	t.Helper()
+	snaps, err := r.SnapshotList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(snaps)
 }
 
 // TestPutFileChunkDedup：相同内容两次 PUT 复用 chunk（后端 blob 数不变）。
