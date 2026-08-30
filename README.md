@@ -199,16 +199,15 @@ services:
       - "8080:8080"      # WebDAV（按需开放）
     volumes:
       - ./conf:/conf:ro        # 配置文件（crysync.yaml，0600）
-      - crysync-keys:/keys     # 密钥卷（与数据/元数据物理分离）
+      - crysync-keys:/keys     # 密钥卷（与元数据物理分离）
       - crysync-meta:/meta     # SQLite 元数据卷
-      - crysync-data:/data     # dir 后端数据卷（全部用 webdav 后端时可去掉）
+      - /srv/crysync/data:/data  # Dir 后端 blob 数据：bind mount（任意属主零配置）
 volumes:
   crysync-keys:
   crysync-meta:
-  crysync-data:
 ```
 
-- **三卷分离**：`/keys`（密钥）、`/meta`（元数据）、`/data`（blob）各自独立卷，互为备份可独立挂载/恢复。
+- **数据分离**：`/keys`（密钥）与 `/meta`（元数据）为独立命名卷，互为备份可独立挂载/恢复；`/data`（blob）用 bind mount 宿主目录（全部用 WebDAV 后端时去掉该行）。
 - **权限自举**：`entrypoint.sh` 以 root 进入后确定运行身份再 `su-exec` 降权——优先级 `PUID/PGID` 环境变量 > 挂载目录属主探测 > 默认 `1000:1000`；挂载目录属主不一致或身份无写权限时报错并给出修复命令。bind mount 任意属主目录零配置。
 - **密钥保护**：密钥只应存在于 `/keys` 卷。密钥文件缺失但元数据库已存在时**拒绝自动生成新密钥**（防止密钥卷丢失时静默换钥导致旧数据永久不可解密），报错交由人工决策。
 - **配置保护**：`conf/crysync.yaml` 含口令，建议权限 0600（`.gitignore` 已排除本地 `crysync.yaml`；`docker-compose.yml` 亦排除）。
