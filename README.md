@@ -139,26 +139,6 @@ curl -u backup:pass http://host:8080/home/file
 
 服务器根 `http://<host>:<port>/` 是虚拟目录：PROPFIND 根返回全部已就绪模块的集合列表（浏览器 GET 根返回 HTML 索引），挂载根的客户端可直接看到各模块文件夹再进入。浏览器直接打开 `http://<host>:<port>/<模块名>/` 即可查看目录列表、点击下载文件（目录 GET 渲染 HTML 文件列表，标准客户端走 PROPFIND 不受影响）。
 
-### Ubuntu 挂载
-
-```bash
-# 1. davfs2（命令行挂载）
-sudo apt install davfs2
-sudo mkdir -p /mnt/crysync
-sudo mount -t davfs http://host:8080/home/ /mnt/crysync   # 提示输入用户名/密码
-
-# 2. 密码持久化（免交互）
-sudo sh -c 'echo "http://host:8080/home/ backup <密码>" >> /etc/davfs2/secrets'
-sudo chmod 600 /etc/davfs2/secrets
-
-# 3. 开机自动挂载：/etc/fstab 追加（noauto 避免开机网络未就绪挂载失败）
-http://host:8080/home/  /mnt/crysync  davfs  user,noauto  0  0
-```
-
-- 图形界面：GNOME 文件管理器 `Ctrl+L` 直接输入地址（弹认证框填账号密码）
-- rclone：`type=webdav, url=http://host:8080/, vendor=other, user=backup`，挂载 `rclone mount <remote>:home /mnt/crysync`
-- 挂载服务器根 `http://host:8080/` 会先看到模块文件夹列表再进入
-
 ### 并发写与客户端兼容
 
 - **写请求串行化**：PUT/MKCOL/DELETE/COPY/MOVE 在仓库层互斥执行——并发写安全（后提交者胜），不会出现并发事务互相覆盖丢失已提交数据
