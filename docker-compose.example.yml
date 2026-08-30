@@ -1,21 +1,26 @@
-# CrySync docker compose 部署示例
+# CrySync docker compose 部署示例（rsync + WebDAV 双前端）
 # 使用方式：复制本文件为 docker-compose.yml（复制品含本地环境信息，已被 gitignore）
 #   cp docker-compose.example.yml docker-compose.yml
 # 前置：配置文件已就绪——复制并编辑 conf/crysync.yaml.example 为 conf/crysync.yaml
-#（密码、模块名、后端类型按需修改，权限 0600；WebDAV 后端无需 /data 卷）
+#（front 节含 rsync 与 webdav 两前端（至少启用一个）；密码、模块名、后端类型按需修改，
+#  权限 0600；WebDAV 后端无需 /data 卷）
+# 端口：873 = rsync 前端；8080 = WebDAV 前端（按需开放，或仅暴露在局域网/反代后）
 # 卷权限：entrypoint 自动探测挂载目录属主并降权运行，bind mount 任意属主目录零配置；
 #   可选 PUID/PGID 环境变量显式指定运行身份；显式写 user: 则跳过探测（需自行保证权限）
 
 services:
   crysync:
-    # GHCR 官方镜像；生产建议固定版本号（如 ghcr.io/cnstark/crysync:0.1.0）
+    # GHCR 官方镜像；生产建议固定版本号（如 ghcr.io/cnstark/crysync:0.3.2）
     image: ghcr.io/cnstark/crysync:latest
     ports:
-      - "873:873"            # 宿主端口被占用时改左侧（如 "8873:873"），rsync --port 同步改
+      - "873:873"            # rsync 前端；宿主端口被占用时改左侧（如 "8873:873"），rsync --port 同步改
+      - "8080:8080"          # WebDAV 前端；同左（如 "8875:8080"），客户端 URL 端口同步改
     # 目录属主为 root（dockerd 自动创建目录）时以 root 运行并打印警告，建议宿主机 chown
     restart: unless-stopped
+    # 健康检查：任一前端（rsync 873 / WebDAV 8080）在监听即健康；
+    # 只启用其中一个前端时，另一条 nc 探测失败不影响（|| 语义）
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "873"]
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 873 || nc -z 127.0.0.1 8080"]
       interval: 30s
       timeout: 5s
       retries: 3
