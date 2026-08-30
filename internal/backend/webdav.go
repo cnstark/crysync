@@ -42,7 +42,11 @@ func NewWebDAV(rawURL, user, pass string) (*WebDAV, error) {
 		user:    user,
 		pass:    pass,
 		client: &http.Client{
-			Timeout: 60 * time.Second,
+			// 300s：公网 WebDAV 后端（如夸克云盘）上行带宽可低至 ~0.1MiB/s，
+			// 大块 blob（chunk_size 配置 32MiB 时）传输需要数百秒；60s 会在
+			// 带宽波动期误杀慢速 PUT 触发整块重传放大。写失败仍有 3 次
+			// 指数退避重试兜底（Put）。
+			Timeout: 300 * time.Second,
 		},
 	}, nil
 }
