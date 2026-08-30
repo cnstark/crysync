@@ -5,7 +5,6 @@ package webdav
 import (
 	"context"
 	"os"
-	pathpkg "path"
 	"time"
 
 	"golang.org/x/net/webdav"
@@ -13,28 +12,16 @@ import (
 	"crysync/internal/core"
 )
 
-// openWrite 打开写句柄：read_only 拒绝；父目录缺失返回 os.ErrNotExist
-// （x/net/webdav PUT 对 os.IsNotExist 映射 409 Conflict）。
+// openWrite 打开写句柄：read_only 拒绝。父目录存在性不在前置检查--
+// PutFile 在写锁内的 checkParentDir 才是权威判定（锁外预检查曾读 ActiveSnapshotID
+// 到一个已被并发单份模式 trim 删除的快照，GET 旧快照清单必然落空 -> PUT 409
+// 重试风暴；405/409 映射仍由 PutFile 返回的 os.ErrNotExist 驱动）。
 func (m *moduleFS) openWrite(ctx context.Context, path string) (webdav.File, error) {
 	if m.readOnly || m.writer == nil {
 		return nil, os.ErrPermission
 	}
 	if path == "" {
 		return nil, os.ErrInvalid // 根不可写
-	}
-	parent := pathpkg.Dir(path)
-	if parent != "." {
-		sid, err := m.store.ActiveSnapshotID()
-		if err != nil {
-			return nil, err
-		}
-		row, ok, err := m.store.GetFileRow(sid, parent)
-		if err != nil {
-			return nil, err
-		}
-		if !ok || !row.IsDir {
-			return nil, os.ErrNotExist
-		}
 	}
 	tmp, err := os.CreateTemp("", "crysync-webdav-put-*")
 	if err != nil {

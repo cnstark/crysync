@@ -440,6 +440,23 @@ func (r *Repo) TrimAfterCommit(snapshotID int64, keepHistory bool) (int, int, er
 	return r.KeepOnlySnapshot(snapshotID)
 }
 
+// TrimWrite 持写锁执行裁剪：写即快照 + 单份模式收尾必须在写事务之外仍与
+// 写互斥--否则并发读路径（如 webdav openWrite 预检）可能拿到"即将被 trim
+// 删除的快照 ID"而后读空。TrimAfterCommit 本身不持锁（receiver 会话收尾
+// 调用，rsync 长事务语义独立），WebDAV 短事务路径经此入口串行化。
+func (r *Repo) TrimWrite(keepHistory bool) (int, int, error) {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	if keepHistory {
+		return 0, 0, nil
+	}
+	id, err := r.LatestSnapshotID()
+	if err != nil {
+		return 0, 0, err
+	}
+	return r.KeepOnlySnapshot(id)
+}
+
 // fileChunk 文件块索引（OpenFile 时一次查全）。
 type fileChunk struct {
 	blobName string

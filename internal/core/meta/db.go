@@ -79,11 +79,28 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("打开 SQLite: %w", err)
 	}
 	db.SetMaxOpenConns(1) // 单写者：SQLite WAL 下由应用串行化
-	if _, err := db.Exec(schema); err != nil {
+	// schema 建库包在单事务内：rsync 前端 EnsureModuleInit 与 webdav 前端
+	// OpenModule 启动时并发打开同一模块库（main 起 goroutine 各自执行），
+	// 多语句 Exec 曾在 NAS 慢盘上交错触发 SQLITE_BUSY（busy_timeout 计的是
+	// 单条语句等待，事务化后并发方整体排队，幂等且无窗口）
+	if err := ensureSchema(db); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("初始化 schema: %w", err)
 	}
 	return &DB{db: db}, nil
+}
+
+// ensureSchema 在单事务内执行全部 DDL（IF NOT EXISTS 幂等）。
+func ensureSchema(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // 提交后 Rollback 是 no-op
+	if _, err := tx.Exec(schema); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (d *DB) Close() error { return d.db.Close() }

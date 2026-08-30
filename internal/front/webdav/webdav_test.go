@@ -2,10 +2,12 @@ package webdav
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"golang.org/x/net/webdav"
@@ -66,6 +68,7 @@ func (nopReadSeekCloser) Close() error { return nil }
 
 // fakeWriter 记录写调用。
 type fakeWriter struct {
+	mu     sync.Mutex // 并发用例（TestPutNoStaleSnapshotRace）保护 map/切片写
 	puts   map[string]string
 	mkcols []string
 	dels   []string
@@ -77,12 +80,26 @@ func (w *fakeWriter) PutFile(path string, mode uint32, mtimeNs int64, src io.Rea
 	if err != nil {
 		return err
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.puts[path] = string(b)
 	return nil
 }
-func (w *fakeWriter) Mkcol(path string) error      { w.mkcols = append(w.mkcols, path); return nil }
-func (w *fakeWriter) DeletePath(path string) error { w.dels = append(w.dels, path); return nil }
+func (w *fakeWriter) Mkcol(path string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.mkcols = append(w.mkcols, path)
+	return nil
+}
+func (w *fakeWriter) DeletePath(path string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.dels = append(w.dels, path)
+	return nil
+}
 func (w *fakeWriter) MovePath(src, dst string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.moves = append(w.moves, [2]string{src, dst})
 	return nil
 }
@@ -189,8 +206,11 @@ func TestWriteOperations(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPut, "/noparent/x.txt", strings.NewReader("x"))
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("PUT 父目录缺失应 409, got %d", rec.Code)
+	// 409 判定下沉到 repo.PutFile 锁内 checkParentDir（适配层不再锁外预检，
+	// 曾因读到被单份模式 trim 删除的快照而 409 重试风暴）；fakeWriter 不做
+	// 父目录检查，真实行为由 repo 层测试与集成测试覆盖。
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("PUT（fake 层无父目录检查）应 201, got %d", rec.Code)
 	}
 	// DELETE
 	store.rows["sub/b.txt"] = meta.FileRow{Path: "sub/b.txt", Mode: 0o644}
@@ -234,14 +254,14 @@ func TestReadOnlyFS(t *testing.T) {
 
 // TestPropfindEmptyDir 空目录 PROPFIND 必须 207：x/net/webdav walkFS 用
 // Readdir(0) 且把任何 err 当错误；count<=0 时耗尽应返回 (nil, nil)
-//（对照库内 memFile 语义），返回 io.EOF 会让空目录 PROPFIND 变 500
-//（restic 等客户端反复探测空目录会卡死重试循环）。
+// （对照库内 memFile 语义），返回 io.EOF 会让空目录 PROPFIND 变 500
+// （restic 等客户端反复探测空目录会卡死重试循环）。
 func TestPropfindEmptyDir(t *testing.T) {
 	store := &fakeStore{
 		rows: map[string]meta.FileRow{
-			"locks":  {Path: "locks", IsDir: true, Mode: 0o40755},
-			"keys":   {Path: "keys", IsDir: true, Mode: 0o40755},
-			"a.txt":  {Path: "a.txt", Mode: 0o644, Size: 3},
+			"locks": {Path: "locks", IsDir: true, Mode: 0o40755},
+			"keys":  {Path: "keys", IsDir: true, Mode: 0o40755},
+			"a.txt": {Path: "a.txt", Mode: 0o644, Size: 3},
 		},
 		data: map[string]string{"a.txt": "abc"},
 	}
@@ -283,7 +303,7 @@ func TestDirBrowse(t *testing.T) {
 		rows: map[string]meta.FileRow{
 			"sub":       {Path: "sub", IsDir: true, Mode: 0o40755},
 			"sub/a.txt": {Path: "sub/a.txt", Mode: 0o644, Size: 5},
-			"中文.txt":   {Path: "中文.txt", Mode: 0o644, Size: 9},
+			"中文.txt":    {Path: "中文.txt", Mode: 0o644, Size: 9},
 			"root.txt":  {Path: "root.txt", Mode: 0o644, Size: 3},
 		},
 		data: map[string]string{"sub/a.txt": "hello", "root.txt": "abc", "中文.txt": "中文内容"},
@@ -343,4 +363,42 @@ func TestDirBrowse(t *testing.T) {
 	if !nextCalled {
 		t.Fatal("PROPFIND 应透传 next")
 	}
+}
+
+// TestPutNoStaleSnapshotRace 单份模式并发写不再 409 风暴：
+// 修复前 openWrite 锁外预检 ActiveSnapshotID，并发 MKCOL 提交后 trim 删除
+// 该快照 -> PUT 读到已删快照清单 -> 409 重试永不收敛（NAS 实测 30 分钟循环）。
+func TestPutNoStaleSnapshotRace(t *testing.T) {
+	store := &fakeStore{rows: map[string]meta.FileRow{}, data: map[string]string{}}
+	writer := &fakeWriter{puts: map[string]string{}}
+	h := &webdav.Handler{
+		FileSystem: newTestFS(store, writer, false),
+		LockSystem: noopLockSystem{},
+	}
+	// 根下已有 data 目录（模拟 MKCOL 已提交）
+	store.rows["data"] = meta.FileRow{Path: "data", IsDir: true, Mode: 0o40755}
+
+	// 并发 8 个 PUT 到 data/ 下（fake 层路径：Handler 会做 Stat，目录须在）
+	var wg sync.WaitGroup
+	ok := int64(0)
+	var mu sync.Mutex
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodPut, fmt.Sprintf("/data/f%d.txt", i), strings.NewReader(fmt.Sprintf("content-%d", i)))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			// fakeWriter 层的 PutFile 不做父目录检查（模拟修复后无锁外预检），
+			// 此处只断言请求不因适配层预检而 4xx（fake 层 PUT 走 write 路径）
+			if rec.Code != http.StatusCreated && rec.Code != http.StatusNoContent {
+				mu.Lock()
+				ok++
+				mu.Unlock()
+				t.Errorf("PUT f%d 失败: %d %s", i, rec.Code, rec.Body.String())
+			}
+		}(i)
+	}
+	wg.Wait()
+	_ = ok
 }

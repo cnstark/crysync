@@ -74,8 +74,10 @@ func OpenModule(module *config.ModuleConfig) (*Module, error) {
 }
 
 // fileWriter 写即快照 + 单份模式裁剪：WebDAV 写完成后按模块快照开关裁剪快照
-// （keepHistory=false 只保留最新一份，与 receiver 会话收尾 TrimAfterCommit 一致）。
+// （keepHistory=false 只保留最新一份，与 receiver 会话收尾语义一致）。
 // repo 写方法本身不感知 keepHistory（由前端/中端边界注入），此处封装承担该策略。
+// trim 经 repo.TrimWrite 与写事务共用写锁串行化：并发写与快照裁剪之间不再有
+// "读路径拿到即将被删的快照"窗口。
 type fileWriter struct {
 	r           *repo.Repo
 	keepHistory bool
@@ -85,37 +87,29 @@ func (w *fileWriter) PutFile(path string, mode uint32, mtimeNs int64, src io.Rea
 	if err := w.r.PutFile(path, mode, mtimeNs, src); err != nil {
 		return err
 	}
-	return w.trim()
+	_, _, err := w.r.TrimWrite(w.keepHistory)
+	return err
 }
 func (w *fileWriter) Mkcol(path string) error {
 	if err := w.r.Mkcol(path); err != nil {
 		return err
 	}
-	return w.trim()
+	_, _, err := w.r.TrimWrite(w.keepHistory)
+	return err
 }
 func (w *fileWriter) DeletePath(path string) error {
 	if err := w.r.DeletePath(path); err != nil {
 		return err
 	}
-	return w.trim()
+	_, _, err := w.r.TrimWrite(w.keepHistory)
+	return err
 }
 func (w *fileWriter) MovePath(src, dst string) error {
 	if err := w.r.MovePath(src, dst); err != nil {
 		return err
 	}
-	return w.trim()
-}
-
-// trim 写提交后裁剪：latest 即刚提交的快照，删除其之前全部快照（keepHistory 时 no-op）。
-func (w *fileWriter) trim() error {
-	id, err := w.r.LatestSnapshotID()
-	if err != nil {
-		return err
-	}
-	if _, _, err := w.r.TrimAfterCommit(id, w.keepHistory); err != nil {
-		return err
-	}
-	return nil
+	_, _, err := w.r.TrimWrite(w.keepHistory)
+	return err
 }
 
 // keyfileMutexes 同进程内按密钥路径串行化自动初始化（多个连接同时首开同一模块）。
