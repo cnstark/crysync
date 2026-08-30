@@ -163,6 +163,13 @@ func TestWebDAVRsyncCrossFront(t *testing.T) {
 	if code != 207 || !bytes.Contains(body, []byte("sub")) {
 		t.Fatalf("PROPFIND 不符: %d %s", code, body)
 	}
+	// 服务器根（虚拟根）：PROPFIND / 返回模块集合列表（挂载根的客户端入口）
+	code, body = webdavDo(t, "PROPFIND", davBase+"/",
+		[]byte(`<?xml version="1.0"?><propfind xmlns="DAV:"><prop><displayname/></prop></propfind>`),
+		map[string]string{"Depth": "1"})
+	if code != 207 || !bytes.Contains(body, []byte(`<D:href>/home/</D:href>`)) {
+		t.Fatalf("PROPFIND 服务器根应 207 且含 /home/ 集合: %d %s", code, body)
+	}
 
 	// 3) WebDAV PUT 上传（跨前端一致性：webdav 写 → rsync 读）
 	code, body = webdavDo(t, http.MethodPut, davBase+"/home/upload.txt", []byte("uploaded via webdav"), nil)

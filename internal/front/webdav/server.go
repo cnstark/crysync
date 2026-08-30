@@ -103,5 +103,16 @@ func (s *Server) buildMux(modules map[string]*core.Module) http.Handler {
 		h.Prefix = prefix
 		mux.Handle(prefix+"/", auth(readOnlyGuard(m.ReadOnly, h)))
 	}
+	// 虚拟根（catch-all）：挂载服务器根的客户端 PROPFIND / 可见模块列表
+	//（按配置声明顺序，仅含已就绪模块）；未认证时先得 401 质询。
+	// 此前根上无处理器：PROPFIND / 得裸 404，WebDAV 客户端报
+	// "根文件夹不存在或无权限"。
+	rootNames := make([]string, 0, len(modules))
+	for i := range s.cfg.Modules {
+		if _, ok := modules[s.cfg.Modules[i].Name]; ok {
+			rootNames = append(rootNames, s.cfg.Modules[i].Name)
+		}
+	}
+	mux.Handle("/", auth(&rootHandler{moduleNames: rootNames}))
 	return mux
 }
