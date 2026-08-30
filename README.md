@@ -13,7 +13,7 @@
 - ✅ 快照：`snapshot: true` 开启多版本历史 + 活跃快照切换（恢复到任意时间点）；缺省单份模式只保留最新一份
 - ✅ prune：restic 保留规则（keep_last/daily/weekly/monthly）+ 孤儿 blob 回收，每日调度
 - ✅ 认证：rsyncd 风格 challenge-response（MD5）
-- ✅ WebDAV 前端：同一批模块以 HTTP 文件服务暴露（Basic 认证、写即快照、read_only 403），curl/文件管理器/挂载工具可直接访问
+- ✅ WebDAV 前端：同一批模块以 HTTP 文件服务暴露（Basic 认证、写即快照、read_only 403、并发写串行化、浏览器 HTML 目录浏览），curl/文件管理器/挂载工具/restic 等客户端可直接访问
 - 🚧 未实现（v2）：xattr/硬链接/稀疏文件
 
 ## 快速开始（本地）
@@ -135,7 +135,35 @@ curl -u backup:pass http://host:8080/home/file
 
 也支持 MKCOL（建目录）、DELETE（删除）、COPY/MOVE（复制/移动）等方法；主流文件管理器/WebDAV 挂载工具与 curl 用法相同。
 
-服务器根 `http://<host>:<port>/` 是虚拟目录：PROPFIND 根返回全部已就绪模块的集合列表（浏览器 GET 根返回 HTML 索引），挂载根的客户端可直接看到各模块文件夹再进入。浏览器直接打开 `http://<host>:<port>/<模块名>/` 可查看目录列表、点击下载文件（目录 GET 渲染 HTML，标准客户端走 PROPFIND 不受影响）。
+### 浏览器查看
+
+服务器根 `http://<host>:<port>/` 是虚拟目录：PROPFIND 根返回全部已就绪模块的集合列表（浏览器 GET 根返回 HTML 索引），挂载根的客户端可直接看到各模块文件夹再进入。浏览器直接打开 `http://<host>:<port>/<模块名>/` 即可查看目录列表、点击下载文件（目录 GET 渲染 HTML 文件列表，标准客户端走 PROPFIND 不受影响）。
+
+### Ubuntu 挂载
+
+```bash
+# 1. davfs2（命令行挂载）
+sudo apt install davfs2
+sudo mkdir -p /mnt/crysync
+sudo mount -t davfs http://host:8080/home/ /mnt/crysync   # 提示输入用户名/密码
+
+# 2. 密码持久化（免交互）
+sudo sh -c 'echo "http://host:8080/home/ backup <密码>" >> /etc/davfs2/secrets'
+sudo chmod 600 /etc/davfs2/secrets
+
+# 3. 开机自动挂载：/etc/fstab 追加（noauto 避免开机网络未就绪挂载失败）
+http://host:8080/home/  /mnt/crysync  davfs  user,noauto  0  0
+```
+
+- 图形界面：GNOME 文件管理器 `Ctrl+L` 直接输入地址（弹认证框填账号密码）
+- rclone：`type=webdav, url=http://host:8080/, vendor=other, user=backup`，挂载 `rclone mount <remote>:home /mnt/crysync`
+- 挂载服务器根 `http://host:8080/` 会先看到模块文件夹列表再进入
+
+### 并发写与客户端兼容
+
+- **写请求串行化**：PUT/MKCOL/DELETE/COPY/MOVE 在仓库层互斥执行——并发写安全（后提交者胜），不会出现并发事务互相覆盖丢失已提交数据
+- **父目录未就绪返回 409**：并发创建目录时，先到的文件写可能遇到父目录尚未提交（`409 Conflict`）——客户端重试即可；restic 等备份软件将 WebDAV 用作后端存储实测兼容（仓库布局 init/上传/快照全流程通过）
+- ⚠️ **避免 rsync 会话与 WebDAV 写并发**：同一模块的 rsync 备份会话（长事务）不参与 WebDAV 写串行化，两者并发可能互相覆盖；同模块请错开使用
 
 > ⚠️ **PUT 请求体中断语义**：PUT 上传中途断流（客户端中断/网络抖动）时，已接收的部分内容仍会被提交为一条新快照——x/net/webdav 库在 `io.Copy` 出错后仍会调用 `Close`，适配层无法感知 copy 失败。单份模式下该提交不会留下旧版本的完整副本。**重要数据建议使用 rsync 会话上传**（传输中断自动回滚，不产生快照）；WebDAV 适合即席小文件操作。
 
