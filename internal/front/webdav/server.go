@@ -101,7 +101,9 @@ func (s *Server) buildMux(modules map[string]*core.Module) http.Handler {
 		// MOVE/COPY 的 Destination 头，会导致目标路径带模块前缀而写失败）。
 		prefix := "/" + m.Name
 		h.Prefix = prefix
-		mux.Handle(prefix+"/", auth(readOnlyGuard(m.ReadOnly, h)))
+		// dirBrowse：浏览器 GET 目录渲染 HTML 文件列表（标准客户端走
+		// PROPFIND 不受影响；x/net/webdav 对目录 GET 固定 405）
+		mux.Handle(prefix+"/", auth(readOnlyGuard(m.ReadOnly, dirBrowse(h, mod.FileStore, prefix))))
 	}
 	// 虚拟根（catch-all）：挂载服务器根的客户端 PROPFIND / 可见模块列表
 	//（按配置声明顺序，仅含已就绪模块）；未认证时先得 401 质询。

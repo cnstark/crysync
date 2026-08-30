@@ -275,3 +275,72 @@ func TestPropfindEmptyDir(t *testing.T) {
 		}
 	}
 }
+
+// TestDirBrowse 目录 HTML 浏览中间件：GET/HEAD 目录渲染 HTML 文件列表，
+// 文件/不存在/POST 透传给 webdav.Handler（对标 rclone/wsgidav dir_browser）。
+func TestDirBrowse(t *testing.T) {
+	store := &fakeStore{
+		rows: map[string]meta.FileRow{
+			"sub":       {Path: "sub", IsDir: true, Mode: 0o40755},
+			"sub/a.txt": {Path: "sub/a.txt", Mode: 0o644, Size: 5},
+			"中文.txt":   {Path: "中文.txt", Mode: 0o644, Size: 9},
+			"root.txt":  {Path: "root.txt", Mode: 0o644, Size: 3},
+		},
+		data: map[string]string{"sub/a.txt": "hello", "root.txt": "abc", "中文.txt": "中文内容"},
+	}
+	var nextCalled bool
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		http.Error(w, "next-handler", http.StatusNotFound)
+	})
+	h := dirBrowse(next, store, "/test")
+
+	// GET 模块根 -> HTML 列表（目录项带斜杠、文件项、中文文件名）
+	req := httptest.NewRequest(http.MethodGet, "/test/", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || nextCalled {
+		t.Fatalf("目录 GET 应渲染 HTML, got %d next=%v", rec.Code, nextCalled)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{"sub/", "root.txt", "中文.txt"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("根列表缺 %q: %s", want, body)
+		}
+	}
+	// 子目录 GET -> 含子项与父目录链接
+	req = httptest.NewRequest(http.MethodGet, "/test/sub/", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "a.txt") {
+		t.Fatalf("子目录列表不符: %d %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "/test/") {
+		t.Fatalf("子目录应有父目录/根链接: %s", rec.Body.String())
+	}
+
+	// 文件 GET -> 透传（下载交给 webdav.Handler）
+	nextCalled = false
+	req = httptest.NewRequest(http.MethodGet, "/test/root.txt", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if !nextCalled {
+		t.Fatal("文件 GET 应透传 next")
+	}
+	// 不存在路径 -> 透传（webdav.Handler 返回 404）
+	nextCalled = false
+	req = httptest.NewRequest(http.MethodGet, "/test/nope", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if !nextCalled {
+		t.Fatal("不存在路径应透传 next")
+	}
+	// 非 GET/HEAD（PROPFIND/PUT 等）-> 透传
+	nextCalled = false
+	req = httptest.NewRequest("PROPFIND", "/test/", nil)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if !nextCalled {
+		t.Fatal("PROPFIND 应透传 next")
+	}
+}

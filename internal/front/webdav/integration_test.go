@@ -163,6 +163,11 @@ func TestWebDAVRsyncCrossFront(t *testing.T) {
 	if code != 207 || !bytes.Contains(body, []byte("sub")) {
 		t.Fatalf("PROPFIND 不符: %d %s", code, body)
 	}
+	// 目录 GET -> 200 HTML 浏览（浏览器直接查看备份内容）
+	code, body = webdavDo(t, http.MethodGet, davBase+"/home/", nil, nil)
+	if code != http.StatusOK || !bytes.Contains(body, []byte("hello.txt")) {
+		t.Fatalf("GET 模块根应 200 HTML 含文件链接, got %d %s", code, body)
+	}
 	// 服务器根（虚拟根）：PROPFIND / 返回模块集合列表（挂载根的客户端入口）
 	code, body = webdavDo(t, "PROPFIND", davBase+"/",
 		[]byte(`<?xml version="1.0"?><propfind xmlns="DAV:"><prop><displayname/></prop></propfind>`),
