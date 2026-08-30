@@ -3,12 +3,14 @@ package repo
 
 import (
 	"bytes"
+	"fmt"
 	"crypto/md5"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -957,5 +959,79 @@ func TestMovePathOverwriteDir(t *testing.T) {
 	}
 	if _, ok, _ := r.GetFileRow(sid, "sub/a.txt"); ok {
 		t.Fatal("src 源文件 sub/a.txt 应已消失")
+	}
+}
+
+func TestConcurrentPutFileNoLostWrite(t *testing.T) {
+	r, _ := newTestRepo(t)
+	// 并发 8 个不同路径的 PUT：写即快照事务串行化后，最终快照应 8 个全在。
+	//（无互斥时并发 BeginSnapshot 基于同一旧快照，后提交者覆盖前者--丢写。）
+	const n = 8
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if err := r.PutFile(fmt.Sprintf("f%d.txt", i), 0o644, time.Now().UnixNano(),
+				strings.NewReader(fmt.Sprintf("content-%d", i))); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("并发 PUT 失败: %v", err)
+	}
+	sid := mustLatest(t, r)
+	for i := 0; i < n; i++ {
+		row, ok, err := r.GetFileRow(sid, fmt.Sprintf("f%d.txt", i))
+		if err != nil || !ok {
+			t.Fatalf("并发写丢失: f%d.txt 不在最终快照 (ok=%v err=%v)", i, ok, err)
+		}
+		if row.Size != int64(len(fmt.Sprintf("content-%d", i))) {
+			t.Fatalf("f%d.txt size 不符: %d", i, row.Size)
+		}
+	}
+}
+
+func TestConcurrentMkcolPut(t *testing.T) {
+	r, _ := newTestRepo(t)
+	// MKCOL 与子文件 PUT 并发（restic init 的典型形态）：串行化后 PUT 若
+	// 先于 MKCOL 拿锁，允许返回可重试的 os.ErrNotExist；不允许其他错误；
+	// 客户端重试一次必须成功（父目录已在）。
+	var wg sync.WaitGroup
+	errCh := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := r.Mkcol("data"); err != nil && !errors.Is(err, os.ErrExist) {
+			errCh <- err
+		}
+	}()
+	var putErr error
+	go func() {
+		defer wg.Done()
+		putErr = r.PutFile("data/blob", 0o644, time.Now().UnixNano(), strings.NewReader("blob"))
+	}()
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("并发 MKCOL 失败: %v", err)
+	}
+	if putErr != nil && !errors.Is(putErr, os.ErrNotExist) {
+		t.Fatalf("PUT 失败须为可重试的 ErrNotExist, got %v", putErr)
+	}
+	// 模拟客户端重试：父目录已提交，重放必须成功
+	if err := r.PutFile("data/blob", 0o644, time.Now().UnixNano(), strings.NewReader("blob")); err != nil {
+		t.Fatalf("重试 PUT 失败: %v", err)
+	}
+	sid := mustLatest(t, r)
+	if _, ok, _ := r.GetFileRow(sid, "data"); !ok {
+		t.Fatal("并发后 data 目录丢失")
+	}
+	if _, ok, _ := r.GetFileRow(sid, "data/blob"); !ok {
+		t.Fatal("重试后 data/blob 仍不在快照")
 	}
 }

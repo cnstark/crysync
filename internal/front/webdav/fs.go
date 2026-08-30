@@ -141,6 +141,10 @@ type dirFile struct {
 	off  int // 枚举游标
 }
 
+// Readdir 枚举目录子项。count<=0 时返回全部剩余且耗尽不是错误
+//（(nil, nil)）——对齐 x/net/webdav 内 memFile 与 os.File 语义：walkFS
+// 用 Readdir(0) 且把任何非 nil err 当目录遍历失败，空目录返回 io.EOF
+// 会令 PROPFIND 得 500。count>0 时耗尽返回 io.EOF（分页读取惯例）。
 func (d *dirFile) Readdir(count int) ([]os.FileInfo, error) {
 	rows, err := d.fs.store.ListDir(d.sid, d.path)
 	if err != nil {
@@ -151,7 +155,10 @@ func (d *dirFile) Readdir(count int) ([]os.FileInfo, error) {
 		infos = append(infos, &fileInfo{row: row})
 	}
 	if d.off >= len(infos) {
-		return nil, io.EOF
+		if count > 0 {
+			return nil, io.EOF
+		}
+		return nil, nil
 	}
 	end := len(infos)
 	if count > 0 && d.off+count < end {

@@ -231,3 +231,47 @@ func TestReadOnlyFS(t *testing.T) {
 		t.Fatalf("只读适配层不应允许写, got %d", rec.Code)
 	}
 }
+
+// TestPropfindEmptyDir 空目录 PROPFIND 必须 207：x/net/webdav walkFS 用
+// Readdir(0) 且把任何 err 当错误；count<=0 时耗尽应返回 (nil, nil)
+//（对照库内 memFile 语义），返回 io.EOF 会让空目录 PROPFIND 变 500
+//（restic 等客户端反复探测空目录会卡死重试循环）。
+func TestPropfindEmptyDir(t *testing.T) {
+	store := &fakeStore{
+		rows: map[string]meta.FileRow{
+			"locks":  {Path: "locks", IsDir: true, Mode: 0o40755},
+			"keys":   {Path: "keys", IsDir: true, Mode: 0o40755},
+			"a.txt":  {Path: "a.txt", Mode: 0o644, Size: 3},
+		},
+		data: map[string]string{"a.txt": "abc"},
+	}
+	h := &webdav.Handler{
+		FileSystem: newTestFS(store, &fakeWriter{puts: map[string]string{}}, false),
+		LockSystem: noopLockSystem{},
+	}
+	body := strings.NewReader(`<?xml version="1.0"?><propfind xmlns="DAV:"><prop><displayname/></prop></propfind>`)
+	// 空目录 locks（root 下两个空目录 + 一个文件，walkFS 会枚举空目录）
+	req := httptest.NewRequest("PROPFIND", "/locks", body)
+	req.Header.Set("Depth", "1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("空目录 PROPFIND 应 207, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "<D:href>/locks/</D:href>") {
+		t.Fatalf("空目录响应应含自身集合 href: %s", rec.Body.String())
+	}
+	// 根 Depth 1：两个空目录 + 文件都在
+	req = httptest.NewRequest("PROPFIND", "/", body)
+	req.Header.Set("Depth", "1")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("根 PROPFIND 应 207, got %d: %s", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{"locks", "keys", "a.txt"} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("根枚举缺 %q: %s", want, rec.Body.String())
+		}
+	}
+}

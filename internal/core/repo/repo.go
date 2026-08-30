@@ -11,6 +11,7 @@ import (
 	"os"
 	pathpkg "path"
 	"strings"
+	"sync"
 	"time"
 
 	"crysync/internal/backend"
@@ -25,6 +26,14 @@ type Repo struct {
 	backend   backend.Backend
 	key       *crypto.Key
 	chunkSize int
+
+	// writeMu 写即快照短事务互斥：PutFile/Mkcol/DeletePath/MovePath 全程
+	// 持锁（含父目录检查）。并发写事务若不串行，各自 BeginSnapshot 基于
+	// 同一旧快照复制，后提交者覆盖前者--丢已提交数据；且父目录检查可能
+	// 读到并发 MKCOL 未提交前的旧快照而误报不存在。短事务毫秒级，锁竞争
+	// 可接受。rsync 会话长事务（SessionTxn）不持此锁--同模块避免 rsync
+	// 备份与 WebDAV 写并发（README 已注明）。
+	writeMu sync.Mutex
 }
 
 func New(metaDB *meta.DB, be backend.Backend, key *crypto.Key, chunkSize int) *Repo {
@@ -643,6 +652,8 @@ func checkParentDir(r *Repo, path string) error {
 // PutFile 以"写即快照"语义写入（或覆盖）path：请求体流式分块去重存储，
 // 提交一个新快照。mode 为文件权限位，mtimeNs 为修改时间（纳秒）。
 func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	if err := checkParentDir(r, path); err != nil {
 		return err
 	}
@@ -700,6 +711,8 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 
 // Mkcol 以"写即快照"语义创建目录条目；已存在返回 os.ErrExist。
 func (r *Repo) Mkcol(path string) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	if err := checkParentDir(r, path); err != nil {
 		return err
 	}
@@ -731,6 +744,8 @@ func (r *Repo) Mkcol(path string) error {
 // DeletePath 以"写即快照"语义删除 path（文件或目录，目录递归删整棵子树）；
 // 不存在返回 os.ErrNotExist。
 func (r *Repo) DeletePath(path string) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	txn, err := r.BeginSnapshot(time.Now())
 	if err != nil {
 		return err
@@ -765,6 +780,8 @@ func (r *Repo) DeletePath(path string) error {
 // 前缀整体替换。目标已存在时覆盖（WebDAV Overwrite 语义）：先删除 dst 原
 // 子树（与 src 重叠部分除外）再搬入 src，保证 dst 不残留旧内容。
 func (r *Repo) MovePath(src, dst string) error {
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
 	if err := checkParentDir(r, dst); err != nil {
 		return err
 	}
