@@ -68,12 +68,17 @@ func renderDirList(w http.ResponseWriter, r *http.Request, store core.FileStore,
 	})
 
 	var b strings.Builder
+	// 显示路径：模块根为 "/"，子目录如 "/deep/"
+	display := "/"
+	if path != "" {
+		display = "/" + path + "/"
+	}
 	b.WriteString("<!DOCTYPE html><html><head><meta charset=\"utf-8\">")
-	b.WriteString("<title>crysync: /" + html.EscapeString(path) + "/</title>")
+	b.WriteString("<title>crysync: " + html.EscapeString(display) + "</title>")
 	b.WriteString("<style>body{font-family:monospace;margin:2em}ul{list-style:none;padding:0}")
 	b.WriteString("li{padding:2px 0}a{text-decoration:none}.muted{color:#888;margin-left:1em}</style></head><body>")
 	// 标题 = 面包屑（模块根 -> 逐层路径）
-	b.WriteString("<h1>" + html.EscapeString("/"+path) + "/</h1><ul>")
+	b.WriteString("<h1>" + html.EscapeString(display) + "</h1><ul>")
 	if path != "" {
 		// 父目录链接：去掉最后一段（r.URL.Path 必以 / 结尾——ServeMux 301 保证）
 		parent := r.URL.Path[:strings.LastIndex(strings.TrimSuffix(r.URL.Path, "/"), "/")+1]
