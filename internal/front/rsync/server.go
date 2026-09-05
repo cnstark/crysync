@@ -18,7 +18,6 @@ import (
 	"crysync/internal/config"
 	"crysync/internal/core"
 	"crysync/internal/core/meta"
-	"crysync/internal/core/prune"
 	"crysync/internal/core/types"
 	"crysync/internal/front/rsync/protocol"
 )
@@ -100,18 +99,6 @@ func (s *Server) Serve(ctx context.Context) error {
 	// 模块并发连接计数（对齐 rsyncd max connections：0 = 无限制、负值 = 禁用模块、
 	// 正数 = 上限；claim_connection 语义，连接结束释放）
 	limiter := &moduleConnLimiter{}
-	// prune 调度：每模块独立 goroutine，按 schedule 每日执行
-	for i := range s.cfg.Modules {
-		m := &s.cfg.Modules[i]
-		if modulePrunePolicy(m) == (prune.Policy{}) {
-			continue
-		}
-		wg.Add(1)
-		go func(module *config.ModuleConfig) {
-			defer wg.Done()
-			runPruneLoop(ctx, module, s.logger)
-		}(m)
-	}
 	go func() {
 		<-ctx.Done()
 		ln.Close()
@@ -136,69 +123,6 @@ func (s *Server) Serve(ctx context.Context) error {
 		}(conn)
 	}
 	return nil
-}
-
-// modulePrunePolicy 返回模块的保留策略（无配置时为全 0）。
-func modulePrunePolicy(m *config.ModuleConfig) prune.Policy {
-	if m.Prune == nil {
-		return prune.Policy{}
-	}
-	return m.Prune.Policy()
-}
-
-// runPruneLoop 每模块每日调度：睡到下一个 schedule 时刻 -> 打开仓库执行 Prune。
-func runPruneLoop(ctx context.Context, module *config.ModuleConfig, logger *slog.Logger) {
-	schedule := "03:00"
-	if module.Prune != nil && module.Prune.Schedule != "" {
-		schedule = module.Prune.Schedule
-	}
-	for {
-		if !sleepUntil(ctx, schedule) {
-			return
-		}
-		if err := pruneOnce(module, logger); err != nil {
-			logger.Error("prune_error", "module", module.Name, "err", err.Error())
-		}
-	}
-}
-
-// pruneOnce 打开模块仓库执行一次保留策略清理（删除被裁快照 + 孤儿 blob 回收）。
-func pruneOnce(module *config.ModuleConfig, logger *slog.Logger) error {
-	mod, err := core.OpenModule(module)
-	if err != nil {
-		return fmt.Errorf("打开仓库失败: %w", err)
-	}
-	defer mod.Close()
-	removed, blobs, err := mod.Repo.Prune(modulePrunePolicy(module))
-	if err != nil {
-		return err
-	}
-	if removed > 0 || blobs > 0 {
-		logger.Info("prune_done", "module", module.Name,
-			"removed_snapshots", removed, "reclaimed_blobs", blobs)
-	}
-	return nil
-}
-
-// sleepUntil 睡到下一个 HH:MM 时刻；ctx 取消返回 false。
-func sleepUntil(ctx context.Context, hhmm string) bool {
-	h, m := 3, 0
-	if _, err := fmt.Sscanf(hhmm, "%d:%d", &h, &m); err != nil {
-		h, m = 3, 0
-	}
-	now := time.Now()
-	next := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, now.Location())
-	if !next.After(now) {
-		next = next.Add(24 * time.Hour)
-	}
-	timer := time.NewTimer(time.Until(next))
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }
 
 // moduleConnLimiter：模块并发连接计数。allow 在模块选定后、认证前占坑（须与
