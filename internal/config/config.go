@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 
-	"crysync/internal/core/prune"
 
 	"gopkg.in/yaml.v3"
 )
@@ -72,24 +71,6 @@ type BackendConfig struct {
 	Password string `yaml:"password"`
 }
 
-type PruneConfig struct {
-	KeepLast    int    `yaml:"keep_last"`
-	KeepDaily   int    `yaml:"keep_daily"`
-	KeepWeekly  int    `yaml:"keep_weekly"`
-	KeepMonthly int    `yaml:"keep_monthly"`
-	Schedule    string `yaml:"schedule"` // 每日执行时刻 "HH:MM"，缺省 "03:00"
-}
-
-// Policy 返回保留策略（restic 语义，internal/prune）。
-func (p *PruneConfig) Policy() prune.Policy {
-	return prune.Policy{
-		KeepLast:    p.KeepLast,
-		KeepDaily:   p.KeepDaily,
-		KeepWeekly:  p.KeepWeekly,
-		KeepMonthly: p.KeepMonthly,
-	}
-}
-
 type ModuleConfig struct {
 	Name     string `yaml:"name"`
 	Path     string `yaml:"path"`
@@ -104,7 +85,6 @@ type ModuleConfig struct {
 	Keyfile        string        `yaml:"keyfile"`
 	Meta           string        `yaml:"meta"`
 	ChunkSize      int           `yaml:"chunk_size"`
-	Prune          *PruneConfig  `yaml:"prune"`
 }
 
 func (m *ModuleConfig) ChunkSizeBytes() int {
