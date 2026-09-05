@@ -15,7 +15,6 @@ log:
 modules:
   - name: home
     path: "/"
-    snapshot: true                    # false（缺省）= 单份模式只保留最新一份；true = 多版本历史
     backend: { type: dir, path: /data/home }
     keyfile: /keys/home.key
     meta: /meta/home.db
