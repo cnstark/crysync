@@ -24,22 +24,27 @@ import (
 
 // rsyncService 组合 Session + FileStore，供协议会话按 RsyncService 使用。
 // Session/FileStore 在 rsync 前端由同一 *repo.Repo 承担，两接口共享的读方法
-// （ActiveSnapshotID/GetFileRow/StreamFile/ChunkSizeBytes）在此显式转发到
-// Session 以消歧（嵌入两接口同名方法会产生歧义选择器）。
+// （GetFileRow/StreamFile/ChunkSizeBytes/FileRows）在此显式转发到 Session
+// 以消歧（嵌入两接口同名方法会产生歧义选择器）。
 type rsyncService struct {
 	types.Session
 	types.FileStore
 }
 
-func (s *rsyncService) ActiveSnapshotID() (int64, error) { return s.Session.ActiveSnapshotID() }
-func (s *rsyncService) GetFileRow(snapshotID int64, path string) (meta.FileRow, bool, error) {
-	return s.Session.GetFileRow(snapshotID, path)
+func (s *rsyncService) GetFileRow(path string) (meta.FileRow, bool, error) {
+	return s.Session.GetFileRow(path)
 }
-func (s *rsyncService) StreamFile(snapshotID int64, path string, seed int32, w io.Writer) (int64, [16]byte, error) {
-	return s.Session.StreamFile(snapshotID, path, seed, w)
+func (s *rsyncService) StreamFile(path string, seed int32, w io.Writer) (int64, [16]byte, error) {
+	return s.Session.StreamFile(path, seed, w)
 }
 func (s *rsyncService) ChunkSizeBytes() int {
 	return s.Session.ChunkSizeBytes()
+}
+func (s *rsyncService) FileRows(prefix string) ([]meta.FileRow, error) {
+	return s.Session.FileRows(prefix)
+}
+func (s *rsyncService) WriteSessionLock() func() {
+	return s.Session.WriteSessionLock()
 }
 
 // nopLogger：未注入 logger 时的兜底（丢弃全部日志）。
@@ -157,7 +162,7 @@ func (l *moduleConnLimiter) release(name string) {
 
 // handleConn：handshake 与协议共享同一个 bufio.Reader（buffer 可能预读协议字节，
 // 必须传给后续协议解析，否则预读字节丢失）。握手成功后派生会话级 logger
-//（module/client/session 字段贯穿该会话全部日志事件）。
+// （module/client/session 字段贯穿该会话全部日志事件）。
 func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config, logger *slog.Logger, limiter *moduleConnLimiter) error {
 	// 握手阶段（greeting→模块选择→认证→argv 协商）读超时上限：防半开/挂死
 	// 客户端占住连接 24h（rsync 3.5.0 DAEMON_HANDSHAKE_TIMEOUT=60 同旨）；

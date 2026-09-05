@@ -17,17 +17,15 @@ import (
 
 // fakeStore 最小 FileStore 实现（只实现测试用方法）。
 type fakeStore struct {
-	rows map[string]meta.FileRow // path -> row（模拟活跃快照清单）
+	rows map[string]meta.FileRow // path -> row（模拟当前清单）
 	data map[string]string       // path -> 内容
-	sid  int64
 }
 
-func (f *fakeStore) ActiveSnapshotID() (int64, error) { return f.sid, nil }
-func (f *fakeStore) GetFileRow(_ int64, path string) (meta.FileRow, bool, error) {
+func (f *fakeStore) GetFileRow(path string) (meta.FileRow, bool, error) {
 	row, ok := f.rows[path]
 	return row, ok, nil
 }
-func (f *fakeStore) ListDir(_ int64, path string) ([]meta.FileRow, error) {
+func (f *fakeStore) ListDir(path string) ([]meta.FileRow, error) {
 	var out []meta.FileRow
 	prefix := path
 	if prefix != "" {
@@ -45,7 +43,7 @@ func (f *fakeStore) ListDir(_ int64, path string) ([]meta.FileRow, error) {
 	}
 	return out, nil
 }
-func (f *fakeStore) OpenFile(_ int64, path string) (io.ReadSeekCloser, meta.FileRow, error) {
+func (f *fakeStore) OpenFile(path string) (io.ReadSeekCloser, meta.FileRow, error) {
 	row, ok := f.rows[path]
 	if !ok {
 		return nil, meta.FileRow{}, errors.New("not found")
@@ -54,10 +52,10 @@ func (f *fakeStore) OpenFile(_ int64, path string) (io.ReadSeekCloser, meta.File
 }
 
 // 以下方法满足 core.FileStore 接口（测试未用到，提供空实现）。
-func (f *fakeStore) SnapshotFileRows(int64, string) ([]meta.FileRow, error) {
+func (f *fakeStore) FileRows(string) ([]meta.FileRow, error) {
 	return nil, nil
 }
-func (f *fakeStore) StreamFile(int64, string, int32, io.Writer) (int64, [16]byte, error) {
+func (f *fakeStore) StreamFile(string, int32, io.Writer) (int64, [16]byte, error) {
 	return 0, [16]byte{}, nil
 }
 func (f *fakeStore) ChunkSizeBytes() int { return 0 }
@@ -407,9 +405,9 @@ func TestDirBrowse(t *testing.T) {
 	}
 }
 
-// TestPutNoStaleSnapshotRace 单份模式并发写不再 409 风暴：
-// 修复前 openWrite 锁外预检 ActiveSnapshotID，并发 MKCOL 提交后 trim 删除
-// 该快照 -> PUT 读到已删快照清单 -> 409 重试永不收敛（NAS 实测 30 分钟循环）。
+// TestPutNoStaleSnapshotRace 并发写路径不再因状态预检而 409 风暴：
+// v0.5 单一状态模型下无快照裁剪竞态，写入只需父目录存在（适配层不做
+// 锁外清单预检，父目录校验在 repo 写锁内）——并发 PUT 全部收敛成功。
 func TestPutNoStaleSnapshotRace(t *testing.T) {
 	store := &fakeStore{rows: map[string]meta.FileRow{}, data: map[string]string{}}
 	writer := &fakeWriter{puts: map[string]string{}}

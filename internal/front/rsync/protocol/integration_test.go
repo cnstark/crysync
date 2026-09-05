@@ -25,15 +25,8 @@ import (
 )
 
 // 起一个完整 daemon（握手+协商+receiver）监听随机端口，返回端口号。
-// 模块显式开快照历史（多版本断言依赖；单份模式见 startSingleCopyServer）。
+// v0.5 单一当前状态模型：每次成功会话原地更新当前清单（无快照历史）。
 func startTestServer(t *testing.T) (int, *repo.Repo) {
-	t.Helper()
-	return startServerModule(t, &config.ModuleConfig{Name: "home", Path: "/", Snapshot: true})
-}
-
-// startSingleCopyServer 同 startTestServer 但模块为单份模式（snapshot: false
-// 缺省行为）：每次成功会话后仓库收敛为只保留最新一份快照。
-func startSingleCopyServer(t *testing.T) (int, *repo.Repo) {
 	t.Helper()
 	return startServerModule(t, &config.ModuleConfig{Name: "home", Path: "/"})
 }
@@ -101,11 +94,10 @@ func TestRsyncClientBackup(t *testing.T) {
 		t.Fatalf("rsync 备份失败: %v\n%s", err, out)
 	}
 
-	sid, err := r.LatestSnapshotID()
-	if err != nil || sid == 0 {
-		t.Fatalf("应产生快照: %d %v", sid, err)
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
 	}
-	files, _ := r.GetFilesForTest(sid)
 	var buf strings.Builder
 	for _, f := range files {
 		buf.WriteString(f.Path)
@@ -113,10 +105,10 @@ func TestRsyncClientBackup(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "a.txt") || !strings.Contains(buf.String(), "sub/b.bin") ||
 		!strings.Contains(buf.String(), "link1") {
-		t.Fatalf("快照文件清单不完整: %s", buf.String())
+		t.Fatalf("文件清单不完整: %s", buf.String())
 	}
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "a.txt", &out); err != nil || out.String() != "hello rsync" {
+	if err := r.ReadFile("a.txt", &out); err != nil || out.String() != "hello rsync" {
 		t.Fatalf("读取 a.txt: %v %q", err, out.String())
 	}
 }
@@ -140,29 +132,30 @@ func TestRsyncClientSecondBackup(t *testing.T) {
 	if err := run(); err != nil {
 		t.Fatal(err)
 	}
-	// 第二次：文件变化 + 新增一个
+	// 第二次：文件变化 + 新增一个 → 单一当前状态原地收敛为 2 个文件
 	os.WriteFile(filepath.Join(src, "a.txt"), []byte("v2 changed"), 0o644)
 	os.WriteFile(filepath.Join(src, "new.txt"), []byte("new"), 0o644)
 	if err := run(); err != nil {
 		t.Fatal(err)
 	}
-	s2, _ := r.LatestSnapshotID()
-	files2, _ := r.GetFilesForTest(s2)
-	if len(files2) != 2 {
-		t.Fatalf("第二次快照应有 2 个文件: %v", files2)
+	files2, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
 	}
-	// 第一次快照还在
-	files1, _ := r.GetFilesForTest(s2 - 1)
-	if len(files1) != 1 || files1[0].Path != "a.txt" {
-		t.Fatalf("第一次快照应有 a.txt: %v", files1)
+	if len(files2) != 2 {
+		t.Fatalf("当前清单应有 2 个文件: %v", files2)
+	}
+	var out bytes.Buffer
+	if err := r.ReadFile("a.txt", &out); err != nil || out.String() != "v2 changed" {
+		t.Fatalf("读取 a.txt: %v %q", err, out.String())
 	}
 }
 
-// TestSingleCopySnapshotTrim：单份模式（snapshot: false 缺省）端到端：真实
-// rsync 客户端多次备份后仓库恒只保留最新一份快照，旧快照清单被裁剪、最新
-// 快照内容正确；无变化会话（纯 quick check）同样收敛为一份。
-func TestSingleCopySnapshotTrim(t *testing.T) {
-	port, r := startSingleCopyServer(t)
+// TestSingleCopyInPlace：v0.5 单一当前状态端到端——真实 rsync 客户端多次
+// 备份后当前清单原地收敛（首次 1 文件、二次 2 文件、无变化会话后不变），
+// 内容读回一致。
+func TestSingleCopyInPlace(t *testing.T) {
+	port, r := startTestServer(t)
 	src := t.TempDir()
 	os.WriteFile(filepath.Join(src, "a.txt"), []byte("v1"), 0o644)
 	pw := filepath.Join(t.TempDir(), "pw")
@@ -177,47 +170,42 @@ func TestSingleCopySnapshotTrim(t *testing.T) {
 		}
 	}
 	run()
-	s1, _ := r.LatestSnapshotID()
-	if n, _ := r.SnapshotCountForTest(); n != 1 {
-		t.Fatalf("首次备份后应恰 1 个快照: %d", n)
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Path != "a.txt" {
+		t.Fatalf("首次备份后清单应恰 1 个文件: %v", files)
 	}
 
-	// 第二次：文件变化 + 新增一个 -> 提交新快照并裁掉旧快照
+	// 第二次：文件变化 + 新增一个 → 原地 upsert 收敛
 	os.WriteFile(filepath.Join(src, "a.txt"), []byte("v2 changed"), 0o644)
 	os.WriteFile(filepath.Join(src, "new.txt"), []byte("new"), 0o644)
 	run()
-	s2, _ := r.LatestSnapshotID()
-	if n, _ := r.SnapshotCountForTest(); n != 1 {
-		t.Fatalf("二次备份后仍应恰 1 个快照: %d", n)
+	files2, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if s2 <= s1 {
-		t.Fatalf("新快照 ID 应递增: %d -> %d", s1, s2)
-	}
-	// 旧快照已裁剪（清单为空）
-	if files, _ := r.GetFilesForTest(s1); len(files) != 0 {
-		t.Fatalf("旧快照应已被裁剪: %v", files)
-	}
-	files2, _ := r.GetFilesForTest(s2)
 	if len(files2) != 2 {
-		t.Fatalf("最新快照应有 2 个文件: %v", files2)
+		t.Fatalf("二次备份后清单应恰 2 个文件: %v", files2)
 	}
 	var out bytes.Buffer
-	if err := r.ReadFile(s2, "a.txt", &out); err != nil || out.String() != "v2 changed" {
+	if err := r.ReadFile("a.txt", &out); err != nil || out.String() != "v2 changed" {
 		t.Fatalf("读取 a.txt: %v %q", err, out.String())
 	}
 
-	// 第三次：无变化（纯 quick check，无孤儿 chunk 不触发后端 GC）-> 仍恰 1 份
+	// 第三次：无变化（纯 quick check）→ 清单不变、内容不变
 	run()
-	s3, _ := r.LatestSnapshotID()
-	if n, _ := r.SnapshotCountForTest(); n != 1 {
-		t.Fatalf("无变化会话后仍应恰 1 个快照: %d", n)
+	files3, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if files, _ := r.GetFilesForTest(s2); len(files) != 0 {
-		t.Fatalf("上一份快照应已被裁剪: %v", files)
+	if len(files3) != 2 {
+		t.Fatalf("无变化会话后清单不应改变: %v", files3)
 	}
 	out.Reset()
-	if err := r.ReadFile(s3, "a.txt", &out); err != nil || out.String() != "v2 changed" {
-		t.Fatalf("读取最新快照 a.txt: %v %q", err, out.String())
+	if err := r.ReadFile("a.txt", &out); err != nil || out.String() != "v2 changed" {
+		t.Fatalf("读取 a.txt: %v %q", err, out.String())
 	}
 }
 
@@ -249,11 +237,10 @@ func TestRsyncClientDeepSort(t *testing.T) {
 		t.Fatalf("rsync 备份失败: %v\n%s", err, out)
 	}
 
-	sid, err := r.LatestSnapshotID()
-	if err != nil || sid == 0 {
-		t.Fatalf("应产生快照: %d %v", sid, err)
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
 	}
-	files, _ := r.GetFilesForTest(sid)
 	var buf strings.Builder
 	for _, f := range files {
 		buf.WriteString(f.Path)
@@ -276,7 +263,7 @@ func TestRsyncClientDeepSort(t *testing.T) {
 	}
 	// 抽查深层文件内容可读回
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "x/y/z.txt", &out); err != nil || out.String() != "deep x/y/z.txt" {
+	if err := r.ReadFile("x/y/z.txt", &out); err != nil || out.String() != "deep x/y/z.txt" {
 		t.Fatalf("读取 x/y/z.txt: %v %q", err, out.String())
 	}
 }
@@ -322,14 +309,13 @@ func TestRsyncQuickCheckUnchanged(t *testing.T) {
 	if !strings.Contains(stats, "Number of regular files transferred: 0") {
 		t.Fatalf("quick check 未生效（二次备份仍有传输）:\n%s", stats)
 	}
-	sid, _ := r.LatestSnapshotID()
-	if sid != 2 {
-		t.Fatalf("应有 2 个快照: %d", sid)
-	}
-	// 第二次快照文件仍在且内容继承正确
+	// 单一状态：文件仍在且内容不变
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "a.txt", &out); err != nil || out.String() != "hello" {
+	if err := r.ReadFile("a.txt", &out); err != nil || out.String() != "hello" {
 		t.Fatalf("读取 a.txt: %v %q", err, out.String())
+	}
+	if files, _ := r.GetFilesForTest(); len(files) != 1 {
+		t.Fatalf("清单应恰 1 个文件: %v", files)
 	}
 }
 
@@ -362,9 +348,8 @@ func TestRsyncDeltaPartialUpdate(t *testing.T) {
 		t.Fatalf("literal 数据异常（应 ≈1KB+块边界余量）: %d", literal)
 	}
 	// 内容读回与修改后源一致
-	sid, _ := r.LatestSnapshotID()
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "big.bin", &out); err != nil {
+	if err := r.ReadFile("big.bin", &out); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(out.Bytes(), big) {
@@ -399,11 +384,10 @@ func TestRsyncMixedSecondBackupDelta(t *testing.T) {
 	os.WriteFile(filepath.Join(src, "c.txt"), []byte("new file"), 0o644)
 	run() // 二次
 
-	s2, _ := r.LatestSnapshotID()
-	if s2 != 2 {
-		t.Fatalf("应有 2 个快照: %d", s2)
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
 	}
-	files, _ := r.GetFilesForTest(s2)
 	got := map[string]bool{}
 	for _, f := range files {
 		got[f.Path] = true
@@ -416,21 +400,16 @@ func TestRsyncMixedSecondBackupDelta(t *testing.T) {
 	// 修改后的 a.txt 内容读回正确（delta 重组）
 	wantA := bytes.Repeat([]byte("v2 longer content "), 50)
 	var out bytes.Buffer
-	if err := r.ReadFile(s2, "a.txt", &out); err != nil {
+	if err := r.ReadFile("a.txt", &out); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(out.Bytes(), wantA) {
 		t.Fatal("a.txt 二次备份内容不一致")
 	}
-	// 未变化的 sub/b.bin 由 CopyFiles 继承（quick check 跳过）
+	// 未变化的 sub/b.bin 由 quick check 跳过、内容保持不变
 	out.Reset()
-	if err := r.ReadFile(s2, "sub/b.bin", &out); err != nil || !bytes.Equal(out.Bytes(), bytes.Repeat([]byte{0x01}, 1500)) {
+	if err := r.ReadFile("sub/b.bin", &out); err != nil || !bytes.Equal(out.Bytes(), bytes.Repeat([]byte{0x01}, 1500)) {
 		t.Fatalf("sub/b.bin 继承内容不一致: %v %d", err, out.Len())
-	}
-	// 第一次快照保持 3 个条目（a.txt + sub 目录 + sub/b.bin）
-	files1, _ := r.GetFilesForTest(1)
-	if len(files1) != 3 {
-		t.Fatalf("首次快照应有 3 个条目: %v", files1)
 	}
 }
 
@@ -457,11 +436,10 @@ func TestRsyncBackupNoPreserve(t *testing.T) {
 		t.Fatalf("rsync -r 备份失败: %v\n%s", err, out)
 	}
 
-	sid, err := r.LatestSnapshotID()
-	if err != nil || sid == 0 {
-		t.Fatalf("应产生快照: %d %v", sid, err)
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
 	}
-	files, _ := r.GetFilesForTest(sid)
 	got := map[string]bool{}
 	for _, f := range files {
 		got[f.Path] = true
@@ -476,7 +454,7 @@ func TestRsyncBackupNoPreserve(t *testing.T) {
 		t.Fatalf("无 target 的 symlink 应跳过落库: %v", files)
 	}
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "a.txt", &out); err != nil || out.String() != "no preserve" {
+	if err := r.ReadFile("a.txt", &out); err != nil || out.String() != "no preserve" {
 		t.Fatalf("a.txt 内容: %v %q", err, out.String())
 	}
 }
@@ -571,11 +549,10 @@ func TestRsyncBackupRL(t *testing.T) {
 		t.Fatalf("rsync -rl 备份失败: %v\n%s", err, out)
 	}
 
-	sid, _ := r.LatestSnapshotID()
-	if sid == 0 {
-		t.Fatal("应产生快照")
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
 	}
-	files, _ := r.GetFilesForTest(sid)
 	got := map[string]string{}
 	for _, f := range files {
 		got[f.Path] = f.LinkTarget
@@ -605,8 +582,10 @@ func TestRsyncBackupSubpathPrefix(t *testing.T) {
 		t.Fatalf("子路径备份失败: %v\n%s", err, out)
 	}
 
-	sid, _ := r.LatestSnapshotID()
-	files, _ := r.GetFilesForTest(sid)
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	got := map[string]bool{}
 	for _, f := range files {
 		got[f.Path] = true
@@ -618,7 +597,7 @@ func TestRsyncBackupSubpathPrefix(t *testing.T) {
 		t.Fatalf("子路径备份不应落库到模块根: %v", files)
 	}
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "sub1/a.txt", &out); err != nil || out.String() != "from sub1" {
+	if err := r.ReadFile("sub1/a.txt", &out); err != nil || out.String() != "from sub1" {
 		t.Fatalf("读取 sub1/a.txt: %v %q", err, out.String())
 	}
 
@@ -630,8 +609,10 @@ func TestRsyncBackupSubpathPrefix(t *testing.T) {
 	if out2, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("第二个子路径备份失败: %v\n%s", err, out2)
 	}
-	sid2, _ := r.LatestSnapshotID()
-	files2, _ := r.GetFilesForTest(sid2)
+	files2, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	got2 := map[string]bool{}
 	for _, f := range files2 {
 		got2[f.Path] = true
@@ -640,7 +621,7 @@ func TestRsyncBackupSubpathPrefix(t *testing.T) {
 		t.Fatalf("两个子路径应并存: %v", files2)
 	}
 	var out2 bytes.Buffer
-	if err := r.ReadFile(sid2, "sub1/a.txt", &out2); err != nil || out2.String() != "from sub1" {
+	if err := r.ReadFile("sub1/a.txt", &out2); err != nil || out2.String() != "from sub1" {
 		t.Fatalf("sub1/a.txt 被子路径备份覆盖: %v %q", err, out2.String())
 	}
 
@@ -727,9 +708,8 @@ func TestRsyncSubpathDelta(t *testing.T) {
 	if matched < 900_000 {
 		t.Fatalf("delta 匹配字节过少: %d\n%s", matched, stats)
 	}
-	sid, _ := r.LatestSnapshotID()
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "sub1/big.bin", &out); err != nil || !bytes.Equal(out.Bytes(), big) {
+	if err := r.ReadFile("sub1/big.bin", &out); err != nil || !bytes.Equal(out.Bytes(), big) {
 		t.Fatalf("读取 sub1/big.bin: %v (len=%d want=%d)", err, out.Len(), len(big))
 	}
 }
@@ -753,9 +733,8 @@ func TestRsyncCompressRejected(t *testing.T) {
 	if !strings.Contains(strings.ToLower(string(out)), "compress") {
 		t.Fatalf("错误信息应说明压缩不支持:\n%s", out)
 	}
-	sid, _ := r.LatestSnapshotID()
-	if sid != 0 {
-		t.Fatalf("被拒绝的会话不应产生快照: %d", sid)
+	if files, err := r.GetFilesForTest(); err != nil || len(files) != 0 {
+		t.Fatalf("被拒绝的会话不应落库任何文件: %v %v", files, err)
 	}
 }
 
@@ -803,15 +782,14 @@ func TestRsyncBackupChecksum(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("rsync -ac 备份失败: %v\n%s", err, out)
 	}
-	sid, _ := r.LatestSnapshotID()
-	if sid == 0 {
-		t.Fatal("应产生快照")
-	}
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "a.txt", &out); err != nil || out.String() != "checksum mode" {
+	if err := r.ReadFile("a.txt", &out); err != nil || out.String() != "checksum mode" {
 		t.Fatalf("读取 a.txt: %v %q", err, out.String())
 	}
-	files, _ := r.GetFilesForTest(sid)
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
 	got := map[string]bool{}
 	for _, f := range files {
 		got[f.Path] = true
@@ -950,10 +928,10 @@ func TestRsyncBackupNoLinksSymlink(t *testing.T) {
 	}
 }
 
-// TestRsyncEmptySessionNoSnapshot P1#6：空 flist 备份会话（无 -a 的空目录推送，
-// argv 形如 "--server -e.LsfxCIvu --stats . home/"，entries=0）不应提交快照——
-// 此前每次此类会话都新增一个无变化快照，污染快照历史与 prune 保留计算。
-func TestRsyncEmptySessionNoSnapshot(t *testing.T) {
+// TestRsyncEmptySessionNoWrite P1#6：空 flist 备份会话（无 -a 的空目录推送，
+// argv 形如 "--server -e.LsfxCIvu --stats . home/"，entries=0）不应产生任何写——
+// 单一状态模型下空会话 = 无 upsert 无删除，当前清单保持不变。
+func TestRsyncEmptySessionNoWrite(t *testing.T) {
 	port, r := startTestServer(t)
 
 	empty := t.TempDir() // 空目录
@@ -970,21 +948,28 @@ func TestRsyncEmptySessionNoSnapshot(t *testing.T) {
 		}
 	}
 
-	// 空模块上的空会话：不产生任何快照
+	// 空模块上的空会话：零写入
 	push("--stats", empty+"/", "backup@127.0.0.1::home/")
-	if sid, _ := r.LatestSnapshotID(); sid != 0 {
-		t.Fatalf("空模块空会话不应产生快照: %d", sid)
+	if files, err := r.GetFilesForTest(); err != nil || len(files) != 0 {
+		t.Fatalf("空模块空会话不应落库: %v %v", files, err)
 	}
 	// 正常备份一个文件
 	push("-a", src+"/", "backup@127.0.0.1::home/")
-	sid1, err := r.LatestSnapshotID()
-	if err != nil || sid1 == 0 {
-		t.Fatalf("正常备份应产生快照: %d %v", sid1, err)
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
 	}
-	// 已有快照的空会话：不新增快照
+	if len(files) != 1 || files[0].Path != "a.txt" {
+		t.Fatalf("正常备份应落库 a.txt: %v", files)
+	}
+	// 已有内容后的空会话：清单不变（无 upsert 无删除）
 	push("--stats", empty+"/", "backup@127.0.0.1::home/")
-	if sid, _ := r.LatestSnapshotID(); sid != sid1 {
-		t.Fatalf("空会话不应新增快照: %d != %d", sid, sid1)
+	files2, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files2) != 1 || files2[0].Path != "a.txt" {
+		t.Fatalf("空会话不应改变清单: %v", files2)
 	}
 }
 
@@ -1015,16 +1000,15 @@ func TestRsyncSourceMissingNoHang(t *testing.T) {
 	if rerr == nil {
 		t.Fatalf("客户端应报源缺失错误:\n%s", out)
 	}
-	if sid, _ := r.LatestSnapshotID(); sid != 0 {
-		t.Fatalf("失败会话不应产生快照: %d", sid)
+	if files, err := r.GetFilesForTest(); err != nil || len(files) != 0 {
+		t.Fatalf("失败会话不应落库任何文件: %v %v", files, err)
 	}
 }
 
-// TestRsyncDeleteSemantics P1#7：--delete 备份的快照语义——传输根（子路径前缀）
-// 内、本次 flist 未覆盖的文件与目录行应从新快照删除（此前永远复制保留，恢复时
-// "复活"客户端已删除的文件）。同时验证：范围界定（其他子路径不受影响）、旧快照
-// 不可变（历史时间点恢复仍含已删文件）。io_error 联动（源缺失时禁删）由
-// TestRsyncSourceMissingIoErrorNoDelete 覆盖。
+// TestRsyncDeleteSemantics P1#7：--delete 备份的当前状态语义——传输根（子路径
+// 前缀）内、本次 flist 未覆盖的文件与目录行应被原地删除（恢复时不"复活"客户端
+// 已删除的文件）。同时验证：范围界定（其他子路径不受影响）。io_error 联动
+// （源缺失时禁删）由 TestRsyncSourceMissingIoErrorNoDelete 覆盖。
 func TestRsyncDeleteSemantics(t *testing.T) {
 	port, r, _ := startLoggedRouterServer(t)
 	pw := filepath.Join(t.TempDir(), "pw")
@@ -1047,9 +1031,9 @@ func TestRsyncDeleteSemantics(t *testing.T) {
 			t.Fatalf("rsync %v 失败: %v\n%s", args, err, out)
 		}
 	}
-	rowsOf := func(sid int64) map[string]bool {
+	rowsOf := func() map[string]bool {
 		t.Helper()
-		files, err := r.GetFilesForTest(sid)
+		files, err := r.GetFilesForTest()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1062,11 +1046,7 @@ func TestRsyncDeleteSemantics(t *testing.T) {
 
 	rsyncRun("-a", other+"/", "backup@127.0.0.1::home/other/")
 	rsyncRun("-a", src+"/", "backup@127.0.0.1::home/del/")
-	sid1, err := r.LatestSnapshotID()
-	if err != nil || sid1 == 0 {
-		t.Fatalf("首次备份应产生快照: %d %v", sid1, err)
-	}
-	if m := rowsOf(sid1); !m["del/sub/b.txt"] || !m["del/emptydir/keep.txt"] || !m["other/x.txt"] {
+	if m := rowsOf(); !m["del/sub/b.txt"] || !m["del/emptydir/keep.txt"] || !m["other/x.txt"] {
 		t.Fatalf("首次备份清单不符: %v", m)
 	}
 
@@ -1074,20 +1054,12 @@ func TestRsyncDeleteSemantics(t *testing.T) {
 	os.Remove(filepath.Join(src, "sub", "b.txt"))
 	os.RemoveAll(filepath.Join(src, "emptydir"))
 	rsyncRun("-a", "--delete", src+"/", "backup@127.0.0.1::home/del/")
-	sid2, err := r.LatestSnapshotID()
-	if err != nil || sid2 == sid1 {
-		t.Fatalf("--delete 推送应产生新快照: %d %v", sid2, err)
-	}
-	m2 := rowsOf(sid2)
+	m2 := rowsOf()
 	if m2["del/sub/b.txt"] || m2["del/emptydir"] || m2["del/emptydir/keep.txt"] {
-		t.Fatalf("--delete 后客户端已删条目应从新快照消失: %v", m2)
+		t.Fatalf("--delete 后客户端已删条目应从当前清单消失: %v", m2)
 	}
 	if !m2["del/a.txt"] || !m2["del/sub"] || !m2["other/x.txt"] {
 		t.Fatalf("--delete 不应误删保留条目/其他子路径: %v", m2)
-	}
-	// 旧快照不可变：历史时间点仍含已删文件（快照系统的核心属性）
-	if m1 := rowsOf(sid1); !m1["del/sub/b.txt"] {
-		t.Fatalf("旧快照不应被 --delete 改动: %v", m1)
 	}
 	// 恢复验证：b.txt / emptydir 不复活
 	dst := t.TempDir()
@@ -1117,9 +1089,8 @@ func TestRsyncSourceMissingIoErrorNoDelete(t *testing.T) {
 	if out, err := exec.Command("rsync", append([]string{"-a"}, append(base, src+"/", "backup@127.0.0.1::home/")...)...).CombinedOutput(); err != nil {
 		t.Fatalf("首次备份失败: %v\n%s", err, out)
 	}
-	sid1, _ := r.LatestSnapshotID()
-	if sid1 == 0 {
-		t.Fatal("首次备份应产生快照")
+	if files, err := r.GetFilesForTest(); err != nil || len(files) != 1 {
+		t.Fatalf("首次备份应落库: %v %v", files, err)
 	}
 
 	// 源目录消失 + --delete：客户端 sender io_error=1，服务端必须禁删
@@ -1128,15 +1099,12 @@ func TestRsyncSourceMissingIoErrorNoDelete(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err == nil {
 		t.Fatalf("源缺失 + --delete 应报错:\n%s", out)
 	}
-	// 最新快照（若产生）不得丢失 a.txt
-	sid, _ := r.LatestSnapshotID()
-	if sid != sid1 {
-		files, _ := r.GetFilesForTest(sid)
-		for _, f := range files {
-			if f.Path == "a.txt" {
-				return // 数据仍在
-			}
-		}
+	// io_error 会话不得删除已有数据（--delete 被禁、无文件传输 → 清单不变）
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Path != "a.txt" {
 		t.Fatalf("io_error 会话删除了已有数据: %v", files)
 	}
 }
@@ -1144,8 +1112,8 @@ func TestRsyncSourceMissingIoErrorNoDelete(t *testing.T) {
 // TestRsyncFileOpenDeniedPartial P1#9：客户端 open 失败（chmod 000）时发
 // MSG_NO_SEND(102)+ndx 后跳过该文件继续下一个（sender.c:722-724）。rsync 语义：
 // 该文件报错、其余文件正常完成（rc=23）。此前服务端 MuxStream 丢弃消息帧，
-// recvNdxEcho 死等被跳过文件的回显 → 会话永久挂起。修复后：会话正常完成并
-// 提交快照（好文件入库、失败文件不落库），恢复好文件完好。
+// recvNdxEcho 死等被跳过文件的回显 → 会话永久挂起。修复后：会话正常完成
+// （好文件入库、失败文件不落库），恢复好文件完好。
 func TestRsyncFileOpenDeniedPartial(t *testing.T) {
 	port, r, logBuf := startLoggedRouterServer(t)
 	pw := filepath.Join(t.TempDir(), "pw")
@@ -1182,12 +1150,11 @@ func TestRsyncFileOpenDeniedPartial(t *testing.T) {
 		t.Fatalf("客户端应报 secret.txt 错误:\n%s", out)
 	}
 
-	// 其余文件正常完成：快照存在且含好文件、不含失败文件
-	sid, err := r.LatestSnapshotID()
-	if err != nil || sid == 0 {
-		t.Fatalf("部分失败会话应提交快照: %d %v", sid, err)
+	// 其余文件正常完成：当前清单含好文件、不含失败文件
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
 	}
-	files, _ := r.GetFilesForTest(sid)
 	got := map[string]bool{}
 	for _, f := range files {
 		got[f.Path] = true
@@ -1214,13 +1181,11 @@ func TestRsyncFileOpenDeniedPartial(t *testing.T) {
 	}
 }
 
-
-
 // TestRsyncDryRunBackup dry-run 备份（argv 'n'，!do_xfers）：真实客户端 sender 对
 // 传输请求只回显 ndx+iflags（sender.c:638-642），不读 sum_head/不发 token 流；服务端
-// 须同样只发 ndx+iflags（generator.c:2390 !do_xfers 跳过 sums）且不落库不提交快照。
-// 复现来源：UGOS（极空间）备份任务先发 dry-run 会话，此前服务端照常发空 sum_head 并
-// 死等回显导致 EOF 报错。
+// 须同样只发 ndx+iflags（generator.c:2390 !do_xfers 跳过 sums）且不落库（含静态
+// 目录条目——单一状态模型下目录行落库同样是写）。复现来源：UGOS（极空间）备份
+// 任务先发 dry-run 会话，此前服务端照常发空 sum_head 并死等回显导致 EOF 报错。
 func TestRsyncDryRunBackup(t *testing.T) {
 	port, r, _ := startLoggedRouterServer(t)
 
@@ -1236,9 +1201,12 @@ func TestRsyncDryRunBackup(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("首次备份失败: %v\n%s", err, out)
 	}
-	sid, err := r.LatestSnapshotID()
-	if err != nil || sid == 0 {
-		t.Fatalf("首次备份应产生快照: %d %v", sid, err)
+	files, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 1 || files[0].Path != "a.txt" {
+		t.Fatalf("首次备份应落库 a.txt: %v", files)
 	}
 
 	// 新文件 + 变化文件后 dry-run 推送
@@ -1250,22 +1218,16 @@ func TestRsyncDryRunBackup(t *testing.T) {
 		t.Fatalf("dry-run 备份失败: %v\n%s", err, out)
 	}
 
-	// dry-run 不产生新快照、内容不落库
-	sid2, err := r.LatestSnapshotID()
+	// dry-run 零写入：清单不变、内容不变
+	files2, err := r.GetFilesForTest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sid2 != sid {
-		t.Fatalf("dry-run 不应提交新快照: %d -> %d", sid, sid2)
-	}
-	files, _ := r.GetFilesForTest(sid2)
-	for _, f := range files {
-		if f.Path == "new.txt" {
-			t.Fatalf("dry-run 不应落库新文件: %v", files)
-		}
+	if len(files2) != 1 {
+		t.Fatalf("dry-run 不应落库新文件: %v", files2)
 	}
 	var out bytes.Buffer
-	if err := r.ReadFile(sid2, "a.txt", &out); err != nil || out.String() != "v1" {
+	if err := r.ReadFile("a.txt", &out); err != nil || out.String() != "v1" {
 		t.Fatalf("dry-run 不应改变已备份内容: %v %q", err, out.String())
 	}
 
@@ -1275,12 +1237,15 @@ func TestRsyncDryRunBackup(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("dry-run 后真实备份失败: %v\n%s", err, out)
 	}
-	sid3, _ := r.LatestSnapshotID()
-	if sid3 == sid2 {
-		t.Fatalf("真实备份应提交新快照")
+	files3, err := r.GetFilesForTest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files3) != 2 {
+		t.Fatalf("真实备份后清单应含 2 个文件: %v", files3)
 	}
 	var out2 bytes.Buffer
-	if err := r.ReadFile(sid3, "new.txt", &out2); err != nil || out2.String() != "brand new" {
+	if err := r.ReadFile("new.txt", &out2); err != nil || out2.String() != "brand new" {
 		t.Fatalf("真实备份后应能读到新文件: %v %q", err, out2.String())
 	}
 }

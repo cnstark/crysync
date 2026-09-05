@@ -145,20 +145,14 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 		return fmt.Errorf("filter: %w", err)
 	}
 
-	// 快照清单 -> flist 条目 -> f_name_cmp 排序（ndx = 排序后索引，两端一致）。
+	// 当前清单 -> flist 条目 -> f_name_cmp 排序（ndx = 排序后索引，两端一致）。
+	// v0.5 单一当前状态模型：无快照概念，"从未备份"与"备份了空目录"在仓库中
+	// 不可区分——空清单发空 flist 即可（真实 rsync 对空 flist 的处理为直接
+	// 断连，客户端感知为空目录）。
 	// 子路径拉取（prefix 非空）时条目名相对传输根：目录化身 "."（DOTDIR_NAME
 	// 语义，客户端把其属性应用到目标目录），其下条目剥前缀。
-	sid, err := fs.ActiveSnapshotID()
-	if err != nil {
-		return err
-	}
-	if sid == 0 {
-		// 明确告知客户端再断连（静默断连客户端只见 connection unexpectedly closed）
-		rejectWithExit(out, "ERROR: module has no snapshot to restore\n", 1)
-		return fmt.Errorf("模块 %s 没有可恢复的快照", module.Name)
-	}
 	prefix := modulePrefix(neg.ModuleArg, module.Name)
-	rows, err := fs.SnapshotFileRows(sid, prefix)
+	rows, err := fs.FileRows(prefix)
 	if err != nil {
 		return err
 	}
@@ -217,7 +211,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 			op, arg = "change_dir", prefix
 		case strings.Contains(prefix, "/"):
 			dir := prefix[:strings.LastIndex(prefix, "/")]
-			row, ok, gerr := fs.GetFileRow(sid, dir)
+			row, ok, gerr := fs.GetFileRow(dir)
 			if gerr != nil {
 				return gerr
 			}
@@ -249,7 +243,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 		// MD5（flist.c:757-766 file_checksum，无 seed；客户端 recv_file_entry
 		// 无条件读该段，缺失则整条流错位）。目录/符号链接不附。
 		if neg.ChecksumMode && !it.entry.IsDir && !it.entry.IsSymlink && isRegularMode(it.entry.Mode) {
-			_, fileSum, err := fs.StreamFile(sid, it.snapPath, 0, io.Discard)
+			_, fileSum, err := fs.StreamFile(it.snapPath, 0, io.Discard)
 			if err != nil {
 				return fmt.Errorf("计算 flist 校验和 %s: %w", it.entry.Path, err)
 			}
@@ -406,7 +400,7 @@ func processSendSession(ctx context.Context, in *MuxReader, out *MuxWriter, modu
 
 		lw := &literalWriter{out: out}
 		fileStart := time.Now()
-		n, fileSum, err := fs.StreamFile(sid, it.snapPath, neg.ChecksumSeed, lw)
+		n, fileSum, err := fs.StreamFile(it.snapPath, neg.ChecksumSeed, lw)
 		if err != nil {
 			return fmt.Errorf("读取文件 %s: %w", e.Path, err)
 		}

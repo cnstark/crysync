@@ -27,17 +27,12 @@ func dirBrowse(next http.Handler, store core.FileStore, prefix string) http.Hand
 			return
 		}
 		path := normalize(strings.TrimPrefix(r.URL.Path, prefix))
-		sid, err := store.ActiveSnapshotID()
-		if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
 		if path == "" {
 			// 模块根是虚拟目录（无 FileRow 行）：直接渲染
-			renderDirList(w, r, store, sid, "")
+			renderDirList(w, r, store, "")
 			return
 		}
-		row, ok, err := store.GetFileRow(sid, path)
+		row, ok, err := store.GetFileRow(path)
 		if err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
@@ -47,14 +42,14 @@ func dirBrowse(next http.Handler, store core.FileStore, prefix string) http.Hand
 			next.ServeHTTP(w, r)
 			return
 		}
-		renderDirList(w, r, store, sid, path)
+		renderDirList(w, r, store, path)
 	})
 }
 
 // renderDirList 渲染目录 HTML 列表：目录项（带尾斜杠）在前、文件项在后，
 // 均按名排序；非模块根时含父目录链接。
-func renderDirList(w http.ResponseWriter, r *http.Request, store core.FileStore, sid int64, path string) {
-	rows, err := store.ListDir(sid, path)
+func renderDirList(w http.ResponseWriter, r *http.Request, store core.FileStore, path string) {
+	rows, err := store.ListDir(path)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

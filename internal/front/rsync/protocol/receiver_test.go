@@ -58,7 +58,7 @@ func newTestRepoFull(t *testing.T) (*repo.Repo, *config.ModuleConfig) {
 	key, _ := crypto.GenerateKey()
 	be := backend.NewInMemory()
 	r := repo.New(db, be, key, 64)
-	m := &config.ModuleConfig{Name: "home", Path: "/", Snapshot: true}
+	m := &config.ModuleConfig{Name: "home", Path: "/"}
 	return r, m
 }
 
@@ -77,7 +77,7 @@ func newTestRepoLarge(t *testing.T) (*repo.Repo, *config.ModuleConfig) {
 	key, _ := crypto.GenerateKey()
 	be := backend.NewInMemory()
 	r := repo.New(db, be, key, 4<<20)
-	m := &config.ModuleConfig{Name: "home", Path: "/", Snapshot: true}
+	m := &config.ModuleConfig{Name: "home", Path: "/"}
 	return r, m
 }
 
@@ -216,8 +216,7 @@ func TestReceiverDirsAndFiles(t *testing.T) {
 		t.Logf("daemon 输出: % x", serverOut.Bytes())
 		t.Fatalf("receiver: %v", err)
 	}
-	sid, _ := r.LatestSnapshotID()
-	files, err := r.GetFilesForTest(sid)
+	files, err := r.GetFilesForTest()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,15 +226,15 @@ func TestReceiverDirsAndFiles(t *testing.T) {
 	}
 	for _, want := range []string{"sub", "link1", "a.txt", "b.txt"} {
 		if !got[want] {
-			t.Fatalf("缺少 %s，快照内容: %v", want, files)
+			t.Fatalf("缺少 %s，清单内容: %v", want, files)
 		}
 	}
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "a.txt", &out); err != nil || out.String() != "hello" {
+	if err := r.ReadFile("a.txt", &out); err != nil || out.String() != "hello" {
 		t.Fatalf("读取 a.txt: %v %q", err, out.String())
 	}
 	out.Reset()
-	if err := r.ReadFile(sid, "b.txt", &out); err != nil || out.String() != "abc" {
+	if err := r.ReadFile("b.txt", &out); err != nil || out.String() != "abc" {
 		t.Fatalf("读取 b.txt: %v %q", err, out.String())
 	}
 }
@@ -256,13 +255,12 @@ func TestReceiverTopDirEntry(t *testing.T) {
 	if err := RunReceiver(ctx, bufio.NewReader(conn), conn, m, r, nil); err != nil {
 		t.Fatalf("receiver: %v", err)
 	}
-	sid, _ := r.LatestSnapshotID()
-	files, err := r.GetFilesForTest(sid)
+	files, err := r.GetFilesForTest()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(files) != 1 || files[0].Path != "a.txt" {
-		t.Fatalf("顶层目录不应落库，快照内容: %v", files)
+		t.Fatalf("顶层目录不应落库，清单内容: %v", files)
 	}
 }
 
@@ -429,7 +427,7 @@ func newContentMD5(b []byte) []byte {
 }
 
 // TestReceiverQuickCheck：二次会话（flist 相同、mtime/size 不变）→ 服务端
-// 不发任何传输请求，客户端只需回 goodbye ACK；快照内容由 CopyFiles 继承。
+// 不发任何传输请求，客户端只需回 goodbye ACK；当前清单内容保持不变。
 func TestReceiverQuickCheck(t *testing.T) {
 	r, m := newTestRepoFull(t)
 	entry := buildEntry(t, "a.txt", 0o644, 5, false, "")
@@ -448,13 +446,9 @@ func TestReceiverQuickCheck(t *testing.T) {
 	if err := RunReceiver(ctx2, bufio.NewReader(conn2), conn2, m, r, nil); err != nil {
 		t.Fatalf("二次备份: %v", err)
 	}
-	sid, _ := r.LatestSnapshotID()
-	if sid != 2 {
-		t.Fatalf("应有 2 个快照: %d", sid)
-	}
-	// 内容由 CopyFiles 继承，仍可读回
+	// 内容仍在（quick check 不动当前状态），可读回
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "a.txt", &out); err != nil || out.String() != "hello" {
+	if err := r.ReadFile("a.txt", &out); err != nil || out.String() != "hello" {
 		t.Fatalf("继承内容读取失败: %v %q", err, out.String())
 	}
 }
@@ -515,12 +509,8 @@ func TestReceiverDelta(t *testing.T) {
 		t.Fatalf("二次备份: %v", err)
 	}
 	// 断言重组内容
-	sid, _ := r.LatestSnapshotID()
-	if sid != 2 {
-		t.Fatalf("应有 2 个快照: %d", sid)
-	}
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "a.txt", &out); err != nil {
+	if err := r.ReadFile("a.txt", &out); err != nil {
 		t.Fatalf("读取: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), newContent) {
@@ -596,10 +586,10 @@ func TestReceiverDeltaProtocolErrors(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), c.wantErr) {
 				t.Fatalf("期望错误含 %q，实际: %v", c.wantErr, err)
 			}
-			// 会话失败不产生快照
-			sid, _ := r.LatestSnapshotID()
-			if sid != 1 {
-				t.Fatalf("失败会话不应产生快照: %d", sid)
+			// 会话失败 = 半更新：a.txt 应保留首次备份的旧内容（未被破坏性覆盖）
+			var out bytes.Buffer
+			if err := r.ReadFile("a.txt", &out); err != nil || !bytes.Equal(out.Bytes(), oldContent) {
+				t.Fatalf("失败会话不应改动已有内容: %v (%d 字节)", err, out.Len())
 			}
 		})
 	}
@@ -607,7 +597,8 @@ func TestReceiverDeltaProtocolErrors(t *testing.T) {
 
 // TestReceiverBadChecksumSkip P1#9：客户端发坏整文件校验和（读源中途失败）时
 // legacy 路径此前不比对静默存坏数据；修复后不落库该文件，会话继续其余文件
-// 并正常提交快照（rsync 语义：单文件报错，其余完成）。
+// 并正常收尾（rsync 语义：单文件报错，其余完成；单一状态模型下坏文件保留
+// 旧状态或不存在）。
 func TestReceiverBadChecksumSkip(t *testing.T) {
 	r, m := newTestRepoFull(t)
 	entries := [][]byte{
@@ -624,11 +615,7 @@ func TestReceiverBadChecksumSkip(t *testing.T) {
 		t.Logf("daemon 输出: % x", serverOut.Bytes())
 		t.Fatalf("receiver: %v", err)
 	}
-	sid, _ := r.LatestSnapshotID()
-	if sid == 0 {
-		t.Fatal("部分失败会话应提交快照")
-	}
-	files, err := r.GetFilesForTest(sid)
+	files, err := r.GetFilesForTest()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -638,14 +625,14 @@ func TestReceiverBadChecksumSkip(t *testing.T) {
 		}
 	}
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "good.txt", &out); err != nil || out.String() != "good" {
+	if err := r.ReadFile("good.txt", &out); err != nil || out.String() != "good" {
 		t.Fatalf("好文件应完好入库: %v %q", err, out.String())
 	}
 }
 
 // TestReceiverDeltaBadChecksumPartial P1#9 delta 变体：整文件校验和不匹配
-// （客户端读源中途失败发坏校验和）不再使整会话回滚——该文件不落库（快照
-// 继承旧版本内容），会话继续并提交新快照，客户端收到 file corruption 错误。
+// （客户端读源中途失败发坏校验和）不再使整会话回滚——该文件不覆盖（保留
+// 旧版本内容），会话正常收尾，客户端收到 file corruption 错误。
 func TestReceiverDeltaBadChecksumPartial(t *testing.T) {
 	r, m := newTestRepoLarge(t)
 	oldContent := bytes.Repeat([]byte{0x41}, 1500)
@@ -683,13 +670,9 @@ func TestReceiverDeltaBadChecksumPartial(t *testing.T) {
 	if err != nil {
 		t.Fatalf("坏校验和会话应正常完成: %v", err)
 	}
-	// 新快照提交（sid=2），a.txt 保留旧版本内容（继承未覆盖）
-	sid, _ := r.LatestSnapshotID()
-	if sid != 2 {
-		t.Fatalf("部分失败会话应提交新快照: %d", sid)
-	}
+	// 坏校验和文件不覆盖：a.txt 保留首次备份的旧版本内容
 	var out bytes.Buffer
-	if err := r.ReadFile(sid, "a.txt", &out); err != nil || !bytes.Equal(out.Bytes(), oldContent) {
+	if err := r.ReadFile("a.txt", &out); err != nil || !bytes.Equal(out.Bytes(), oldContent) {
 		t.Fatalf("a.txt 应保留旧版本: %v %d 字节", err, out.Len())
 	}
 }

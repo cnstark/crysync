@@ -5,7 +5,6 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"database/sql"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,28 +16,38 @@ import (
 	"crysync/internal/backend"
 	"crysync/internal/core/crypto"
 	"crysync/internal/core/meta"
-	"crysync/internal/core/prune"
-	"crysync/internal/core/types"
 )
+
+// moduleWriteLocks 模块级共享写锁（键 = meta DB 路径）：v0.5 单一当前状态
+// 模型下 Repo 实例按需创建（rsync 每连接一个、webdav 缓存一个），实例内锁
+// 无法跨连接/跨前端互斥——此包级锁保证同一模块的写操作全局串行。
+var moduleWriteLocks sync.Map // meta DB path -> *sync.Mutex
 
 type Repo struct {
 	meta      *meta.DB
 	backend   backend.Backend
 	key       *crypto.Key
 	chunkSize int
-
-	// writeMu 写即快照短事务互斥：PutFile/Mkcol/DeletePath/MovePath 全程
-	// 持锁（含父目录检查）。并发写事务若不串行，各自 BeginSnapshot 基于
-	// 同一旧快照复制，后提交者覆盖前者--丢已提交数据；且父目录检查可能
-	// 读到并发 MKCOL 未提交前的旧快照而误报不存在。短事务毫秒级，锁竞争
-	// 可接受。rsync 会话长事务（SessionTxn）不持此锁--同模块避免 rsync
-	// 备份与 WebDAV 写并发（README 已注明）。
-	writeMu sync.Mutex
 }
 
 func New(metaDB *meta.DB, be backend.Backend, key *crypto.Key, chunkSize int) *Repo {
 	return &Repo{meta: metaDB, backend: be, key: key, chunkSize: chunkSize}
 }
+
+// lockWrite 获取模块写锁（短持：WebDAV 单请求的行更新段）。
+// 返回解锁函数。同模块并发写/写会话在此排队。
+func (r *Repo) lockWrite() func() {
+	mu, _ := moduleWriteLocks.LoadOrStore(r.meta.DBPath(), &sync.Mutex{})
+	m := mu.(*sync.Mutex)
+	m.Lock()
+	return m.Unlock
+}
+
+// WriteSessionLock 写会话全程互斥（types.Session 接口）：rsync 备份会话
+// 开始时获取、结束释放。同模块并发写会话与 WebDAV 写（lockWrite 短持）在
+// 会话期间排队等待——替代 v0.4 快照事务的并发隔离（绿联单客户端场景无感）。
+// 契约：会话内直接调用 meta 层写方法（不经 PutFile 等再次加锁），避免死锁。
+func (r *Repo) WriteSessionLock() func() { return r.lockWrite() }
 
 // ChunkSizeBytes 返回分块大小（字节）。receiver 用它确定内容缓冲/分块边界。
 func (r *Repo) ChunkSizeBytes() int {
@@ -75,144 +84,24 @@ func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
 	return id, false, nil
 }
 
-type SnapshotTxn struct {
-	repo       *Repo
-	snapshotID int64
-	finalized  bool
-}
-
-// SnapshotID 返回本次事务创建的快照 ID（复制清单后即可用）。
-func (t *SnapshotTxn) SnapshotID() int64 { return t.snapshotID }
-
-// BeginSnapshot 创建新快照并复制上一快照的完整文件清单。
-// 返回面向前端的 SessionTxn 接口（rsyncproto 等调用方只依赖接口方法）。
-func (r *Repo) BeginSnapshot(now time.Time) (types.SessionTxn, error) {
-	prev, err := r.LatestSnapshotID()
-	if err != nil {
-		return nil, err
-	}
-	id, err := r.meta.CreateSnapshot(now)
-	if err != nil {
-		return nil, err
-	}
-	if prev != 0 {
-		if err := r.meta.CopyFiles(prev, id); err != nil {
-			return nil, err
-		}
-	}
-	return &SnapshotTxn{repo: r, snapshotID: id}, nil
-}
-
-func (t *SnapshotTxn) UpsertFile(f meta.FileRow, chunks []meta.ChunkRef) error {
-	if t.finalized {
-		return errors.New("快照事务已结束")
-	}
-	fid, err := t.repo.meta.UpsertFile(t.snapshotID, f)
-	if err != nil {
-		return err
-	}
-	if len(chunks) > 0 {
-		if err := t.repo.meta.AttachChunks(fid, chunks); err != nil {
-			return err
-		}
-		// refcount 递增由引用方负责（AttachChunks 只建关联，见接口契约）
-		for _, c := range chunks {
-			if err := t.repo.meta.IncrRefcount(c.ChunkID); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func (t *SnapshotTxn) DeleteFile(path string) error {
-	if t.finalized {
-		return errors.New("快照事务已结束")
-	}
-	return t.repo.meta.DeleteFile(t.snapshotID, path)
-}
-
-// ApplyDelete 执行 rsync --delete 语义：删除事务快照中 prefix 子树内、不在
-// covered 路径集合中的行（文件与目录，refcount 级联由 DeleteFile 处理），
-// 返回删除行数。covered 键为落库形态路径（目录无尾斜杠）；范围按 prefix
-// 子树界定（SnapshotFileRows 语义），不殃及模块内其他子路径。调用方须先
-// 确认发送侧无 io_error（rsync 语义：io_error≠0 时禁删，防源清单不完整误删）。
-func (t *SnapshotTxn) ApplyDelete(prefix string, covered map[string]bool) (int, error) {
-	if t.finalized {
-		return 0, errors.New("快照事务已结束")
-	}
-	rows, err := t.repo.SnapshotFileRows(t.snapshotID, prefix)
-	if err != nil {
-		return 0, err
-	}
-	n := 0
-	for _, row := range rows {
-		if covered[row.Path] {
-			continue
-		}
-		if err := t.DeleteFile(row.Path); err != nil {
-			return n, err
-		}
-		n++
-	}
-	return n, nil
-}
-
-func (t *SnapshotTxn) Commit() (int64, error) {
-	if t.finalized {
-		return 0, errors.New("快照事务已结束")
-	}
-	t.finalized = true
-	return t.snapshotID, nil
-}
-
-func (t *SnapshotTxn) Rollback() error {
-	if t.finalized {
-		return errors.New("快照事务已结束")
-	}
-	t.finalized = true
-	_, err := t.repo.meta.DeleteSnapshot(t.snapshotID)
+// UpsertFile 原地落库文件行并附加块关联（替换+refcount 维护+关联全在
+// meta.UpsertFile 单事务内原子完成）。调用方必须处于写互斥内
+// （WriteSessionLock 持有中，或 lockWrite 短持锁内）——单一状态模型下不存在
+// 快照隔离，行更新必须与同模块其他写串行。
+func (r *Repo) UpsertFile(f meta.FileRow, chunks []meta.ChunkRef) error {
+	_, err := r.meta.UpsertFile(f, chunks)
 	return err
 }
 
-func (r *Repo) LatestSnapshotID() (int64, error) {
-	var id int64
-	err := r.meta.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM snapshots`).Scan(&id)
-	return id, err
+// DeleteFile 原地删除路径行（refcount 递减）。锁契约同 UpsertFile。
+func (r *Repo) DeleteFile(path string) error {
+	return r.meta.DeleteFile(path)
 }
 
-// ActiveSnapshotID 返回活跃快照：meta 表 active_snapshot 键（CLI 切换时间点）
-// 存在且有效时优先，否则默认最新快照。
-func (r *Repo) ActiveSnapshotID() (int64, error) {
-	v, ok, err := r.meta.GetMeta("active_snapshot")
-	if err != nil {
-		return 0, err
-	}
-	if ok {
-		var id int64
-		if _, err := fmt.Sscanf(v, "%d", &id); err == nil && id > 0 {
-			var n int
-			if err := r.meta.QueryRow(`SELECT COUNT(*) FROM snapshots WHERE id = ?`, id).Scan(&n); err != nil {
-				return 0, err
-			}
-			if n > 0 {
-				return id, nil
-			}
-		}
-	}
-	return r.LatestSnapshotID()
-}
-
-// SetActiveSnapshot 手动切换活跃快照（快照恢复时间点，存 meta 表）。
-func (r *Repo) SetActiveSnapshot(id int64) error {
-	return r.meta.SetMeta("active_snapshot", fmt.Sprintf("%d", id))
-}
-
-// SnapshotFileRows 返回快照文件清单，按子路径过滤：prefix 为空（拉取模块根）返回全部；
-// 否则只含 path == prefix（单文件/目录自身）或以 prefix+"/" 开头的条目。
-// 结果按 path 排序（发送侧再按 f_name_cmp 重排）。
-func (r *Repo) SnapshotFileRows(snapshotID int64, prefix string) ([]meta.FileRow, error) {
-	files, err := r.meta.GetFiles(snapshotID)
+// FileRows 返回文件清单，按前缀路径过滤：prefix 为空返回全部；否则只含
+// path == prefix（单文件/目录自身）或以 prefix+"/" 开头的条目。按 path 排序。
+func (r *Repo) FileRows(prefix string) ([]meta.FileRow, error) {
+	files, err := r.meta.GetFiles()
 	if err != nil {
 		return nil, err
 	}
@@ -228,10 +117,10 @@ func (r *Repo) SnapshotFileRows(snapshotID int64, prefix string) ([]meta.FileRow
 	return out, nil
 }
 
-// ListDir 返回快照中 path 的直接子项（非递归，不含自身）。path 为空 = 模块根。
+// ListDir 返回 path 的直接子项（非递归，不含自身）。path 为空 = 模块根。
 // 目录不存在时返回空切片（调用方先用 GetFileRow 判定存在性）。
-func (r *Repo) ListDir(snapshotID int64, path string) ([]meta.FileRow, error) {
-	files, err := r.meta.GetFiles(snapshotID)
+func (r *Repo) ListDir(path string) ([]meta.FileRow, error) {
+	files, err := r.meta.GetFiles()
 	if err != nil {
 		return nil, err
 	}
@@ -253,25 +142,24 @@ func (r *Repo) ListDir(snapshotID int64, path string) ([]meta.FileRow, error) {
 	return out, nil
 }
 
-// GetFileRow 按快照路径查文件元数据（quick check 判定用）：旧快照存在同路径
-// 普通文件且 (mtime, size) 一致 → 未变化，无需传输。
-func (r *Repo) GetFileRow(snapshotID int64, path string) (meta.FileRow, bool, error) {
-	return r.meta.GetFileRow(snapshotID, path)
+// GetFileRow 按路径查文件元数据（quick check 判定用）。
+func (r *Repo) GetFileRow(path string) (meta.FileRow, bool, error) {
+	return r.meta.GetFileRow(path)
 }
 
-// ReadChunkAt 读取快照文件第 idx 个存储块（file_chunks.idx）的明文。
+// ReadChunkAt 读取文件第 idx 个存储块（file_chunks.idx）的明文。
 // 短连接查询：Scan 后即释放连接，供 basisReader 逐块顺序读取（不长期占用
 // meta 单写连接——StreamFile+io.Pipe 方案会因连接互锁而死锁，
 // meta.DB SetMaxOpenConns(1) 下唯一连接被流式读占用时 StoreChunk 等不到连接）。
-func (r *Repo) ReadChunkAt(snapshotID int64, path string, idx int) ([]byte, error) {
+func (r *Repo) ReadChunkAt(path string, idx int) ([]byte, error) {
 	var blobName string
 	var size int64
 	err := r.meta.QueryRow(`
 		SELECT c.blob_name, c.size FROM file_chunks fc
 		JOIN files f ON f.id = fc.file_id
 		JOIN chunks c ON c.id = fc.chunk_id
-		WHERE f.snapshot_id = ? AND f.path = ? AND fc.idx = ?`,
-		snapshotID, path, idx).Scan(&blobName, &size)
+		WHERE f.path = ? AND fc.idx = ?`,
+		path, idx).Scan(&blobName, &size)
 	if err != nil {
 		return nil, err
 	}
@@ -282,17 +170,16 @@ func (r *Repo) ReadChunkAt(snapshotID int64, path string, idx int) ([]byte, erro
 	return r.key.Decrypt(raw, blobName)
 }
 
-// StreamFile 流式读取快照中文件内容：逐块解密后写入 w，同时计算 rsync 整文件
+// StreamFile 流式读取文件内容：逐块解密后写入 w，同时计算 rsync 整文件
 // 强校验和 MD5(content)（checksum.c sum_end：CSUM_MD5 分支为纯 MD5——sum_init
 // 的 seed 参数仅作用于 xxh 系列，对 MD5 无效；带 seed 混入的是 file_checksum，
 // --checksum 模式，v1 不涉及）。返回写入字节数与校验和。
-func (r *Repo) StreamFile(snapshotID int64, path string, _ int32, w io.Writer) (int64, [16]byte, error) {
+func (r *Repo) StreamFile(path string, _ int32, w io.Writer) (int64, [16]byte, error) {
 	// 先确认文件存在：空文件没有 file_chunks 行，必须靠 files 行判定
 	var fileSize int64
-	err := r.meta.QueryRow(`SELECT size FROM files WHERE snapshot_id = ? AND path = ?`,
-		snapshotID, path).Scan(&fileSize)
+	err := r.meta.QueryRow(`SELECT size FROM files WHERE path = ?`, path).Scan(&fileSize)
 	if err == sql.ErrNoRows {
-		return 0, [16]byte{}, fmt.Errorf("快照 %d 中不存在文件 %s", snapshotID, path)
+		return 0, [16]byte{}, fmt.Errorf("仓库中不存在文件 %s", path)
 	}
 	if err != nil {
 		return 0, [16]byte{}, err
@@ -301,8 +188,8 @@ func (r *Repo) StreamFile(snapshotID int64, path string, _ int32, w io.Writer) (
 		SELECT c.blob_name, c.size FROM file_chunks fc
 		JOIN files f ON f.id = fc.file_id
 		JOIN chunks c ON c.id = fc.chunk_id
-		WHERE f.snapshot_id = ? AND f.path = ?
-		ORDER BY fc.idx`, snapshotID, path)
+		WHERE f.path = ?
+		ORDER BY fc.idx`, path)
 	if err != nil {
 		return 0, [16]byte{}, err
 	}
@@ -333,8 +220,8 @@ func (r *Repo) StreamFile(snapshotID int64, path string, _ int32, w io.Writer) (
 		return 0, [16]byte{}, err
 	}
 	if n != fileSize {
-		return 0, [16]byte{}, fmt.Errorf("快照 %d 中文件 %s 内容不完整: %d/%d 字节",
-			snapshotID, path, n, fileSize)
+		return 0, [16]byte{}, fmt.Errorf("文件 %s 内容不完整: %d/%d 字节",
+			path, n, fileSize)
 	}
 	var sum [16]byte
 	copy(sum[:], h.Sum(nil))
@@ -342,119 +229,14 @@ func (r *Repo) StreamFile(snapshotID int64, path string, _ int32, w io.Writer) (
 }
 
 // ReadFile 按 file_chunks 顺序读出并解密文件内容，写入 w。
-func (r *Repo) ReadFile(snapshotID int64, path string, w io.Writer) error {
-	_, _, err := r.StreamFile(snapshotID, path, 0, w)
+func (r *Repo) ReadFile(path string, w io.Writer) error {
+	_, _, err := r.StreamFile(path, 0, w)
 	return err
 }
 
-// SnapshotList 返回快照列表（id + 创建时间，供 CLI 展示与 prune）。
-func (r *Repo) SnapshotList() ([]meta.SnapshotInfo, error) {
-	return r.meta.SnapshotList()
-}
-
-// SnapshotFileCount 返回快照文件条目数。
-func (r *Repo) SnapshotFileCount(snapshotID int64) (int, error) {
-	return r.meta.SnapshotFileCount(snapshotID)
-}
-
 // GetFilesForTest 临时公开包装，供测试断言。
-func (r *Repo) GetFilesForTest(snapshotID int64) ([]meta.FileRow, error) {
-	return r.meta.GetFiles(snapshotID)
-}
-
-// SnapshotCountForTest 临时公开包装，供测试断言（单份模式恒 1）。
-func (r *Repo) SnapshotCountForTest() (int, error) {
-	infos, err := r.meta.SnapshotList()
-	return len(infos), err
-}
-
-// Prune 按保留策略执行清理：删除被裁掉的快照（DeleteSnapshot 递减引用，
-// 归零的 chunk 行删除）-> 孤儿 blob 回收（GC）。返回删除的快照数与回收的 blob 数。
-func (r *Repo) Prune(p prune.Policy) (int, int, error) {
-	infos, err := r.meta.SnapshotList()
-	if err != nil {
-		return 0, 0, err
-	}
-	snaps := make([]prune.Snapshot, 0, len(infos))
-	for _, s := range infos {
-		snaps = append(snaps, prune.Snapshot{ID: s.ID, CreatedAt: s.CreatedAt})
-	}
-	_, remove := p.Apply(snaps)
-	for _, s := range remove {
-		if _, err := r.meta.DeleteSnapshot(s.ID); err != nil {
-			return 0, 0, fmt.Errorf("删除快照 %d: %w", s.ID, err)
-		}
-	}
-	blobs, err := r.GC()
-	if err != nil {
-		return len(remove), 0, err
-	}
-	return len(remove), blobs, nil
-}
-
-// KeepOnlySnapshot 单份模式（模块配置 snapshot: false）会话收尾：删除
-// keepID 之前的全部快照，使仓库收敛为"只保留一份"。返回删除的快照数与
-// 回收的 blob 数。
-//
-// 语义要点：
-//   - 只删 ID 更小的快照（更早创建）。并发会话已提交的更新快照不殃及——
-//     同模块并发单份备份收敛为最后提交者；被裁掉在途快照的会话会在后续
-//     落库时报错（客户端重试即可）。要彻底规避可用 max_connections: 1。
-//   - 本次删除未产生孤儿 chunk（deletedChunks=0，如纯 quick check 的无变化
-//     会话）时跳过 GC，避免每次会话全量扫描后端；失败/中断会话的陈年孤儿
-//     由下一次确有删除的会话或 prune 调度兜底回收。
-func (r *Repo) KeepOnlySnapshot(keepID int64) (int, int, error) {
-	infos, err := r.meta.SnapshotList()
-	if err != nil {
-		return 0, 0, err
-	}
-	var removed, deletedChunks int
-	for _, s := range infos {
-		if s.ID >= keepID {
-			continue
-		}
-		n, err := r.meta.DeleteSnapshot(s.ID)
-		if err != nil {
-			return removed, 0, fmt.Errorf("删除快照 %d: %w", s.ID, err)
-		}
-		removed++
-		deletedChunks += n
-	}
-	if deletedChunks == 0 {
-		return removed, 0, nil
-	}
-	blobs, err := r.GC()
-	if err != nil {
-		return removed, 0, err
-	}
-	return removed, blobs, nil
-}
-
-// TrimAfterCommit 快照提交后的收尾裁剪（receiver 与 WebDAV 写共用）：
-// keepHistory=true（多版本模式）时不动作；false（单份模式）时删除
-// snapshotID 之前的全部快照并回收孤儿 blob（语义与 KeepOnlySnapshot 相同）。
-func (r *Repo) TrimAfterCommit(snapshotID int64, keepHistory bool) (int, int, error) {
-	if keepHistory {
-		return 0, 0, nil
-	}
-	return r.KeepOnlySnapshot(snapshotID)
-}
-
-// TrimWrite 持写锁执行裁剪：写即快照 + 单份模式收尾必须在写事务之外仍与
-// 写互斥--否则并发读路径（如 webdav openWrite 预检）可能拿到"即将被 trim
-// 删除的快照 ID"而后读空。TrimAfterCommit 本身不持锁（receiver 会话收尾
-// 调用，rsync 长事务语义独立），WebDAV 短事务路径经此入口串行化。
-func (r *Repo) TrimWrite(keepHistory bool) (int, int, error) {
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	if keepHistory {
-		return 0, 0, nil
-	}
-	id, err := r.LatestSnapshotID()
-	if err != nil {
-		return 0, 0, err
-	}
-	return r.KeepOnlySnapshot(id)
+func (r *Repo) GetFilesForTest() ([]meta.FileRow, error) {
+	return r.meta.GetFiles()
 }
 
 // fileChunk 文件块索引（OpenFile 时一次查全）。
@@ -463,7 +245,7 @@ type fileChunk struct {
 	size     int64
 }
 
-// FileReader 按块流式重组快照文件（解密后逐块输出），支持 Seek 定位到
+// FileReader 按块流式重组文件（解密后逐块输出），支持 Seek 定位到
 // 任意块重放（HTTP Range 下载用）。块定位 O(块数)，块内读取 O(1)。
 type FileReader struct {
 	r        *Repo
@@ -476,10 +258,10 @@ type FileReader struct {
 	closed   bool
 }
 
-// OpenFile 按路径打开快照文件：返回流式块重组 reader（Read/Seek/Close）与
+// OpenFile 按路径打开文件：返回流式块重组 reader（Read/Seek/Close）与
 // 文件元数据。仅普通文件可打开；目录/符号链接由调用方先行判定。
-func (r *Repo) OpenFile(snapshotID int64, path string) (io.ReadSeekCloser, meta.FileRow, error) {
-	row, ok, err := r.meta.GetFileRow(snapshotID, path)
+func (r *Repo) OpenFile(path string) (io.ReadSeekCloser, meta.FileRow, error) {
+	row, ok, err := r.meta.GetFileRow(path)
 	if err != nil {
 		return nil, meta.FileRow{}, err
 	}
@@ -492,7 +274,7 @@ func (r *Repo) OpenFile(snapshotID int64, path string) (io.ReadSeekCloser, meta.
 	rows, err := r.meta.Query(`SELECT c.blob_name, c.size FROM file_chunks fc
 		JOIN files f ON f.id = fc.file_id
 		JOIN chunks c ON c.id = fc.chunk_id
-		WHERE f.snapshot_id = ? AND f.path = ? ORDER BY fc.idx`, snapshotID, path)
+		WHERE f.path = ? ORDER BY fc.idx`, path)
 	if err != nil {
 		return nil, row, err
 	}
@@ -592,10 +374,13 @@ func (f *FileReader) Close() error {
 	return nil
 }
 
-// GC 回收孤儿 blob：后端存在但未被任何 chunk 引用的 blob（失败/中断会话的
-// 残留，设计文档 §4.2：blob 先写后端、快照提交失败即孤儿）。引用判定以
-// chunks 表为准——chunk 一旦入库即保留（refcount 归零与否由 prune 策略决定，
-// 本函数只清"从未入库"的）。返回删除数量。
+// GC 回收孤儿 blob。v0.5 单一状态模型下引用判定必须以 file_chunks JOIN files
+// 的真引用为唯一真值（不能以 chunks 表为准——失败会话残留的 refcount=0 chunk
+// 行会让其 blob 永不回收）：
+//  1. chunks 行未被任何文件引用的（StoreChunk 后未 attach 的失败残留）→ 删行+blob；
+//  2. 后端存在但无对应 chunk 行的 blob（行删除后的直接残留）→ 删 blob。
+//
+// 返回删除的 blob 数量。
 func (r *Repo) GC() (int, error) {
 	blobs, err := r.backend.List()
 	if err != nil {
@@ -604,18 +389,20 @@ func (r *Repo) GC() (int, error) {
 	if len(blobs) == 0 {
 		return 0, nil
 	}
-	rows, err := r.meta.Query(`SELECT blob_name FROM chunks`)
+	// 真引用集合：当前清单中文件实际引用的 chunk id
+	rows, err := r.meta.Query(`SELECT DISTINCT fc.chunk_id FROM file_chunks fc
+		JOIN files f ON f.id = fc.file_id`)
 	if err != nil {
 		return 0, err
 	}
-	referenced := make(map[string]bool, len(blobs))
+	referenced := make(map[int64]bool, len(blobs))
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
 			rows.Close()
 			return 0, err
 		}
-		referenced[name] = true
+		referenced[id] = true
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -623,12 +410,51 @@ func (r *Repo) GC() (int, error) {
 	}
 	rows.Close()
 
+	// chunks 表全量：未引用行（残留）连同 blob 一并回收；chunkBlob 供后端
+	// blob 判定（后端 blob 名必须对得上 chunks 行才算有主）
+	rows, err = r.meta.Query(`SELECT id, blob_name FROM chunks`)
+	if err != nil {
+		return 0, err
+	}
+	chunkBlob := make(map[string]bool, len(blobs))
+	garbage := make(map[string]bool) // blob_name -> 待删
+	var deadChunks []int64
+	for rows.Next() {
+		var id int64
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		chunkBlob[name] = true
+		if !referenced[id] {
+			garbage[name] = true
+			deadChunks = append(deadChunks, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	for _, name := range blobs {
+		if !chunkBlob[name] {
+			garbage[name] = true
+		}
+	}
+	if len(garbage) == 0 {
+		return 0, nil
+	}
+
+	// 先删 chunk 行再删 blob（行删失败 blob 仍会被下一次 GC 按"无对应行"回收）
+	for _, id := range deadChunks {
+		if err := r.meta.DeleteChunk(id); err != nil {
+			return 0, fmt.Errorf("删除残留 chunk 行 %d: %w", id, err)
+		}
+	}
 	var deleted int
 	var failed []string
-	for _, name := range blobs {
-		if referenced[name] {
-			continue
-		}
+	for name := range garbage {
 		if err := r.backend.Delete(name); err != nil {
 			failed = append(failed, fmt.Sprintf("%s: %v", name, err))
 			continue
@@ -641,22 +467,15 @@ func (r *Repo) GC() (int, error) {
 	return deleted, nil
 }
 
-// checkParentDir 校验 path 的父目录在最新快照中存在（WebDAV PUT 语义：
-// 父目录缺失 → 409；适配层同样前置检查以映射状态码）。
-// 仓库为空时除根外任何父目录都不存在。
+// checkParentDir 校验 path 的父目录在当前清单中存在（WebDAV PUT 语义：
+// 父目录缺失 → 409）。仓库为空时除根外任何父目录都不存在。
+// 调用方必须处于写互斥内。
 func checkParentDir(r *Repo, path string) error {
 	parent := pathpkg.Dir(path)
 	if parent == "." || parent == "/" {
 		return nil
 	}
-	latest, err := r.LatestSnapshotID()
-	if err != nil {
-		return err
-	}
-	if latest == 0 {
-		return os.ErrNotExist
-	}
-	row, ok, err := r.meta.GetFileRow(latest, parent)
+	row, ok, err := r.meta.GetFileRow(parent)
 	if err != nil {
 		return err
 	}
@@ -666,39 +485,38 @@ func checkParentDir(r *Repo, path string) error {
 	return nil
 }
 
-// PutFile 以"写即快照"语义写入（或覆盖）path：请求体流式分块去重存储，
-// 提交一个新快照。mode 为文件权限位，mtimeNs 为修改时间（纳秒）。
+// pathExistsLocked 在写互斥内判定 path 是否存在于当前清单（幂等
+// MKCOL/DELETE 判定用：目标状态已达成即成功，绿联 restic fork 对 405/404
+// 敏感）。调用方必须持写锁。
+func (r *Repo) pathExistsLocked(path string) (bool, error) {
+	_, ok, err := r.meta.GetFileRow(path)
+	return ok, err
+}
+
+// cleanupNewChunks 写失败收口：删除本次新建但未附引用的 chunk 行
+// （blob 随之脱表成孤儿，由 GC 回收；曾因 chunks 表残留 refcount=0 行
+// 而 blob 无法回收）。
+func (r *Repo) cleanupNewChunks(newChunks []int64) {
+	for _, id := range newChunks {
+		_ = r.meta.DeleteChunkIfZero(id)
+	}
+}
+
+// PutFile 写入（或覆盖）path 文件内容。
+// v0.5 单一当前状态语义：阶段 1 无锁分块去重上传（blob 写后端为网络 IO，
+// 内容寻址并发安全——任务 5 将并行化）；阶段 2 短锁内行更新（父目录校验
+// + 原地 upsert）。行更新失败 → 文件保留旧状态、新 blob 成孤儿（GC 回收）。
 func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) error {
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	if err := checkParentDir(r, path); err != nil {
-		return err
-	}
-	txn, err := r.BeginSnapshot(time.Now())
-	if err != nil {
-		return err
-	}
-	committed := false
-	var newChunks []int64 // 本次新建且未复用的 chunk（出错时回收，防 refcount=0 行残留）
-	defer func() {
-		if committed {
-			return
-		}
-		_ = txn.Rollback()
-		// 回滚已删除快照内被引用的 chunk 行；未附引用的新建 chunk 行在此补删，
-		// 其 blob 随之脱离 chunks 表 → 由 GC 回收（否则 refcount=0 行+blob 泄漏）。
-		for _, id := range newChunks {
-			_ = r.meta.DeleteChunkIfZero(id)
-		}
-	}()
 	buf := make([]byte, r.chunkSize)
 	var chunks []meta.ChunkRef
 	var total int64
+	var newChunks []int64 // 本次新建且未复用的 chunk（出错时回收）
 	for {
 		n, err := io.ReadFull(src, buf)
 		if n > 0 {
 			id, reused, err2 := r.StoreChunk(buf[:n])
 			if err2 != nil {
+				r.cleanupNewChunks(newChunks)
 				return err2
 			}
 			if !reused {
@@ -713,152 +531,89 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			break
 		}
+		r.cleanupNewChunks(newChunks)
+		return err
+	}
+	unlock := r.lockWrite()
+	defer unlock()
+	if err := checkParentDir(r, path); err != nil {
+		r.cleanupNewChunks(newChunks)
 		return err
 	}
 	row := meta.FileRow{Path: path, Mode: mode, Size: total, MTimeNs: mtimeNs}
-	if err := txn.UpsertFile(row, chunks); err != nil {
+	if err := r.UpsertFile(row, chunks); err != nil {
+		r.cleanupNewChunks(newChunks)
 		return err
 	}
-	if _, err := txn.Commit(); err != nil {
-		return err
-	}
-	committed = true
 	return nil
 }
 
-// pathExistsLocked 在写锁内判定 path 是否存在于最新快照（幂等 MKCOL/DELETE
-// 用）：仓库无任何快照时视为不存在。调用方必须持 writeMu——读的
-// LatestSnapshotID 与 BeginSnapshot 的复制源一致，无并发快照切换窗口。
-func (r *Repo) pathExistsLocked(path string) (bool, error) {
-	id, err := r.LatestSnapshotID()
-	if err != nil {
-		return false, err
-	}
-	if id == 0 {
-		return false, nil
-	}
-	_, ok, err := r.meta.GetFileRow(id, path)
-	return ok, err
-}
-
-// Mkcol 以"写即快照"语义创建目录条目；已存在时幂等返回 nil（目录已存在即
-// 目标状态已达成，x/net/webdav 映射为 201 Created）。
-// 幂等原因（NAS 实测）：绿联 NAS 定制 restic fork 把 MKCOL 405（目录已存在）
-// 当致命错误，mkdirAll 永不收敛——1.5 小时 442 次重试、零 PUT blob，任务报
-// "Path not found/No permission/Insufficient capacity"；官方 restic webdav
-// 后端则把 405 视为"已存在，继续"。幂等返回成功对 rclone/Windows/官方
-// restic 等标准客户端同样安全（RFC 4918 允许服务器宽容处理已存在目录）。
+// Mkcol 创建目录条目；已存在时幂等返回 nil（目录已存在即目标状态已达
+// 成——绿联 NAS 定制 restic fork 把 MKCOL 405 当致命错误；官方 restic
+// webdav 后端同样把 405 视为已存在继续。读历史：v0.4.2 幂等化）。
 func (r *Repo) Mkcol(path string) error {
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
+	unlock := r.lockWrite()
+	defer unlock()
 	if err := checkParentDir(r, path); err != nil {
 		return err
 	}
-	// 已存在检查前置到事务外：幂等请求零开销（不建快照、不复制清单），
-	// 且锁内判定与事务内判定结果一致
 	if ok, err := r.pathExistsLocked(path); err != nil {
 		return err
 	} else if ok {
 		return nil
 	}
-	txn, err := r.BeginSnapshot(time.Now())
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = txn.Rollback()
-		}
-	}()
-	if err := txn.UpsertFile(meta.FileRow{Path: path, IsDir: true, Mode: 0o40755, MTimeNs: time.Now().UnixNano()}, nil); err != nil {
-		return err
-	}
-	if _, err := txn.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+	_, err := r.meta.UpsertFile(meta.FileRow{Path: path, IsDir: true, Mode: 0o40755, MTimeNs: time.Now().UnixNano()}, nil)
+	return err
 }
 
-// DeletePath 以"写即快照"语义删除 path（文件或目录，目录递归删整棵子树）；
-// 不存在时幂等返回 nil（目标状态已达成，x/net/webdav 映射为 204 No Content）。
-// 幂等原因与 Mkcol 相同：绿联 restic fork 对 DELETE 404 同样敏感（删锁文件
-// 反复收到 404 会报错）；标准客户端不受影响。
+// DeletePath 删除 path（文件或目录，目录递归删整棵子树）；不存在时幂等
+// 返回 nil（绿联 restic fork 对 DELETE 404 敏感，v0.4.2 幂等化）。
 func (r *Repo) DeletePath(path string) error {
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
-	// 不存在检查前置到事务外（幂等请求零开销），锁内判定与事务内一致
+	unlock := r.lockWrite()
+	defer unlock()
 	if ok, err := r.pathExistsLocked(path); err != nil {
 		return err
 	} else if !ok {
 		return nil
 	}
-	txn, err := r.BeginSnapshot(time.Now())
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = txn.Rollback()
-		}
-	}()
-	rows, err := r.SnapshotFileRows(txn.SnapshotID(), path)
+	rows, err := r.FileRows(path)
 	if err != nil {
 		return err
 	}
 	if len(rows) == 0 {
-		return nil // 防御性兜底：前置检查后正常不会到达（行存在即匹配自身）
+		return nil // 防御性兜底：前置检查后正常不会到达
 	}
 	for _, row := range rows {
-		if err := txn.DeleteFile(row.Path); err != nil {
+		if err := r.meta.DeleteFile(row.Path); err != nil {
 			return err
 		}
 	}
-	if _, err := txn.Commit(); err != nil {
-		return err
-	}
-	committed = true
 	return nil
 }
 
-// MovePath 以"写即快照"语义移动/改名：目标新建条目（chunk 引用直接复制，
-// 净 refcount 不变、不产生新 blob），源删除。目录移动递归整棵子树，路径
-// 前缀整体替换。目标已存在时覆盖（WebDAV Overwrite 语义）：先删除 dst 原
-// 子树（与 src 重叠部分除外）再搬入 src，保证 dst 不残留旧内容。
+// MovePath 移动/改名：目标新建条目（chunk 引用直接复制，净 refcount 不变、
+// 不产生新 blob），源删除。目录移动递归整棵子树，路径前缀整体替换。
+// 目标已存在时覆盖（WebDAV Overwrite 语义）：先删除 dst 原子树（与 src
+// 重叠部分除外）再搬入 src，保证 dst 不残留旧内容。
 func (r *Repo) MovePath(src, dst string) error {
-	r.writeMu.Lock()
-	defer r.writeMu.Unlock()
+	unlock := r.lockWrite()
+	defer unlock()
 	if err := checkParentDir(r, dst); err != nil {
 		return err
 	}
-	txn, err := r.BeginSnapshot(time.Now())
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = txn.Rollback()
-		}
-	}()
-	rows, err := r.SnapshotFileRows(txn.SnapshotID(), src)
+	rows, err := r.FileRows(src)
 	if err != nil {
 		return err
 	}
 	if len(rows) == 0 {
 		return os.ErrNotExist
 	}
-	// 覆盖语义：dst 若已存在（文件或目录子树），先整体删除——保证移动后
-	// dst 子树纯粹由 src 内容构成，旧 dst 子树不残留（新旧混存）。
-	dstRows, err := r.SnapshotFileRows(txn.SnapshotID(), dst)
+	dstRows, err := r.FileRows(dst)
 	if err != nil {
 		return err
 	}
-	// 注意：src 与 dst 可能同子树（原地改名/前缀替换），删除 dst 时必须
-	// 排除与 src 重叠的行，否则会把待移动的 src 行也删掉。下面按 src 路径
-	// 集合过滤。
+	// src 与 dst 可能同子树（原地改名/前缀替换），删除 dst 时必须排除与
+	// src 重叠的行，否则会把待移动的 src 行也删掉。
 	srcSet := make(map[string]bool, len(rows))
 	for _, row := range rows {
 		srcSet[row.Path] = true
@@ -867,7 +622,7 @@ func (r *Repo) MovePath(src, dst string) error {
 		if srcSet[drow.Path] {
 			continue // 与 src 重叠的行（src 自身或其子树内容已由 upsert 处理）
 		}
-		if err := txn.DeleteFile(drow.Path); err != nil {
+		if err := r.meta.DeleteFile(drow.Path); err != nil {
 			return err
 		}
 	}
@@ -878,22 +633,18 @@ func (r *Repo) MovePath(src, dst string) error {
 		} else {
 			newPath = dst + row.Path[len(src):]
 		}
-		chunks, err := r.meta.GetFileChunks(txn.SnapshotID(), row.Path)
+		chunks, err := r.meta.GetFileChunks(row.Path)
 		if err != nil {
 			return err
 		}
 		newRow := row
 		newRow.Path = newPath
-		if err := txn.UpsertFile(newRow, chunks); err != nil {
+		if err := r.UpsertFile(newRow, chunks); err != nil {
 			return err
 		}
-		if err := txn.DeleteFile(row.Path); err != nil {
+		if err := r.meta.DeleteFile(row.Path); err != nil {
 			return err
 		}
 	}
-	if _, err := txn.Commit(); err != nil {
-		return err
-	}
-	committed = true
 	return nil
 }

@@ -3,9 +3,9 @@ package repo
 
 import (
 	"bytes"
-	"fmt"
 	"crypto/md5"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -17,7 +17,6 @@ import (
 	"crysync/internal/backend"
 	"crysync/internal/core/crypto"
 	"crysync/internal/core/meta"
-	"crysync/internal/core/prune"
 )
 
 func newTestRepo(t *testing.T) (*Repo, *backend.InMemory) {
@@ -32,29 +31,29 @@ func newTestRepo(t *testing.T) (*Repo, *backend.InMemory) {
 	return New(db, be, key, 64), be
 }
 
-// TestListDir：快照中 path 的直接子项（非递归，不含自身）；path 为空 = 模块根。
+// TestListDir：当前清单中 path 的直接子项（非递归，不含自身）；path 为空 = 模块根。
 func TestListDir(t *testing.T) {
 	r, _ := newTestRepo(t)
-	txn, _ := r.BeginSnapshot(time.Now())
-	txn.UpsertFile(meta.FileRow{Path: "sub", IsDir: true, Mode: 0o40755}, nil)
-	txn.UpsertFile(meta.FileRow{Path: "sub/a.txt", Mode: 0o644, Size: 1}, nil)
-	txn.UpsertFile(meta.FileRow{Path: "sub/deep/b.txt", Mode: 0o644, Size: 2}, nil)
-	txn.UpsertFile(meta.FileRow{Path: "sub/deep", IsDir: true, Mode: 0o40755}, nil)
-	txn.UpsertFile(meta.FileRow{Path: "root.txt", Mode: 0o644, Size: 3}, nil)
-	sid, _ := txn.Commit()
+	unlock := r.WriteSessionLock()
+	r.UpsertFile(meta.FileRow{Path: "sub", IsDir: true, Mode: 0o40755}, nil)
+	r.UpsertFile(meta.FileRow{Path: "sub/a.txt", Mode: 0o644, Size: 1}, nil)
+	r.UpsertFile(meta.FileRow{Path: "sub/deep/b.txt", Mode: 0o644, Size: 2}, nil)
+	r.UpsertFile(meta.FileRow{Path: "sub/deep", IsDir: true, Mode: 0o40755}, nil)
+	r.UpsertFile(meta.FileRow{Path: "root.txt", Mode: 0o644, Size: 3}, nil)
+	unlock()
 
 	// 模块根：直接子项（不含子孙）
-	rows, err := r.ListDir(sid, "")
+	rows, err := r.ListDir("")
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("根子项应为 sub/root.txt, got %+v, %v", rows, err)
 	}
 	// 目录 sub：直接子项
-	rows, err = r.ListDir(sid, "sub")
+	rows, err = r.ListDir("sub")
 	if err != nil || len(rows) != 2 {
 		t.Fatalf("sub 子项应为 a.txt/deep, got %+v, %v", rows, err)
 	}
 	// 文件路径：返回空
-	rows, err = r.ListDir(sid, "root.txt")
+	rows, err = r.ListDir("root.txt")
 	if err != nil || len(rows) != 0 {
 		t.Fatalf("文件路径子项应为空, got %+v, %v", rows, err)
 	}
@@ -69,7 +68,7 @@ func TestOpenFileSeek(t *testing.T) {
 	for i := range big {
 		big[i] = byte(i % 251)
 	}
-	txn, _ := r.BeginSnapshot(time.Now())
+	unlock := r.WriteSessionLock()
 	var refs []meta.ChunkRef
 	for off := 0; off < len(big); off += cs {
 		end := off + cs
@@ -82,10 +81,10 @@ func TestOpenFileSeek(t *testing.T) {
 		}
 		refs = append(refs, meta.ChunkRef{ChunkID: id, IDX: len(refs)})
 	}
-	txn.UpsertFile(meta.FileRow{Path: "big.bin", Mode: 0o644, Size: int64(len(big))}, refs)
-	sid, _ := txn.Commit()
+	r.UpsertFile(meta.FileRow{Path: "big.bin", Mode: 0o644, Size: int64(len(big))}, refs)
+	unlock()
 
-	fr, row, err := r.OpenFile(sid, "big.bin")
+	fr, row, err := r.OpenFile("big.bin")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +124,7 @@ func TestOpenFileSeek(t *testing.T) {
 		t.Fatal("全量读不符")
 	}
 	// 不存在文件报错
-	if _, _, err := r.OpenFile(sid, "nonexistent"); err == nil {
+	if _, _, err := r.OpenFile("nonexistent"); err == nil {
 		t.Fatal("不存在文件应报错")
 	}
 }
@@ -196,96 +195,51 @@ func TestStoreChunkPersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-var _ = os.Getenv // 避免误删依赖告警
-
-func TestSnapshotTxnCommit(t *testing.T) {
+// TestUpsertInPlace：同路径连续原地 upsert + 删除，单一状态收敛、refcount 闭环。
+func TestUpsertInPlace(t *testing.T) {
 	r, be := newTestRepo(t)
-	// 第一次快照：写入 2 个文件
-	txn, err := r.BeginSnapshot(time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
+	unlock := r.WriteSessionLock()
+	defer unlock()
+	// 写入 2 个文件
 	data := []byte("file-one-content")
 	c1, _, _ := r.StoreChunk(data)
-	if err := txn.UpsertFile(meta.FileRow{Path: "one.txt", Mode: 0o644, Size: int64(len(data))}, []meta.ChunkRef{{ChunkID: c1, IDX: 0}}); err != nil {
+	if err := r.UpsertFile(meta.FileRow{Path: "one.txt", Mode: 0o644, Size: int64(len(data))}, []meta.ChunkRef{{ChunkID: c1, IDX: 0}}); err != nil {
 		t.Fatal(err)
 	}
 	c2, _, _ := r.StoreChunk([]byte("file-two-content"))
-	if err := txn.UpsertFile(meta.FileRow{Path: "two.txt", Mode: 0o644, Size: 16}, []meta.ChunkRef{{ChunkID: c2, IDX: 0}}); err != nil {
+	if err := r.UpsertFile(meta.FileRow{Path: "two.txt", Mode: 0o644, Size: 16}, []meta.ChunkRef{{ChunkID: c2, IDX: 0}}); err != nil {
 		t.Fatal(err)
 	}
-	s1, err := txn.Commit()
-	if err != nil || s1 == 0 {
-		t.Fatalf("Commit: %v %d", err, s1)
-	}
-
-	// 第二次快照：复制 + 删 one.txt + 改 two.txt
-	txn2, err := r.BeginSnapshot(time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := txn2.DeleteFile("one.txt"); err != nil {
+	// 删除 one.txt + 覆盖 two.txt
+	if err := r.DeleteFile("one.txt"); err != nil {
 		t.Fatal(err)
 	}
 	c3, _, _ := r.StoreChunk([]byte("file-two-updated"))
-	if err := txn2.UpsertFile(meta.FileRow{Path: "two.txt", Mode: 0o600, Size: 16}, []meta.ChunkRef{{ChunkID: c3, IDX: 0}}); err != nil {
+	if err := r.UpsertFile(meta.FileRow{Path: "two.txt", Mode: 0o600, Size: 16}, []meta.ChunkRef{{ChunkID: c3, IDX: 0}}); err != nil {
 		t.Fatal(err)
 	}
-	s2, err := txn2.Commit()
-	if err != nil || s2 == s1 {
-		t.Fatalf("第二次 Commit: %v %d", err, s2)
-	}
 
-	// 验证快照 1：两个文件都在且内容可读
-	var buf bytes.Buffer
-	if err := r.ReadFile(s1, "one.txt", &buf); err != nil || buf.String() != "file-one-content" {
-		t.Fatalf("快照1 读取 one.txt: %v %q", err, buf.String())
-	}
-	// 验证快照 2：one.txt 删除、two.txt 更新
-	files, err := r.meta.GetFiles(s2)
+	files, err := r.meta.GetFiles()
 	if err != nil || len(files) != 1 || files[0].Path != "two.txt" {
-		t.Fatalf("快照2 文件清单: %v %v", files, err)
+		t.Fatalf("当前清单应只剩 two.txt: %v %v", files, err)
 	}
-	buf.Reset()
-	if err := r.ReadFile(s2, "two.txt", &buf); err != nil || buf.String() != "file-two-updated" {
-		t.Fatalf("快照2 读取 two.txt: %v %q", err, buf.String())
+	// one.txt 内容仍可经删除前快照读？——单一状态无历史：验证当前文件内容
+	var buf bytes.Buffer
+	if err := r.ReadFile("two.txt", &buf); err != nil || buf.String() != "file-two-updated" {
+		t.Fatalf("读取 two.txt: %v %q", err, buf.String())
 	}
-	// 去重验证：两快照 one.txt 引用同一 chunk
-	var refcount int
-	// 通过公开接口间接验证：快照1 和快照2 的 two.txt 大小不同 → chunk 不同；one.txt 只在快照1
-	_ = refcount
-	// 后端 blob 数量 = 3 个唯一内容
+	// 后端 blob = 3 个唯一内容；被删/被覆盖的 c1/c2 blob 成孤儿可回收
 	blobs, _ := be.List()
 	if len(blobs) != 3 {
-		t.Fatalf("后端应有 3 个唯一 blob: %v", blobs)
+		t.Fatalf("后端应有 3 个 blob: %v", blobs)
 	}
-}
-
-func TestSnapshotTxnRollback(t *testing.T) {
-	r, _ := newTestRepo(t)
-	txn, err := r.BeginSnapshot(time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := txn.UpsertFile(meta.FileRow{Path: "x.txt", Mode: 0o644}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := txn.Rollback(); err != nil {
-		t.Fatal(err)
-	}
-	// 回滚后应无快照
-	id, err := r.LatestSnapshotID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if id != 0 {
-		t.Fatalf("回滚后不应有快照: %d", id)
+	if n, err := r.GC(); err != nil || n != 2 {
+		t.Fatalf("GC 应回收被覆盖/删除的 2 个 blob: %d %v", n, err)
 	}
 }
 
 func TestReadFileMultiChunk(t *testing.T) {
 	r, _ := newTestRepo(t)
-	txn, _ := r.BeginSnapshot(time.Now())
 	// 超过 chunkSize(64) 的内容 → 2 块
 	big := bytes.Repeat([]byte{0x5A}, 100)
 	var refs []meta.ChunkRef
@@ -301,11 +255,12 @@ func TestReadFileMultiChunk(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	txn.UpsertFile(meta.FileRow{Path: "big.bin", Mode: 0o644, Size: int64(len(big))}, refs)
-	sid, _ := txn.Commit()
+	unlock := r.WriteSessionLock()
+	r.UpsertFile(meta.FileRow{Path: "big.bin", Mode: 0o644, Size: int64(len(big))}, refs)
+	unlock()
 
 	var buf bytes.Buffer
-	if err := r.ReadFile(sid, "big.bin", &buf); err != nil {
+	if err := r.ReadFile("big.bin", &buf); err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(buf.Bytes(), big) {
@@ -315,25 +270,23 @@ func TestReadFileMultiChunk(t *testing.T) {
 
 func TestReadFileMissing(t *testing.T) {
 	r, _ := newTestRepo(t)
-	if err := r.ReadFile(1, "nope.txt", &bytes.Buffer{}); err == nil {
+	if err := r.ReadFile("nope.txt", &bytes.Buffer{}); err == nil {
 		t.Fatal("读取不存在的文件应报错")
 	}
 }
 
-// 造一个含 3 个文件 1 个子目录的快照（供过滤/校验和测试复用）。
-func seedSnapshot(t *testing.T, r *Repo) int64 {
+// seedState 造一个含 3 个文件 2 层子目录的当前清单（供过滤/校验和测试复用）。
+func seedState(t *testing.T, r *Repo) {
 	t.Helper()
-	txn, err := r.BeginSnapshot(time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
+	unlock := r.WriteSessionLock()
+	defer unlock()
 	add := func(path string, data []byte, mode uint32) {
 		t.Helper()
 		c, _, err := r.StoreChunk(data)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := txn.UpsertFile(meta.FileRow{Path: path, Mode: mode, Size: int64(len(data))},
+		if err := r.UpsertFile(meta.FileRow{Path: path, Mode: mode, Size: int64(len(data))},
 			[]meta.ChunkRef{{ChunkID: c, IDX: 0}}); err != nil {
 			t.Fatal(err)
 		}
@@ -341,29 +294,24 @@ func seedSnapshot(t *testing.T, r *Repo) int64 {
 	add("top.txt", []byte("top content"), 0o644)
 	add("sub/inner.txt", []byte("inner content"), 0o644)
 	add("sub/deep/deep.txt", []byte("deep content"), 0o600)
-	if err := txn.UpsertFile(meta.FileRow{Path: "sub", IsDir: true, Mode: 0o40755}, nil); err != nil {
+	if err := r.UpsertFile(meta.FileRow{Path: "sub", IsDir: true, Mode: 0o40755}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := txn.UpsertFile(meta.FileRow{Path: "sub/deep", IsDir: true, Mode: 0o40755}, nil); err != nil {
+	if err := r.UpsertFile(meta.FileRow{Path: "sub/deep", IsDir: true, Mode: 0o40755}, nil); err != nil {
 		t.Fatal(err)
 	}
-	sid, err := txn.Commit()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return sid
 }
 
-func TestSnapshotFileRowsFilter(t *testing.T) {
+func TestFileRowsFilter(t *testing.T) {
 	r, _ := newTestRepo(t)
-	sid := seedSnapshot(t, r)
+	seedState(t, r)
 
-	all, err := r.SnapshotFileRows(sid, "")
+	all, err := r.FileRows("")
 	if err != nil || len(all) != 5 {
 		t.Fatalf("空前缀应返回全部: %d %v", len(all), err)
 	}
 	// 子目录前缀：自身 + 子树
-	sub, err := r.SnapshotFileRows(sid, "sub")
+	sub, err := r.FileRows("sub")
 	if err != nil || len(sub) != 4 {
 		t.Fatalf("子目录前缀应返回 4 条: %d %v", len(sub), err)
 	}
@@ -373,27 +321,27 @@ func TestSnapshotFileRowsFilter(t *testing.T) {
 		}
 	}
 	// 单文件
-	one, err := r.SnapshotFileRows(sid, "top.txt")
+	one, err := r.FileRows("top.txt")
 	if err != nil || len(one) != 1 || one[0].Path != "top.txt" {
 		t.Fatalf("单文件过滤: %v %v", one, err)
 	}
 }
 
-// 前缀歧义断言独立于 seedSnapshot 的数据，直接在过滤结果上验证。
-func TestSnapshotFileRowsAmbiguousPrefix(t *testing.T) {
+// 前缀歧义断言独立于 seedState 的数据，直接在过滤结果上验证。
+func TestFileRowsAmbiguousPrefix(t *testing.T) {
 	r, _ := newTestRepo(t)
-	txn, _ := r.BeginSnapshot(time.Now())
+	unlock := r.WriteSessionLock()
 	add := func(path string, data []byte) {
 		c, _, _ := r.StoreChunk(data)
-		txn.UpsertFile(meta.FileRow{Path: path, Mode: 0o644, Size: int64(len(data))},
+		r.UpsertFile(meta.FileRow{Path: path, Mode: 0o644, Size: int64(len(data))},
 			[]meta.ChunkRef{{ChunkID: c, IDX: 0}})
 	}
 	add("x", []byte("x"))
 	add("x/y", []byte("y"))
 	add("x2", []byte("x2"))
-	sid, _ := txn.Commit()
+	unlock()
 
-	got, err := r.SnapshotFileRows(sid, "x")
+	got, err := r.FileRows("x")
 	if err != nil || len(got) != 2 {
 		t.Fatalf("前缀 x 应匹配 x 与 x/y 而非 x2: %d %v", len(got), err)
 	}
@@ -406,12 +354,12 @@ func TestSnapshotFileRowsAmbiguousPrefix(t *testing.T) {
 
 func TestStreamFileChecksum(t *testing.T) {
 	r, _ := newTestRepo(t)
-	sid := seedSnapshot(t, r)
+	seedState(t, r)
 
 	content := []byte("top content")
 	// 校验和 = 纯 MD5(content)（sum_end 的 CSUM_MD5 分支；seed 参数对 MD5 无效）
 	var buf bytes.Buffer
-	n, sum, err := r.StreamFile(sid, "top.txt", 0, &buf)
+	n, sum, err := r.StreamFile("top.txt", 0, &buf)
 	if err != nil || n != int64(len(content)) {
 		t.Fatalf("StreamFile: %v %d", err, n)
 	}
@@ -420,7 +368,7 @@ func TestStreamFileChecksum(t *testing.T) {
 		t.Fatalf("校验和: got %x want %x", sum, want)
 	}
 	buf.Reset()
-	_, sum, err = r.StreamFile(sid, "top.txt", 42, &buf)
+	_, sum, err = r.StreamFile("top.txt", 42, &buf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -429,6 +377,7 @@ func TestStreamFileChecksum(t *testing.T) {
 	}
 	// 大文件跨块 + 空文件
 	big := bytes.Repeat([]byte{0xAB}, 150)
+	unlock := r.WriteSessionLock()
 	addFile := func(path string, data []byte) {
 		var refs []meta.ChunkRef
 		idx := 0
@@ -441,13 +390,11 @@ func TestStreamFileChecksum(t *testing.T) {
 			idx++
 			return nil
 		})
-		txn, _ := r.BeginSnapshot(time.Now())
-		txn.UpsertFile(meta.FileRow{Path: path, Mode: 0o644, Size: int64(len(data))}, refs)
-		txn.Commit()
+		r.UpsertFile(meta.FileRow{Path: path, Mode: 0o644, Size: int64(len(data))}, refs)
 	}
 	addFile("big.bin", big)
 	addFile("empty.txt", nil)
-	sid2, _ := r.LatestSnapshotID()
+	unlock()
 	for _, tc := range []struct {
 		path string
 		want []byte
@@ -456,7 +403,7 @@ func TestStreamFileChecksum(t *testing.T) {
 		{"empty.txt", nil},
 	} {
 		buf.Reset()
-		n, _, err := r.StreamFile(sid2, tc.path, 7, &buf)
+		n, _, err := r.StreamFile(tc.path, 7, &buf)
 		if err != nil {
 			t.Fatalf("StreamFile(%s): %v", tc.path, err)
 		}
@@ -466,43 +413,21 @@ func TestStreamFileChecksum(t *testing.T) {
 	}
 }
 
-func TestActiveSnapshotID(t *testing.T) {
-	r, _ := newTestRepo(t)
-	s1 := seedSnapshot(t, r)
-	// 未设置 → 默认最新
-	id, err := r.ActiveSnapshotID()
-	if err != nil || id != s1 {
-		t.Fatalf("默认活跃快照应是最新: %d %v", id, err)
-	}
-	// 手动设置（CLI 语义）
-	if err := r.SetActiveSnapshot(s1); err != nil {
-		t.Fatal(err)
-	}
-	seedSnapshot(t, r) // 新建快照，活跃快照应保持
-	id, err = r.ActiveSnapshotID()
-	if err != nil || id != s1 {
-		t.Fatalf("活跃快照应保持手动设置值: %d %v", id, err)
-	}
-}
-
 func TestGC(t *testing.T) {
 	r, be := newTestRepo(t)
-	// 正常快照 + 孤儿模拟：
-	// 1) 引用中的 blob（正常备份）
-	// 2) StoreChunk 后 Rollback 的 blob（中断会话残留 = 孤儿）
+	// 正常状态 + 孤儿模拟：
+	// 1) 引用中的 blob（正常落库）
+	// 2) StoreChunk 后未 attach 的 chunk 行（失败会话残留：行+blob 都应回收）
 	// 3) 直接写入后端的 blob（无任何元数据 = 孤儿）
-	sid := seedSnapshot(t, r)
+	seedState(t, r)
 	blobs1, _ := be.List()
 	if len(blobs1) != 3 {
-		t.Fatalf("seedSnapshot 应有 3 个 blob: %v", blobs1)
+		t.Fatalf("seedState 应有 3 个 blob: %v", blobs1)
 	}
 
-	txn, _ := r.BeginSnapshot(time.Now())
-	c, _, _ := r.StoreChunk([]byte("orphan from rollback"))
-	txn.UpsertFile(meta.FileRow{Path: "x.txt", Mode: 0o644, Size: 19}, []meta.ChunkRef{{ChunkID: c, IDX: 0}})
-	if err := txn.Rollback(); err != nil {
-		t.Fatal(err)
-	}
+	// 失败残留：chunk 行已建（refcount=0）但从未 attach 到文件——v0.5 GC
+	// 必须把这类行连同 blob 一起回收（若以 chunks 表为引用判定会永久泄漏）
+	c, _, _ := r.StoreChunk([]byte("orphan from failed session"))
 	_ = c
 	orphanName := "ff" + strings.Repeat("0", 62) // 64 hex 伪 blob 名
 	if err := be.Put(orphanName, []byte("direct orphan")); err != nil {
@@ -516,13 +441,18 @@ func TestGC(t *testing.T) {
 	if deleted != 2 {
 		t.Fatalf("应删除 2 个孤儿 blob，实际 %d", deleted)
 	}
+	// 残留 chunk 行也应被清掉
+	var n int
+	if err := r.meta.QueryRow(`SELECT COUNT(*) FROM chunks`).Scan(&n); err != nil || n != 3 {
+		t.Fatalf("残留 chunk 行应被清除，剩 3 个: %d %v", n, err)
+	}
 	blobs, _ := be.List()
 	if len(blobs) != 3 {
 		t.Fatalf("GC 后应剩 3 个被引用 blob: %v", blobs)
 	}
-	// 快照仍可读（被引用 blob 未误删）
+	// 清单仍可读（被引用 blob 未误删）
 	var buf bytes.Buffer
-	if err := r.ReadFile(sid, "top.txt", &buf); err != nil || buf.String() != "top content" {
+	if err := r.ReadFile("top.txt", &buf); err != nil || buf.String() != "top content" {
 		t.Fatalf("GC 后读取失败: %v %q", err, buf.String())
 	}
 	// 再次 GC 无操作
@@ -531,18 +461,17 @@ func TestGC(t *testing.T) {
 	}
 }
 
-// TestUpsertRefcount：覆盖写入同一路径时旧 chunk 引用递减、新 chunk 引用递增。
+// TestUpsertRefcount：覆盖写入同一路径时旧 chunk 引用递减、新 chunk 引用递增
+// （chunk 行在 upsert 事务内随引用归零删除，blob 成孤儿）。
 func TestUpsertRefcount(t *testing.T) {
 	r, be := newTestRepo(t)
-	txn, _ := r.BeginSnapshot(time.Now())
+	unlock := r.WriteSessionLock()
 	c1, _, _ := r.StoreChunk([]byte("version one"))
-	txn.UpsertFile(meta.FileRow{Path: "v.txt", Mode: 0o644, Size: 11}, []meta.ChunkRef{{ChunkID: c1, IDX: 0}})
+	r.UpsertFile(meta.FileRow{Path: "v.txt", Mode: 0o644, Size: 11}, []meta.ChunkRef{{ChunkID: c1, IDX: 0}})
 	c2, _, _ := r.StoreChunk([]byte("version two longer"))
-	txn.UpsertFile(meta.FileRow{Path: "v.txt", Mode: 0o644, Size: 18}, []meta.ChunkRef{{ChunkID: c2, IDX: 0}})
-	if _, err := txn.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	// c1 的引用被覆盖移除 -> refcount 归零 -> chunk 行删除 -> blob 成孤儿
+	r.UpsertFile(meta.FileRow{Path: "v.txt", Mode: 0o644, Size: 18}, []meta.ChunkRef{{ChunkID: c2, IDX: 0}})
+	unlock()
+	// c1 的引用被覆盖移除 -> chunk 行已删 -> blob 成孤儿
 	n, err := r.GC()
 	if err != nil || n != 1 {
 		t.Fatalf("GC 应回收被覆盖的旧 blob: %d %v", n, err)
@@ -552,172 +481,8 @@ func TestUpsertRefcount(t *testing.T) {
 		t.Fatalf("后端应只剩新 blob: %v", blobs)
 	}
 	var buf bytes.Buffer
-	if err := r.ReadFile(mustLatest(t, r), "v.txt", &buf); err != nil || buf.String() != "version two longer" {
+	if err := r.ReadFile("v.txt", &buf); err != nil || buf.String() != "version two longer" {
 		t.Fatalf("覆盖后读取失败: %v %q", err, buf.String())
-	}
-}
-
-func mustLatest(t *testing.T, r *Repo) int64 {
-	t.Helper()
-	id, err := r.LatestSnapshotID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return id
-}
-
-// TestPrune：多快照按策略删除 + blob 回收 + 保留快照可读。
-func TestPrune(t *testing.T) {
-	r, be := newTestRepo(t)
-	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.Local)
-	contents := []string{"snap one", "snap two", "snap three"}
-	for i, data := range contents {
-		txn, err := r.BeginSnapshot(base.Add(time.Duration(i) * time.Hour))
-		if err != nil {
-			t.Fatal(err)
-		}
-		c, _, _ := r.StoreChunk([]byte(data))
-		if err := txn.UpsertFile(meta.FileRow{Path: "f.txt", Mode: 0o644, Size: int64(len(data))},
-			[]meta.ChunkRef{{ChunkID: c, IDX: 0}}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := txn.Commit(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if blobs, _ := be.List(); len(blobs) != 3 {
-		t.Fatalf("应有 3 个 blob: %v", blobs)
-	}
-
-	// keep_last=1：删除前 2 个快照，回收其 blob
-	removed, blobs, err := r.Prune(prune.Policy{KeepLast: 1})
-	if err != nil {
-		t.Fatalf("Prune: %v", err)
-	}
-	if removed != 2 || blobs != 2 {
-		t.Fatalf("应删 2 快照 2 blob: %d %d", removed, blobs)
-	}
-	sid, _ := r.LatestSnapshotID()
-	var buf bytes.Buffer
-	if err := r.ReadFile(sid, "f.txt", &buf); err != nil || buf.String() != "snap three" {
-		t.Fatalf("保留快照读取失败: %v %q", err, buf.String())
-	}
-	// 旧快照不可读
-	if err := r.ReadFile(sid-2, "f.txt", &buf); err == nil {
-		t.Fatal("被删除的快照不应可读")
-	}
-	if blobs, _ := be.List(); len(blobs) != 1 {
-		t.Fatalf("后端应只剩 1 个 blob: %v", blobs)
-	}
-	// 无策略 prune：不删除
-	if removed, _, err := r.Prune(prune.Policy{}); err != nil || removed != 0 {
-		t.Fatalf("无策略不应删除: %d %v", removed, err)
-	}
-}
-
-// TestTrimAfterCommit：快照提交后的收尾裁剪（receiver 与 WebDAV 写共用）。
-func TestTrimAfterCommit(t *testing.T) {
-	r, _ := newTestRepo(t)
-	// 三次提交产生 3 个快照
-	for i := 0; i < 3; i++ {
-		txn, err := r.BeginSnapshot(time.Now())
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := txn.Commit(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	latest, err := r.LatestSnapshotID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// keepHistory=true：不裁剪
-	if _, _, err := r.TrimAfterCommit(latest, true); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := r.SnapshotCountForTest(); err != nil || n != 3 {
-		t.Fatalf("多版本模式应保留 3 个快照, got %d, %v", n, err)
-	}
-	// keepHistory=false：收敛到 1
-	if _, _, err := r.TrimAfterCommit(latest, false); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := r.SnapshotCountForTest(); err != nil || n != 1 {
-		t.Fatalf("单份模式应保留 1 个快照, got %d, %v", n, err)
-	}
-}
-
-// TestKeepOnlySnapshot：单份模式收尾。三个内容各异的快照 + 一个纯复制
-// （无变化）快照：裁剪删旧快照、回收独占 blob、共享 chunk 保留；随后再来
-// 一个无变化快照时裁剪不产生孤儿 chunk，跳过 GC（后端零访问）。
-func TestKeepOnlySnapshot(t *testing.T) {
-	r, be := newTestRepo(t)
-	base := time.Date(2026, 8, 1, 0, 0, 0, 0, time.Local)
-	contents := []string{"snap one", "snap two", "snap three"}
-	for i, data := range contents {
-		txn, err := r.BeginSnapshot(base.Add(time.Duration(i) * time.Hour))
-		if err != nil {
-			t.Fatal(err)
-		}
-		c, _, _ := r.StoreChunk([]byte(data))
-		if err := txn.UpsertFile(meta.FileRow{Path: "f.txt", Mode: 0o644, Size: int64(len(data))},
-			[]meta.ChunkRef{{ChunkID: c, IDX: 0}}); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := txn.Commit(); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// 快照 4：纯无变化会话（复制快照 3 清单，共享其 chunk）
-	txn4, err := r.BeginSnapshot(base.Add(3 * time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	s4, err := txn4.Commit()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	removed, blobs, err := r.KeepOnlySnapshot(s4)
-	if err != nil {
-		t.Fatalf("KeepOnlySnapshot: %v", err)
-	}
-	// 删除 3 个旧快照；snap one/two 的 chunk 归零回收（2 blob），
-	// snap three 的 chunk 被快照 4 共享保留（GC 不动其 blob）
-	if removed != 3 || blobs != 2 {
-		t.Fatalf("应删 3 快照 2 blob: %d %d", removed, blobs)
-	}
-	var buf bytes.Buffer
-	if err := r.ReadFile(s4, "f.txt", &buf); err != nil || buf.String() != "snap three" {
-		t.Fatalf("保留快照读取失败: %v %q", err, buf.String())
-	}
-	if got, _ := be.List(); len(got) != 1 {
-		t.Fatalf("后端应只剩 1 个 blob: %v", got)
-	}
-	infos, _ := r.meta.SnapshotList()
-	if len(infos) != 1 || infos[0].ID != s4 {
-		t.Fatalf("应只剩快照 %d: %+v", s4, infos)
-	}
-
-	// 再来一个无变化快照：裁剪不删 chunk 行（共享），不触发 GC、后端无变化
-	txn5, err := r.BeginSnapshot(base.Add(4 * time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	s5, err := txn5.Commit()
-	if err != nil {
-		t.Fatal(err)
-	}
-	removed, blobs, err = r.KeepOnlySnapshot(s5)
-	if err != nil {
-		t.Fatalf("KeepOnlySnapshot 无变化: %v", err)
-	}
-	if removed != 1 || blobs != 0 {
-		t.Fatalf("无变化会话应删 1 快照 0 blob（跳过 GC）: %d %d", removed, blobs)
-	}
-	if got, _ := be.List(); len(got) != 1 {
-		t.Fatalf("后端 blob 不应变化: %v", got)
 	}
 }
 
@@ -725,34 +490,26 @@ func TestKeepOnlySnapshot(t *testing.T) {
 func TestGetFileRow(t *testing.T) {
 	r, _ := newTestRepo(t)
 	now := time.Unix(1700000000, 0).UTC()
-	txn, err := r.BeginSnapshot(now)
-	if err != nil {
-		t.Fatal(err)
-	}
+	unlock := r.WriteSessionLock()
 	want := meta.FileRow{Path: "a.txt", Mode: 0o644, Size: 5, MTimeNs: now.UnixNano()}
-	if err := txn.UpsertFile(want, nil); err != nil {
+	if err := r.UpsertFile(want, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := txn.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	sid, err := r.LatestSnapshotID()
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, ok, err := r.GetFileRow(sid, "a.txt")
+	unlock()
+	got, ok, err := r.GetFileRow("a.txt")
 	if err != nil || !ok {
 		t.Fatalf("GetFileRow: ok=%v err=%v", ok, err)
 	}
 	if got.Size != 5 || got.MTimeNs != want.MTimeNs || got.Path != "a.txt" {
 		t.Fatalf("字段不一致: %+v", got)
 	}
-	if _, ok, err := r.GetFileRow(sid, "nope.txt"); err != nil || ok {
+	if _, ok, err := r.GetFileRow("nope.txt"); err != nil || ok {
 		t.Fatalf("不存在路径: ok=%v err=%v", ok, err)
 	}
 }
 
-// TestPutFileAndFriends：写即快照方法族（PutFile/Mkcol/DeletePath/MovePath）。
+// TestPutFileAndFriends：写方法族（PutFile/Mkcol/DeletePath/MovePath），
+// v0.5 原地语义——每次写直接更新当前清单。
 func TestPutFileAndFriends(t *testing.T) {
 	r, _ := newTestRepo(t)
 	now := time.Now().UnixNano()
@@ -761,8 +518,7 @@ func TestPutFileAndFriends(t *testing.T) {
 	if err := r.PutFile("a.txt", 0o644, now, strings.NewReader("hello")); err != nil {
 		t.Fatal(err)
 	}
-	sid, _ := r.LatestSnapshotID()
-	row, ok, err := r.GetFileRow(sid, "a.txt")
+	row, ok, err := r.GetFileRow("a.txt")
 	if err != nil || !ok {
 		t.Fatalf("a.txt 应存在: %v, %v", ok, err)
 	}
@@ -792,11 +548,10 @@ func TestPutFileAndFriends(t *testing.T) {
 	if err := r.MovePath("a.txt", "a2.txt"); err != nil {
 		t.Fatal(err)
 	}
-	sid, _ = r.LatestSnapshotID()
-	if _, ok, _ := r.GetFileRow(sid, "a.txt"); ok {
+	if _, ok, _ := r.GetFileRow("a.txt"); ok {
 		t.Fatal("移动后源应不存在")
 	}
-	fr, _, err := r.OpenFile(sid, "a2.txt")
+	fr, _, err := r.OpenFile("a2.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -810,19 +565,17 @@ func TestPutFileAndFriends(t *testing.T) {
 	if err := r.DeletePath("a2.txt"); err != nil {
 		t.Fatal(err)
 	}
-	sid, _ = r.LatestSnapshotID()
-	if _, ok, _ := r.GetFileRow(sid, "a2.txt"); ok {
+	if _, ok, _ := r.GetFileRow("a2.txt"); ok {
 		t.Fatal("删除后应不存在")
 	}
 	// DeletePath 目录（递归含 b.txt）
 	if err := r.DeletePath("sub"); err != nil {
 		t.Fatal(err)
 	}
-	sid, _ = r.LatestSnapshotID()
-	if _, ok, _ := r.GetFileRow(sid, "sub"); ok {
+	if _, ok, _ := r.GetFileRow("sub"); ok {
 		t.Fatal("删除后 sub 应不存在")
 	}
-	if _, ok, _ := r.GetFileRow(sid, "sub/b.txt"); ok {
+	if _, ok, _ := r.GetFileRow("sub/b.txt"); ok {
 		t.Fatal("删除后 sub/b.txt 应不存在")
 	}
 	// DeletePath 不存在幂等成功（同 Mkcol 理由，绿联 restic fork 对 DELETE
@@ -832,46 +585,36 @@ func TestPutFileAndFriends(t *testing.T) {
 	}
 }
 
-// TestMkcolDeleteIdempotent 幂等请求不产生新快照：重复 MKCOL 已存在目录、
-// DELETE 不存在路径，快照数保持不变（若每次幂等请求都建快照，单份模式
-// trim 会制造持续写放大，多快照模式会无限膨胀）。
+// TestMkcolDeleteIdempotent：幂等请求（重复 MKCOL 已存在目录、DELETE 不存在
+// 路径）不产生任何写——清单行数与内容不变（绿联 restic fork 对 405/404 敏感，
+// 幂等返回 nil 且不触碰后端）。
 func TestMkcolDeleteIdempotent(t *testing.T) {
-	r, _ := newTestRepo(t)
+	r, be := newTestRepo(t)
 	if err := r.Mkcol("data"); err != nil {
 		t.Fatal(err)
 	}
 	if err := r.PutFile("data/a.txt", 0o644, time.Now().UnixNano(), strings.NewReader("x")); err != nil {
 		t.Fatal(err)
 	}
-	before := snapCount(t, r)
+	before, _ := be.List()
 
-	// 幂等 MKCOL（目录已存在）与幂等 DELETE（不存在）都不应建快照
+	// 幂等 MKCOL（目录已存在）与幂等 DELETE（不存在）都不应写
 	if err := r.Mkcol("data"); err != nil {
 		t.Fatalf("重复 Mkcol 应幂等成功, got %v", err)
 	}
 	if err := r.DeletePath("nope"); err != nil {
 		t.Fatalf("删除不存在应幂等成功, got %v", err)
 	}
-	if got := snapCount(t, r); got != before {
-		t.Fatalf("幂等请求不应产生快照: before=%d after=%d", before, got)
+	if got, _ := be.List(); len(got) != len(before) {
+		t.Fatalf("幂等请求不应产生 blob: before=%d after=%d", len(before), len(got))
 	}
 	// 清单未受幂等请求影响
-	sid := mustLatest(t, r)
-	if _, ok, _ := r.GetFileRow(sid, "data"); !ok {
+	if _, ok, _ := r.GetFileRow("data"); !ok {
 		t.Fatal("幂等请求后 data 应仍在")
 	}
-	if _, ok, _ := r.GetFileRow(sid, "data/a.txt"); !ok {
+	if _, ok, _ := r.GetFileRow("data/a.txt"); !ok {
 		t.Fatal("幂等请求后 data/a.txt 应仍在")
 	}
-}
-
-func snapCount(t *testing.T, r *Repo) int {
-	t.Helper()
-	snaps, err := r.SnapshotList()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return len(snaps)
 }
 
 // TestPutFileChunkDedup：相同内容两次 PUT 复用 chunk（后端 blob 数不变）。
@@ -889,7 +632,7 @@ func TestPutFileChunkDedup(t *testing.T) {
 		t.Fatalf("去重后应只有 1 个 blob, got %d, %v", len(blobs), err)
 	}
 	for _, p := range []string{"one.txt", "two.txt"} {
-		fr, _, err := r.OpenFile(mustLatest(t, r), p)
+		fr, _, err := r.OpenFile(p)
 		if err != nil {
 			t.Fatalf("打开 %s: %v", p, err)
 		}
@@ -932,9 +675,9 @@ func TestPutFileFailureCleanup(t *testing.T) {
 	if err := r.PutFile("half.bin", 0o644, now, src); err == nil {
 		t.Fatal("PutFile 应返回错误")
 	}
-	// 1) 回滚后不应有新快照（仓库空）
-	if id, err := r.LatestSnapshotID(); err != nil || id != 0 {
-		t.Fatalf("快照应已回滚: id=%d err=%v", id, err)
+	// 1) 失败不落库：files 表无行
+	if files, err := r.meta.GetFiles(); err != nil || len(files) != 0 {
+		t.Fatalf("失败后 files 表应为空: %v %v", files, err)
 	}
 	// 2) 新建的 chunk 行（refcount=0）必须清掉，不残留于 chunks 表
 	var n int
@@ -981,14 +724,13 @@ func TestMovePathOverwriteDir(t *testing.T) {
 	if err := r.MovePath("sub", "sub2"); err != nil {
 		t.Fatal(err)
 	}
-	sid := mustLatest(t, r)
 	// dst 原子文件（sub2/x.txt）应不存在——被覆盖删除
-	if _, ok, _ := r.GetFileRow(sid, "sub2/x.txt"); ok {
+	if _, ok, _ := r.GetFileRow("sub2/x.txt"); ok {
 		t.Fatal("覆盖后 dst 旧文件 sub2/x.txt 不应残留")
 	}
 	// src 内容就位：sub2/a.txt 与 sub2/deep.txt 迁移到位
 	for path, want := range map[string]string{"sub2/a.txt": "from-src", "sub2/deep.txt": "deep"} {
-		fr, _, err := r.OpenFile(sid, path)
+		fr, _, err := r.OpenFile(path)
 		if err != nil {
 			t.Fatalf("打开 %s: %v", path, err)
 		}
@@ -999,18 +741,18 @@ func TestMovePathOverwriteDir(t *testing.T) {
 		}
 	}
 	// src 子树在移动后消失
-	if _, ok, _ := r.GetFileRow(sid, "sub"); ok {
+	if _, ok, _ := r.GetFileRow("sub"); ok {
 		t.Fatal("src 源目录 sub 应已消失")
 	}
-	if _, ok, _ := r.GetFileRow(sid, "sub/a.txt"); ok {
+	if _, ok, _ := r.GetFileRow("sub/a.txt"); ok {
 		t.Fatal("src 源文件 sub/a.txt 应已消失")
 	}
 }
 
 func TestConcurrentPutFileNoLostWrite(t *testing.T) {
 	r, _ := newTestRepo(t)
-	// 并发 8 个不同路径的 PUT：写即快照事务串行化后，最终快照应 8 个全在。
-	//（无互斥时并发 BeginSnapshot 基于同一旧快照，后提交者覆盖前者--丢写。）
+	// 并发 8 个不同路径的 PUT：行更新段模块级短锁串行化后，8 个全在
+	//（blob 上传在锁外并发，行更新互斥——见 PutFile 两阶段设计）。
 	const n = 8
 	var wg sync.WaitGroup
 	errCh := make(chan error, n)
@@ -1029,11 +771,10 @@ func TestConcurrentPutFileNoLostWrite(t *testing.T) {
 	for err := range errCh {
 		t.Fatalf("并发 PUT 失败: %v", err)
 	}
-	sid := mustLatest(t, r)
 	for i := 0; i < n; i++ {
-		row, ok, err := r.GetFileRow(sid, fmt.Sprintf("f%d.txt", i))
+		row, ok, err := r.GetFileRow(fmt.Sprintf("f%d.txt", i))
 		if err != nil || !ok {
-			t.Fatalf("并发写丢失: f%d.txt 不在最终快照 (ok=%v err=%v)", i, ok, err)
+			t.Fatalf("并发写丢失: f%d.txt 不在最终清单 (ok=%v err=%v)", i, ok, err)
 		}
 		if row.Size != int64(len(fmt.Sprintf("content-%d", i))) {
 			t.Fatalf("f%d.txt size 不符: %d", i, row.Size)
@@ -1068,15 +809,14 @@ func TestConcurrentMkcolPut(t *testing.T) {
 	if putErr != nil && !errors.Is(putErr, os.ErrNotExist) {
 		t.Fatalf("PUT 失败须为可重试的 ErrNotExist, got %v", putErr)
 	}
-	// 模拟客户端重试：父目录已提交，重放必须成功
+	// 模拟客户端重试：父目录已落库，重放必须成功
 	if err := r.PutFile("data/blob", 0o644, time.Now().UnixNano(), strings.NewReader("blob")); err != nil {
 		t.Fatalf("重试 PUT 失败: %v", err)
 	}
-	sid := mustLatest(t, r)
-	if _, ok, _ := r.GetFileRow(sid, "data"); !ok {
+	if _, ok, _ := r.GetFileRow("data"); !ok {
 		t.Fatal("并发后 data 目录丢失")
 	}
-	if _, ok, _ := r.GetFileRow(sid, "data/blob"); !ok {
-		t.Fatal("重试后 data/blob 仍不在快照")
+	if _, ok, _ := r.GetFileRow("data/blob"); !ok {
+		t.Fatal("重试后 data/blob 仍不在清单")
 	}
 }

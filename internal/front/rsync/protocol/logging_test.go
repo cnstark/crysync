@@ -39,7 +39,7 @@ func startLoggedTestServer(t *testing.T) (int, *bytes.Buffer) {
 	t.Cleanup(func() { db.Close() })
 	key, _ := crypto.GenerateKey()
 	r := repo.New(db, backend.NewInMemory(), key, 64)
-	module := &config.ModuleConfig{Name: "home", Path: "/", Snapshot: true}
+	module := &config.ModuleConfig{Name: "home", Path: "/"}
 	cfg := &config.Config{Front: config.FrontConfig{Rsync: &config.RsyncFrontConfig{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}}}},
 		Modules: []config.ModuleConfig{*module}}
 
@@ -81,7 +81,7 @@ func startLoggedRouterServer(t *testing.T) (int, *repo.Repo, *bytes.Buffer) {
 	t.Cleanup(func() { db.Close() })
 	key, _ := crypto.GenerateKey()
 	r := repo.New(db, backend.NewInMemory(), key, 64)
-	module := &config.ModuleConfig{Name: "home", Path: "/", Snapshot: true}
+	module := &config.ModuleConfig{Name: "home", Path: "/"}
 	cfg := &config.Config{Front: config.FrontConfig{Rsync: &config.RsyncFrontConfig{Auth: config.AuthConfig{Users: map[string]string{"backup": "secret"}}}},
 		Modules: []config.ModuleConfig{*module}}
 
@@ -126,13 +126,13 @@ func TestSessionLogRestore(t *testing.T) {
 			t.Fatalf("rsync 失败: %v\n%s", err, out)
 		}
 	}
-	run(src + "/", "backup@127.0.0.1::home/")
+	run(src+"/", "backup@127.0.0.1::home/")
 
 	dest := t.TempDir()
 	run("backup@127.0.0.1::home/", dest+"/")
 
 	log := logBuf.String()
-	// 快照 4 条目（a.txt link1 sub sub/b.bin，快照不含顶层 "."）；bytes=13+200；200B@64B 块=4 refs
+	// 清单 4 条目（a.txt link1 sub sub/b.bin，不含顶层 "."）；bytes=13+200；200B@64B 块=4 refs
 	for _, want := range [][]string{
 		{"msg=session_start", "dir=restore", "entries=4", "argv="},
 		{"msg=file_sent", "path=a.txt", "size=13", "chunks=1"},
@@ -200,7 +200,7 @@ func TestSessionLogBackup(t *testing.T) {
 		{"msg=file", "path=sub/b.bin", "size=1500", "method=full", "chunks=24", "md5=ok"},
 		{"msg=entry", "path=sub", "type=dir"},
 		{"msg=entry", "path=link1", "type=link", "target=a.txt"},
-		{"msg=session_done", "snapshot_id=1", "files=5", "transferred=2", "skipped=0",
+		{"msg=session_done", "files=5", "transferred=2", "skipped=0",
 			"dirs=1", "links=1", "chunks_stored=3"},
 	} {
 		if findLine(log1, want...) == "" {
@@ -221,7 +221,7 @@ func TestSessionLogBackup(t *testing.T) {
 	for _, want := range [][]string{
 		{"msg=file", "path=a.txt", "size=12", "method=delta", "matched=0", "literal=12", "chunks=1", "md5=ok"},
 		{"msg=file", "path=sub/b.bin", "size=2000", "method=delta", "matched=1500", "literal=500", "chunks=32", "blength=700", "md5=ok"},
-		{"msg=session_done", "snapshot_id=2", "files=5", "transferred=2", "skipped=0"},
+		{"msg=session_done", "files=5", "transferred=2", "skipped=0"},
 	} {
 		if findLine(log2, want...) == "" {
 			t.Fatalf("二次备份日志缺少含全部字段 %v 的行\n完整日志:\n%s", want, log2)
@@ -234,7 +234,9 @@ func TestSessionLogBackup(t *testing.T) {
 		findLine(log3, "msg=file", "path=sub/b.bin", "method=quick_check") == "" {
 		t.Fatalf("三次备份应全部 quick_check\n完整日志:\n%s", log3)
 	}
-	if line := findLine(log3, "msg=session_done", "snapshot_id=3"); !strings.Contains(line, "skipped=2") {
-		t.Fatalf("三次备份 session_done 应 skipped=2: %q\n完整日志:\n%s", line, log3)
+	// 第三次 done 的锚：skipped=2（quick check 全部命中）；此前两次 done 均
+	// skipped=0——去 snapshot_id 后以统计字段定位
+	if findLine(log3, "msg=session_done", "skipped=2") == "" {
+		t.Fatalf("三次备份 session_done 应 skipped=2:\n%s", log3)
 	}
 }

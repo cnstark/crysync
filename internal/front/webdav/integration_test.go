@@ -1,6 +1,6 @@
 // internal/front/webdav/integration_test.go
 // 真实 daemon 双前端（rsync + webdav，Dir 后端）端到端跨前端一致性验收：
-// rsync 备份 → WebDAV 下载比对；WebDAV 上传 → rsync 恢复比对；单份模式收敛。
+// rsync 备份 → WebDAV 下载比对；WebDAV 上传 → rsync 恢复比对；单一状态收敛。
 package webdav
 
 import (
@@ -235,25 +235,36 @@ func TestWebDAVRsyncCrossFront(t *testing.T) {
 		t.Fatalf("MKCOL 后 newdir 应存在: %v", err)
 	}
 
-	// 5) 单份模式收敛（缺省 snapshot=false）：多次写后仓库恒一份快照
+	// 5) 单一状态收敛：多次跨前端写后，仓库清单 = 当前一致状态（快照历史
+	// 已删除——v0.5 单一当前状态模型）
 	mod, err := core.OpenModule(modCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer mod.Close()
-	n, err := mod.Repo.SnapshotCountForTest()
+	rows, err := mod.Repo.GetFilesForTest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 1 {
-		t.Fatalf("单份模式应恒 1 个快照, got %d", n)
+	paths := map[string]bool{}
+	for _, row := range rows {
+		paths[row.Path] = true
+	}
+	// hello.txt 已 MOVE 为 moved.txt、upload.txt 已 DELETE
+	for _, want := range []string{"sub", "sub/deep.txt", "moved.txt", "newdir"} {
+		if !paths[want] {
+			t.Fatalf("清单缺少 %s: %v", want, paths)
+		}
+	}
+	if paths["upload.txt"] || paths["hello.txt"] {
+		t.Fatalf("清单不应含已删/已移动路径: %v", paths)
 	}
 
 	// 6) 幂等 MKCOL/DELETE（绿联 NAS 定制 restic fork 兼容）：已存在目录重复
 	// MKCOL 必须 201（修复前 405 致 mkdirAll 重试风暴 1.5 小时、零 PUT blob）、
 	// DELETE 不存在必须 204（修复前 404 同样被 fork 当致命错误），且幂等请求
-	// 不得产生新快照（否则单份模式持续写放大 / 多快照模式无限膨胀）。
-	before, err := mod.Repo.SnapshotCountForTest()
+	// 不得产生任何写（清单行数与内容不变）。
+	beforeRows, err := mod.Repo.GetFilesForTest()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,12 +276,12 @@ func TestWebDAVRsyncCrossFront(t *testing.T) {
 	if code != http.StatusNoContent {
 		t.Fatalf("DELETE 不存在应幂等 204, got %d", code)
 	}
-	n, err = mod.Repo.SnapshotCountForTest()
+	afterRows, err := mod.Repo.GetFilesForTest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != before {
-		t.Fatalf("幂等请求不应产生快照: before=%d after=%d", before, n)
+	if len(afterRows) != len(beforeRows) {
+		t.Fatalf("幂等请求不应改变清单: before=%d after=%d", len(beforeRows), len(afterRows))
 	}
 
 	// 7) 404 不存在

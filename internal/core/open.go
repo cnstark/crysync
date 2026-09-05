@@ -1,12 +1,10 @@
 // internal/core/open.go
-// 模块打开逻辑（原 front/rsync/server.go 的 OpenRepoForModule/EnsureModuleInit/
-// ensureKeyfile/keyfileMutexes 迁移至此）：中端层负责"配置 → 打开仓库"，
-// 前端与 CLI 共用。打开时自动初始化（密钥+元数据）、校验密钥、构造后端。
+// 模块打开逻辑：中端层负责"配置 → 打开仓库"，前端与 CLI 共用。
+// 打开时自动初始化（密钥+元数据）、校验密钥、构造后端。
 package core
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -60,56 +58,15 @@ func OpenModule(module *config.ModuleConfig) (*Module, error) {
 		return nil, fmt.Errorf("模块 %s 后端不可用: %w", module.Name, err)
 	}
 	r := repo.New(db, be, key, module.ChunkSizeBytes())
-	// 单份模式裁剪写包装（模块 snapshot: false 缺省）：WebDAV 每次"写即快照"
-	// 提交后裁剪，只保留最新一份——与 rsync 会话收尾的 TrimAfterCommit 语义一致，
-	// 使两个前端在同模块下收敛到同一快照策略（集成测试对单份模式恒 1 快照断言）。
-	rw := &fileWriter{r: r, keepHistory: module.Snapshot}
+	// v0.5：单一当前状态模型——FileWriter 直接指向 repo（无快照裁剪包装）。
+	// 写方法内部：blob 上传无锁并发 + 行更新模块级短锁（见 repo 注释）。
 	return &Module{
 		Repo:       r,
 		Session:    r,
 		FileStore:  r,
-		FileWriter: rw,
+		FileWriter: r,
 		Close:      func() error { return db.Close() },
 	}, nil
-}
-
-// fileWriter 写即快照 + 单份模式裁剪：WebDAV 写完成后按模块快照开关裁剪快照
-// （keepHistory=false 只保留最新一份，与 receiver 会话收尾语义一致）。
-// repo 写方法本身不感知 keepHistory（由前端/中端边界注入），此处封装承担该策略。
-// trim 经 repo.TrimWrite 与写事务共用写锁串行化：并发写与快照裁剪之间不再有
-// "读路径拿到即将被删的快照"窗口。
-type fileWriter struct {
-	r           *repo.Repo
-	keepHistory bool
-}
-
-func (w *fileWriter) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) error {
-	if err := w.r.PutFile(path, mode, mtimeNs, src); err != nil {
-		return err
-	}
-	_, _, err := w.r.TrimWrite(w.keepHistory)
-	return err
-}
-func (w *fileWriter) Mkcol(path string) error {
-	if err := w.r.Mkcol(path); err != nil {
-		return err
-	}
-	_, _, err := w.r.TrimWrite(w.keepHistory)
-	return err
-}
-func (w *fileWriter) DeletePath(path string) error {
-	if err := w.r.DeletePath(path); err != nil {
-		return err
-	}
-	_, _, err := w.r.TrimWrite(w.keepHistory)
-	return err
-}
-func (w *fileWriter) MovePath(src, dst string) error {
-	if err := w.r.MovePath(src, dst); err != nil {
-		return err
-	}
-	_, _, err := w.r.TrimWrite(w.keepHistory)
-	return err
 }
 
 // keyfileMutexes 同进程内按密钥路径串行化自动初始化（多个连接同时首开同一模块）。
@@ -149,7 +106,7 @@ func ensureKeyfile(module *config.ModuleConfig) (bool, error) {
 		return false, fmt.Errorf("模块 %s 检查元数据库: %w", module.Name, err)
 	} else if ok {
 		return false, fmt.Errorf("模块 %s: 元数据库已存在但密钥文件缺失（密钥卷丢失或未挂载？），"+
-			"为避免旧快照无法解密拒绝自动生成新密钥；请恢复密钥文件，或确认放弃旧数据后删除 %s",
+			"为避免旧数据无法解密拒绝自动生成新密钥；请恢复密钥文件，或确认放弃旧数据后删除 %s",
 			module.Name, module.Meta)
 	}
 	k, err := crypto.GenerateKey()

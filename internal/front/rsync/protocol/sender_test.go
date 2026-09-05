@@ -9,7 +9,6 @@ import (
 	"net"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"crysync/internal/backend"
 	"crysync/internal/config"
@@ -18,8 +17,10 @@ import (
 	"crysync/internal/core/repo"
 )
 
-// seedSenderRepo 造一个含文件/目录/符号链接的快照（供 sender 会话测试）。
-func seedSenderRepo(t *testing.T) (*repo.Repo, int64) {
+// seedSenderRepo 造一个含文件/目录/符号链接的当前状态（供 sender 会话测试）。
+// 调用方需在返回后取 WriteSessionLock 再落库？——无需：单进程测试无并发写，
+// 直接原地 upsert（写锁契约在并发场景才需要排队）。
+func seedSenderRepo(t *testing.T) *repo.Repo {
 	t.Helper()
 	db, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
 	if err != nil {
@@ -29,39 +30,31 @@ func seedSenderRepo(t *testing.T) (*repo.Repo, int64) {
 	key, _ := crypto.GenerateKey()
 	r := repo.New(db, backend.NewInMemory(), key, 64)
 
-	txn, err := r.BeginSnapshot(time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
+	unlock := r.WriteSessionLock()
+	defer unlock()
 	add := func(path string, data []byte, mode uint32, mtimeNs int64) {
 		t.Helper()
 		var refs []meta.ChunkRef
-		idx := 0
 		if len(data) > 0 {
 			id, _, err := r.StoreChunk(data)
 			if err != nil {
 				t.Fatal(err)
 			}
-			refs = []meta.ChunkRef{{ChunkID: id, IDX: idx}}
-			idx++
+			refs = []meta.ChunkRef{{ChunkID: id, IDX: 0}}
 		}
-		if err := txn.UpsertFile(meta.FileRow{Path: path, Mode: mode, Size: int64(len(data)), MTimeNs: mtimeNs}, refs); err != nil {
+		if err := r.UpsertFile(meta.FileRow{Path: path, Mode: mode, Size: int64(len(data)), MTimeNs: mtimeNs}, refs); err != nil {
 			t.Fatal(err)
 		}
 	}
 	add("a.txt", []byte("hello restore"), 0o644, 1700000000*1e9+123)
 	add("sub/b.txt", []byte("second file content"), 0o600, 1700000001*1e9)
-	if err := txn.UpsertFile(meta.FileRow{Path: "sub", IsDir: true, Mode: 0o40755, MTimeNs: 1700000000 * 1e9}, nil); err != nil {
+	if err := r.UpsertFile(meta.FileRow{Path: "sub", IsDir: true, Mode: 0o40755, MTimeNs: 1700000000 * 1e9}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := txn.UpsertFile(meta.FileRow{Path: "link1", IsSymlink: true, Mode: 0o120777, MTimeNs: 1700000002 * 1e9, LinkTarget: "a.txt"}, nil); err != nil {
+	if err := r.UpsertFile(meta.FileRow{Path: "link1", IsSymlink: true, Mode: 0o120777, MTimeNs: 1700000002 * 1e9, LinkTarget: "a.txt"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	sid, err := txn.Commit()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return r, sid
+	return r
 }
 
 // senderClient 在内存 pipe 上扮演 rsync 客户端（receiver+generator），
@@ -313,7 +306,7 @@ func (c *senderClient) finalGoodbye() {
 }
 
 func TestSenderSession(t *testing.T) {
-	r, sid := seedSenderRepo(t)
+	r := seedSenderRepo(t)
 	connS, connC := net.Pipe()
 	defer connS.Close()
 	defer connC.Close()
@@ -396,11 +389,10 @@ func TestSenderSession(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("sender 会话失败: %v", err)
 	}
-	_ = sid
 }
 
 func TestSenderSessionDelStats(t *testing.T) {
-	r, _ := seedSenderRepo(t)
+	r := seedSenderRepo(t)
 	connS, connC := net.Pipe()
 	defer connS.Close()
 	defer connC.Close()

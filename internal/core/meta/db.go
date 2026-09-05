@@ -6,14 +6,17 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 
 	_ "modernc.org/sqlite"
 )
 
 type DB struct {
-	db *sql.DB
+	db   *sql.DB
+	path string
 }
+
+// DBPath 返回元数据库文件路径（repo 按模块共享写锁的互斥键）。
+func (d *DB) DBPath() string { return d.path }
 
 type FileRow struct {
 	Path       string
@@ -28,16 +31,12 @@ type FileRow struct {
 	LinkTarget string
 }
 
+// schema：v0.5 单一当前状态模型——files 表即仓库清单（无 snapshots 表、
+// 无 snapshot_id 列），写操作原地 upsert；chunks 按内容寻址跨文件共享
+// （refcount = 文件引用计数）；file_chunks 关联文件与块。
 const schema = `
-CREATE TABLE IF NOT EXISTS snapshots (
-	id          INTEGER PRIMARY KEY,
-	created_at  TEXT NOT NULL,
-	label       TEXT,
-	complete    INTEGER NOT NULL DEFAULT 1
-);
 CREATE TABLE IF NOT EXISTS files (
 	id          INTEGER PRIMARY KEY,
-	snapshot_id INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
 	path        TEXT NOT NULL,
 	is_dir      INTEGER NOT NULL,
 	is_symlink  INTEGER NOT NULL DEFAULT 0,
@@ -49,13 +48,8 @@ CREATE TABLE IF NOT EXISTS files (
 	xattrs      BLOB,
 	link_target TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_files_snapshot ON files(snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
--- 复合索引 (snapshot_id, path)：CopyFiles 复制 file_chunks 时按
--- "t.snapshot_id = ? AND t.path = s.path" 关联新旧 files 行，无此索引时
--- 纯 Go driver（modernc，无 ANALYZE 统计）选嵌套全扫计划，千级行清单上
--- 单条 459ms（实测）；复合索引下查找 O(1)（15ms）。统计无关，恒定快
-CREATE INDEX IF NOT EXISTS idx_files_snapshot_path ON files(snapshot_id, path);CREATE TABLE IF NOT EXISTS chunks (
+CREATE TABLE IF NOT EXISTS chunks (
 	id        INTEGER PRIMARY KEY,
 	hash      BLOB NOT NULL UNIQUE,
 	size      INTEGER NOT NULL,
@@ -68,9 +62,9 @@ CREATE TABLE IF NOT EXISTS file_chunks (
 	idx      INTEGER NOT NULL,
 	PRIMARY KEY (file_id, idx)
 );
--- chunk_id 索引：refcount 关联子查询（CopyFiles/UpsertFile/DeleteSnapshot 的
+-- chunk_id 索引：refcount 关联子查询（UpsertFile/DeleteFile 的
 -- UPDATE chunks ... fc.chunk_id = chunks.id）没有它时对 chunks 每行全表扫
--- 描 file_chunks，千级行清单上单请求累计 >1s（实测 581ms/条）；有索引后毫秒级
+-- 描 file_chunks，千级行清单上单请求累计 >1s；有索引后毫秒级
 CREATE INDEX IF NOT EXISTS idx_file_chunks_chunk ON file_chunks(chunk_id);
 CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
@@ -87,6 +81,18 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("打开 SQLite: %w", err)
 	}
 	db.SetMaxOpenConns(1) // 单写者：SQLite WAL 下由应用串行化
+	// 旧版检测先行（旧 schema 有 snapshots 表）：v0.5 删除快照功能且不提供
+	// 迁移——报错提示人工处理，避免在旧库上新建一套新表造成两套清单并存。
+	oldDB, err := isOldSchema(db)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if oldDB {
+		db.Close()
+		return nil, fmt.Errorf("检测到 v0.4.x 旧版元数据库（含快照表）：v0.5 已删除快照功能且不提供迁移。"+
+			"请删除 %s 后重新初始化（需对新架构重新备份；旧后端 blob 将不可见）", path)
+	}
 	// schema 建库包在单事务内：rsync 前端 EnsureModuleInit 与 webdav 前端
 	// OpenModule 启动时并发打开同一模块库（main 起 goroutine 各自执行），
 	// 多语句 Exec 曾在 NAS 慢盘上交错触发 SQLITE_BUSY（busy_timeout 计的是
@@ -95,7 +101,14 @@ func Open(path string) (*DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("初始化 schema: %w", err)
 	}
-	return &DB{db: db}, nil
+	return &DB{db: db, path: path}, nil
+}
+
+// isOldSchema 检测是否为 v0.4.x 旧版库（存在 snapshots 表）。
+func isOldSchema(db *sql.DB) (bool, error) {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='snapshots'`).Scan(&n)
+	return n > 0, err
 }
 
 // ensureSchema 在单事务内执行全部 DDL（IF NOT EXISTS 幂等）。
@@ -113,79 +126,55 @@ func ensureSchema(db *sql.DB) error {
 
 func (d *DB) Close() error { return d.db.Close() }
 
-func (d *DB) CreateSnapshot(createdAt time.Time) (int64, error) {
-	res, err := d.db.Exec(`INSERT INTO snapshots (created_at) VALUES (?)`, createdAt.UTC().Format(time.RFC3339Nano))
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
-}
-
-func (d *DB) CopyFiles(fromSnapshot, toSnapshot int64) error {
-	tx, err := d.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	// 复制文件清单
-	if _, err := tx.Exec(`INSERT INTO files (snapshot_id, path, is_dir, is_symlink, mode, uid, gid, size, mtime_ns, xattrs, link_target)
-		SELECT ?, path, is_dir, is_symlink, mode, uid, gid, size, mtime_ns, xattrs, link_target FROM files WHERE snapshot_id = ?`,
-		toSnapshot, fromSnapshot); err != nil {
-		return err
-	}
-	// 复制 chunk 关联（快照自包含的关键：继承文件必须可读）——通过 path 关联新旧快照的 file 行
-	if _, err := tx.Exec(`INSERT INTO file_chunks (file_id, chunk_id, idx)
-		SELECT t.id, fc.chunk_id, fc.idx
-		FROM file_chunks fc
-		JOIN files s ON s.id = fc.file_id AND s.snapshot_id = ?
-		JOIN files t ON t.snapshot_id = ? AND t.path = s.path`,
-		fromSnapshot, toSnapshot); err != nil {
-		return err
-	}
-	// 继承引用递增 refcount（同一 chunk 被多个快照引用时计数正确）
-	if _, err := tx.Exec(`UPDATE chunks SET refcount = refcount + (
-		SELECT COUNT(*) FROM file_chunks fc JOIN files f ON f.id = fc.file_id
-		WHERE f.snapshot_id = ? AND fc.chunk_id = chunks.id)`,
-		toSnapshot); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// UpsertFile 覆盖写入文件行：旧行的 chunk 引用递减（归零删除 chunk 行——blob
-// 随之成为孤儿，由 GC 回收），再写入新行。chunk 引用递增由调用方负责。
-func (d *DB) UpsertFile(snapshotID int64, f FileRow) (int64, error) {
+// UpsertFile 原子替换文件行：事务内 递减旧引用 → 递增新 refs 引用 →
+// 删除归零的旧 chunk 行 → 替换 files 行 → 附加 file_chunks。
+// refs 递增必须与旧引用递减同事务：相同内容的覆盖（新旧引用同一 chunk）若
+// 把递增推迟到事务外，递减归零会在 attach 前删掉行 → AttachChunks 外键失败。
+func (d *DB) UpsertFile(f FileRow, refs []ChunkRef) (int64, error) {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	// 1) 旧引用递减
 	if _, err := tx.Exec(`UPDATE chunks SET refcount = refcount - (
 		SELECT COUNT(*) FROM file_chunks fc JOIN files f ON f.id = fc.file_id
-		WHERE f.snapshot_id = ? AND f.path = ? AND fc.chunk_id = chunks.id)`,
-		snapshotID, f.Path); err != nil {
+		WHERE f.path = ? AND fc.chunk_id = chunks.id)`,
+		f.Path); err != nil {
 		return 0, err
 	}
-	// 只清理"旧文件曾引用、本次递减后归零"的 chunk——新插入尚未关联的
-	// chunk（refcount=0）不能被误删
+	// 2) 新引用先递增（与旧引用相同的 chunk 递增回正，避免步骤 3 误删）
+	for _, r := range refs {
+		if _, err := tx.Exec(`UPDATE chunks SET refcount = refcount + 1 WHERE id = ?`, r.ChunkID); err != nil {
+			return 0, err
+		}
+	}
+	// 3) 只清理"旧文件曾引用、递减后仍归零"的 chunk（其 blob 成孤儿，由 GC 回收）
 	if _, err := tx.Exec(`DELETE FROM chunks WHERE refcount <= 0 AND id IN (
 		SELECT DISTINCT fc.chunk_id FROM file_chunks fc
-		JOIN files f ON f.id = fc.file_id WHERE f.snapshot_id = ? AND f.path = ?)`,
-		snapshotID, f.Path); err != nil {
+		JOIN files f ON f.id = fc.file_id WHERE f.path = ?)`,
+		f.Path); err != nil {
 		return 0, err
 	}
-	if _, err := tx.Exec(`DELETE FROM files WHERE snapshot_id = ? AND path = ?`, snapshotID, f.Path); err != nil {
+	// 4) 替换文件行
+	if _, err := tx.Exec(`DELETE FROM files WHERE path = ?`, f.Path); err != nil {
 		return 0, err
 	}
-	res, err := tx.Exec(`INSERT INTO files (snapshot_id, path, is_dir, is_symlink, mode, uid, gid, size, mtime_ns, xattrs, link_target)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		snapshotID, f.Path, boolToInt(f.IsDir), boolToInt(f.IsSymlink), f.Mode, f.UID, f.GID, f.Size, f.MTimeNs, f.Xattrs, nullString(f.LinkTarget))
+	res, err := tx.Exec(`INSERT INTO files (path, is_dir, is_symlink, mode, uid, gid, size, mtime_ns, xattrs, link_target)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		f.Path, boolToInt(f.IsDir), boolToInt(f.IsSymlink), f.Mode, f.UID, f.GID, f.Size, f.MTimeNs, f.Xattrs, nullString(f.LinkTarget))
 	if err != nil {
 		return 0, err
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
 		return 0, err
+	}
+	// 5) 附加 file_chunks（refs 已在步骤 2 递增，此处只建关联行）
+	for _, r := range refs {
+		if _, err := tx.Exec(`INSERT INTO file_chunks (file_id, chunk_id, idx) VALUES (?, ?, ?)`, id, r.ChunkID, r.IDX); err != nil {
+			return 0, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
@@ -194,7 +183,7 @@ func (d *DB) UpsertFile(snapshotID int64, f FileRow) (int64, error) {
 }
 
 // DeleteFile 删除文件行，其 chunk 引用递减（归零删除 chunk 行）。
-func (d *DB) DeleteFile(snapshotID int64, path string) error {
+func (d *DB) DeleteFile(path string) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
@@ -202,25 +191,26 @@ func (d *DB) DeleteFile(snapshotID int64, path string) error {
 	defer tx.Rollback()
 	if _, err := tx.Exec(`UPDATE chunks SET refcount = refcount - (
 		SELECT COUNT(*) FROM file_chunks fc JOIN files f ON f.id = fc.file_id
-		WHERE f.snapshot_id = ? AND f.path = ? AND fc.chunk_id = chunks.id)`,
-		snapshotID, path); err != nil {
+		WHERE f.path = ? AND fc.chunk_id = chunks.id)`,
+		path); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM chunks WHERE refcount <= 0 AND id IN (
 		SELECT DISTINCT fc.chunk_id FROM file_chunks fc
-		JOIN files f ON f.id = fc.file_id WHERE f.snapshot_id = ? AND f.path = ?)`,
-		snapshotID, path); err != nil {
+		JOIN files f ON f.id = fc.file_id WHERE f.path = ?)`,
+		path); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM files WHERE snapshot_id = ? AND path = ?`, snapshotID, path); err != nil {
+	if _, err := tx.Exec(`DELETE FROM files WHERE path = ?`, path); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func (d *DB) GetFiles(snapshotID int64) ([]FileRow, error) {
+// GetFiles 返回全部文件清单（按 path 排序）。单一状态模型下即完整仓库状态。
+func (d *DB) GetFiles() ([]FileRow, error) {
 	rows, err := d.db.Query(`SELECT path, is_dir, is_symlink, mode, uid, gid, size, mtime_ns, xattrs, link_target
-		FROM files WHERE snapshot_id = ? ORDER BY path`, snapshotID)
+		FROM files ORDER BY path`)
 	if err != nil {
 		return nil, err
 	}
@@ -245,16 +235,16 @@ func (d *DB) GetFiles(snapshotID int64) ([]FileRow, error) {
 	return out, rows.Err()
 }
 
-// GetFileRow 按 (snapshot_id, path) 查询单行文件元数据；不存在返回 ok=false。
+// GetFileRow 按路径查询单行文件元数据；不存在返回 ok=false。
 // quick check 用：字段扫描与 GetFiles 一致（is_dir/is_symlink 为 int、uid/gid 可空）。
-func (d *DB) GetFileRow(snapshotID int64, path string) (FileRow, bool, error) {
+func (d *DB) GetFileRow(path string) (FileRow, bool, error) {
 	var f FileRow
 	var isDir, isSym int
 	var uid, gid sql.NullInt64
 	var xattrs []byte
 	var link sql.NullString
 	err := d.db.QueryRow(`SELECT path, is_dir, is_symlink, mode, uid, gid, size, mtime_ns, xattrs, link_target
-		FROM files WHERE snapshot_id = ? AND path = ?`, snapshotID, path).
+		FROM files WHERE path = ?`, path).
 		Scan(&f.Path, &isDir, &isSym, &f.Mode, &uid, &gid, &f.Size, &f.MTimeNs, &xattrs, &link)
 	if err == sql.ErrNoRows {
 		return FileRow{}, false, nil
@@ -270,11 +260,11 @@ func (d *DB) GetFileRow(snapshotID int64, path string) (FileRow, bool, error) {
 	return f, true, nil
 }
 
-// GetFileChunks 返回快照文件中 (chunk_id, idx) 有序列表（MovePath 复制引用用）。
-func (d *DB) GetFileChunks(snapshotID int64, path string) ([]ChunkRef, error) {
+// GetFileChunks 返回文件中 (chunk_id, idx) 有序列表（MovePath 复制引用用）。
+func (d *DB) GetFileChunks(path string) ([]ChunkRef, error) {
 	rows, err := d.db.Query(`SELECT fc.chunk_id, fc.idx FROM file_chunks fc
 		JOIN files f ON f.id = fc.file_id
-		WHERE f.snapshot_id = ? AND f.path = ? ORDER BY fc.idx`, snapshotID, path)
+		WHERE f.path = ? ORDER BY fc.idx`, path)
 	if err != nil {
 		return nil, err
 	}
@@ -313,41 +303,6 @@ type ChunkInfo struct {
 	Size     int64
 }
 
-// SnapshotInfo 快照列表条目（prune 策略计算用）。
-type SnapshotInfo struct {
-	ID        int64
-	CreatedAt time.Time
-}
-
-// SnapshotFileCount 返回快照中的文件条目数。
-func (d *DB) SnapshotFileCount(snapshotID int64) (int, error) {
-	var n int
-	err := d.db.QueryRow(`SELECT COUNT(*) FROM files WHERE snapshot_id = ?`, snapshotID).Scan(&n)
-	return n, err
-}
-
-// SnapshotList 返回全部快照（按创建时间升序，即 id 序）。
-func (d *DB) SnapshotList() ([]SnapshotInfo, error) {
-	rows, err := d.db.Query(`SELECT id, created_at FROM snapshots ORDER BY id`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []SnapshotInfo
-	for rows.Next() {
-		var s SnapshotInfo
-		var created string
-		if err := rows.Scan(&s.ID, &created); err != nil {
-			return nil, err
-		}
-		if t, err := time.Parse(time.RFC3339Nano, created); err == nil {
-			s.CreatedAt = t
-		}
-		out = append(out, s)
-	}
-	return out, rows.Err()
-}
-
 type ChunkRef struct {
 	ChunkID int64
 	IDX     int
@@ -378,11 +333,16 @@ func (d *DB) IncrRefcount(chunkID int64) error {
 	return err
 }
 
+// DeleteChunk 按 ID 删除 chunk 行（GC 回收用：行已按 file_chunks JOIN files
+// 真引用判定为无引用残留，不再看 refcount）。
+func (d *DB) DeleteChunk(chunkID int64) error {
+	_, err := d.db.Exec(`DELETE FROM chunks WHERE id = ?`, chunkID)
+	return err
+}
+
 // DeleteChunkIfZero 删除 refcount 为 0 的 chunk 行（未附任何文件引用的孤儿）。
-// 写即快照失败收口用：本次事务新建但未 AttachChunks 的 chunk 行残留（其 blob
-// 因 chunks 表仍引用而 GC 无法回收），出错路径显式清理。已在快照中引用
-// （refcount>0）的由 Rollback/DeleteSnapshot 递减归零后另行删除，本方法只补
-// 漏网之鱼，绝不误删有引用的 chunk。
+// 写失败收口用：本次新建但未 AttachChunks 的 chunk 行残留（其 blob 因
+// chunks 表仍引用而 GC 无法回收），出错路径显式清理。绝不误删有引用的 chunk。
 func (d *DB) DeleteChunkIfZero(chunkID int64) error {
 	_, err := d.db.Exec(`DELETE FROM chunks WHERE id = ? AND refcount <= 0`, chunkID)
 	return err
@@ -414,46 +374,6 @@ func nullString(s string) any {
 		return nil
 	}
 	return s
-}
-
-// DeleteSnapshot 删除快照及其文件行；快照引用的全部 chunk refcount 递减
-// （按每个文件关联计数，去重同 chunk 多文件引用），归零者删除 chunk 行——
-// 对应 blob 成为孤儿，由 GC 回收。返回删除的 chunk 行数（调用方据此判断
-// 是否产生了新孤儿、是否需要触发后端回收）。
-func (d *DB) DeleteSnapshot(snapshotID int64) (int, error) {
-	tx, err := d.db.Begin()
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`UPDATE chunks SET refcount = refcount - (
-		SELECT COUNT(*) FROM file_chunks fc JOIN files f ON f.id = fc.file_id
-		WHERE f.snapshot_id = ? AND fc.chunk_id = chunks.id)`,
-		snapshotID); err != nil {
-		return 0, err
-	}
-	// 同事务内先数出将删除的 chunk 行（UPDATE 之后 refcount 已递减，
-	// SELECT 与 DELETE 的 WHERE 完全一致）
-	var deletedChunks int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM chunks WHERE refcount <= 0 AND id IN (
-		SELECT DISTINCT fc.chunk_id FROM file_chunks fc
-		JOIN files f ON f.id = fc.file_id WHERE f.snapshot_id = ?)`,
-		snapshotID).Scan(&deletedChunks); err != nil {
-		return 0, err
-	}
-	if _, err := tx.Exec(`DELETE FROM chunks WHERE refcount <= 0 AND id IN (
-		SELECT DISTINCT fc.chunk_id FROM file_chunks fc
-		JOIN files f ON f.id = fc.file_id WHERE f.snapshot_id = ?)`,
-		snapshotID); err != nil {
-		return 0, err
-	}
-	if _, err := tx.Exec(`DELETE FROM snapshots WHERE id = ?`, snapshotID); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return deletedChunks, nil
 }
 
 func (d *DB) QueryRow(q string, args ...any) *sql.Row { return d.db.QueryRow(q, args...) }

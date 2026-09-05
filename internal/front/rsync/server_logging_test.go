@@ -101,7 +101,7 @@ func TestServeLogging(t *testing.T) {
 			t.Fatalf("rsync 失败: %v\n%s", err, out)
 		}
 	}
-	run(src + "/", "backup@127.0.0.1::home/")
+	run(src+"/", "backup@127.0.0.1::home/")
 
 	dest := t.TempDir()
 	run("backup@127.0.0.1::home/", dest+"/")
@@ -118,7 +118,7 @@ func TestServeLogging(t *testing.T) {
 		// 会话级字段贯穿全部事件
 		{"msg=session_start", "dir=backup", "module=home", "client=127.0.0.1:", "session="},
 		{"msg=file", "path=hello.txt", "method=full", "module=home", "session="},
-		{"msg=session_done", "module=home", "snapshot_id=1"},
+		{"msg=session_done", "module=home", "dry_run=false", "transferred=1"},
 		{"msg=session_start", "dir=restore", "module=home", "session="},
 		{"msg=file_sent", "path=hello.txt", "size=7", "module=home"},
 		{"msg=session_done", "dir=restore", "module=home"},

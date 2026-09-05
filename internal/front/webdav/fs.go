@@ -30,11 +30,7 @@ func (m *moduleFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	if path == "" {
 		return &fileInfo{row: meta.FileRow{IsDir: true, Mode: 0o40755}}, nil // 模块根
 	}
-	sid, err := m.store.ActiveSnapshotID()
-	if err != nil {
-		return nil, err
-	}
-	row, ok, err := m.store.GetFileRow(sid, path)
+	row, ok, err := m.store.GetFileRow(path)
 	if err != nil {
 		return nil, err
 	}
@@ -49,15 +45,11 @@ func (m *moduleFS) OpenFile(ctx context.Context, name string, flag int, perm os.
 	if flag&(os.O_WRONLY|os.O_RDWR) != 0 {
 		return m.openWrite(ctx, path)
 	}
-	sid, err := m.store.ActiveSnapshotID()
-	if err != nil {
-		return nil, err
-	}
 	if path == "" {
 		// 模块根：与 Stat 一致的虚拟目录，可打开枚举（PROPFIND 遍历用）
-		return &dirFile{fs: m, sid: sid, path: path, fi: &fileInfo{row: meta.FileRow{IsDir: true, Mode: 0o40755}}}, nil
+		return &dirFile{fs: m, path: path, fi: &fileInfo{row: meta.FileRow{IsDir: true, Mode: 0o40755}}}, nil
 	}
-	row, ok, err := m.store.GetFileRow(sid, path)
+	row, ok, err := m.store.GetFileRow(path)
 	if err != nil {
 		return nil, err
 	}
@@ -66,12 +58,12 @@ func (m *moduleFS) OpenFile(ctx context.Context, name string, flag int, perm os.
 	}
 	switch {
 	case row.IsDir:
-		return &dirFile{fs: m, sid: sid, path: path, fi: &fileInfo{row: row}}, nil
+		return &dirFile{fs: m, path: path, fi: &fileInfo{row: row}}, nil
 	case row.IsSymlink:
 		// WebDAV 无 symlink 语义：GET 返回链接目标文本（设计：不跟随、不创建）
 		return &symlinkFile{fi: &fileInfo{row: row}, target: row.LinkTarget}, nil
 	}
-	fr, _, err := m.store.OpenFile(sid, path)
+	fr, _, err := m.store.OpenFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -130,23 +122,22 @@ func (f *readFile) Readdir(count int) ([]os.FileInfo, error) {
 	return nil, os.ErrInvalid
 }
 
-// dirFile 目录句柄：Readdir 列活跃快照的直接子项（PROPFIND 枚举用）。
+// dirFile 目录句柄：Readdir 列当前清单的直接子项（PROPFIND 枚举用）。
 // x/net/webdav 的目录遍历循环调用 Readdir 直到 io.EOF——消费完必须返回
 // io.EOF，否则死循环。
 type dirFile struct {
 	fs   *moduleFS
-	sid  int64
 	path string
 	fi   os.FileInfo
 	off  int // 枚举游标
 }
 
 // Readdir 枚举目录子项。count<=0 时返回全部剩余且耗尽不是错误
-//（(nil, nil)）——对齐 x/net/webdav 内 memFile 与 os.File 语义：walkFS
+// （(nil, nil)）——对齐 x/net/webdav 内 memFile 与 os.File 语义：walkFS
 // 用 Readdir(0) 且把任何非 nil err 当目录遍历失败，空目录返回 io.EOF
 // 会令 PROPFIND 得 500。count>0 时耗尽返回 io.EOF（分页读取惯例）。
 func (d *dirFile) Readdir(count int) ([]os.FileInfo, error) {
-	rows, err := d.fs.store.ListDir(d.sid, d.path)
+	rows, err := d.fs.store.ListDir(d.path)
 	if err != nil {
 		return nil, err
 	}

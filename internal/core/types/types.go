@@ -5,81 +5,60 @@ package types
 
 import (
 	"io"
-	"time"
 
 	"crysync/internal/core/meta"
 )
 
-// SessionTxn 备份会话事务：rsync 备份方向（receiver）使用。
-// 方法集合 = receiver.go 全部落库调用面（UpsertFile/DeleteFile/ApplyDelete/Commit/Rollback
-// 加 SnapshotID 取快照 ID），与 repo.SnapshotTxn 一一对应。
-type SessionTxn interface {
-	// SnapshotID 返回本次事务创建的快照 ID（BeginSnapshot 复制清单后即可用）。
-	SnapshotID() int64
-	// UpsertFile 落库文件行并附加块关联（refcount 递增由实现负责）。
-	UpsertFile(f meta.FileRow, chunks []meta.ChunkRef) error
-	// DeleteFile 删除事务快照中指定路径的行。
-	DeleteFile(path string) error
-	// ApplyDelete 执行 rsync --delete 语义：删除 prefix 子树内、不在 covered 中的行。
-	ApplyDelete(prefix string, covered map[string]bool) (int, error)
-	// Commit 提交快照，返回快照 ID。
-	Commit() (int64, error)
-	// Rollback 回滚快照（删除预建的快照行）。
-	Rollback() error
-}
-
 // Session 备份方向服务：rsync receiver 使用。
-// 方法集合 = rsyncproto 当前实际调用的 repo 方法全集（Task 2 Step 6 逐一核对），
-// 不增不减。含 TrimAfterCommit（receiver 会话收尾单份模式裁剪用）。
+// v0.5 单一当前状态模型：无快照事务，会话持写互斥锁（WriteSessionLock）
+// 后直接原地落库；失败 = 半更新镜像（客户端重试幂等收敛）。
 type Session interface {
-	// BeginSnapshot 创建新快照并复制上一快照的完整文件清单，返回会话事务。
-	BeginSnapshot(now time.Time) (SessionTxn, error)
+	// WriteSessionLock 获取模块写互斥（会话全程持有，结束释放）：
+	// 同模块并发写会话与 WebDAV 写在此排队。
+	WriteSessionLock() func()
 	// StoreChunk 将明文块去重存储（哈希命中复用），返回 chunk ID 与是否复用。
 	StoreChunk(data []byte) (chunkID int64, reused bool, err error)
 	// ChunkSizeBytes 返回分块大小（字节），receiver 用它确定内容缓冲/分块边界。
 	ChunkSizeBytes() int
-	// GetFileRow 按快照路径查文件元数据（delta 的 quick check 基准）。
-	GetFileRow(snapshotID int64, path string) (meta.FileRow, bool, error)
-	// ReadChunkAt 读取快照文件第 idx 个存储块的明文（basisReader 逐块顺序读取）。
-	ReadChunkAt(snapshotID int64, path string, idx int) ([]byte, error)
-	// ActiveSnapshotID 返回活跃快照 ID（会话开始取一次，之后不随 CLI 切换）。
-	ActiveSnapshotID() (int64, error)
-	// StreamFile 流式读取快照文件内容（整文件 MD5 强校验和），返回字节数与校验和。
-	StreamFile(snapshotID int64, path string, seed int32, w io.Writer) (int64, [16]byte, error)
-	// TrimAfterCommit 快照提交后的收尾裁剪：keepHistory=true 不动作；
-	// false（单份模式）删除 snapshotID 之前的全部快照并回收孤儿 blob。
-	TrimAfterCommit(snapshotID int64, keepHistory bool) (removed int, blobs int, err error)
+	// UpsertFile 原地落库文件行并附加块关联（refcount 递增）。
+	UpsertFile(f meta.FileRow, chunks []meta.ChunkRef) error
+	// DeleteFile 原地删除路径行（--delete 语义）。
+	DeleteFile(path string) error
+	// FileRows 返回清单（--delete 枚举与 quick check 用），prefix 子树过滤。
+	FileRows(prefix string) ([]meta.FileRow, error)
+	// GetFileRow 按路径查文件元数据（delta 的 quick check 基准）。
+	GetFileRow(path string) (meta.FileRow, bool, error)
+	// ReadChunkAt 读取文件第 idx 个存储块的明文（basisReader 逐块顺序读取）。
+	ReadChunkAt(path string, idx int) ([]byte, error)
+	// StreamFile 流式读取文件内容（整文件 MD5 强校验和），返回字节数与校验和。
+	StreamFile(path string, seed int32, w io.Writer) (int64, [16]byte, error)
 }
 
-// FileStore 读路径服务：rsync 恢复方向（sender）+ 后续 WebDAV 读使用。
-// 方法集合 = sender.go processSendSession 的 repo 调用面（Step 6 核对），
-// 加 ListDir/OpenFile（WebDAV 读最小必需），不含任何写方法。
+// FileStore 读路径服务：rsync 恢复方向（sender）+ WebDAV 读使用。
 type FileStore interface {
-	// ActiveSnapshotID 返回活跃快照 ID（恢复以 CLI 切换的活跃快照为时间点）。
-	ActiveSnapshotID() (int64, error)
-	// SnapshotFileRows 返回快照文件清单，按子路径 prefix 过滤（sender 构造 flist）。
-	SnapshotFileRows(snapshotID int64, prefix string) ([]meta.FileRow, error)
-	// GetFileRow 按快照路径查文件元数据（恢复方向错误形态判定用）。
-	GetFileRow(snapshotID int64, path string) (meta.FileRow, bool, error)
-	// StreamFile 流式读取快照文件内容（整文件 MD5 强校验和），返回字节数与校验和。
-	StreamFile(snapshotID int64, path string, seed int32, w io.Writer) (int64, [16]byte, error)
+	// FileRows 返回文件清单，按子路径 prefix 过滤（sender 构造 flist）。
+	FileRows(prefix string) ([]meta.FileRow, error)
+	// GetFileRow 按路径查文件元数据（恢复方向错误形态判定用）。
+	GetFileRow(path string) (meta.FileRow, bool, error)
+	// StreamFile 流式读取文件内容（整文件 MD5 强校验和），返回字节数与校验和。
+	StreamFile(path string, seed int32, w io.Writer) (int64, [16]byte, error)
 	// ChunkSizeBytes 返回分块大小（字节），sender 用它计算块数与日志统计。
 	ChunkSizeBytes() int
-	// ListDir 返回快照中 path 的直接子项（非递归，不含自身）。
-	ListDir(snapshotID int64, path string) ([]meta.FileRow, error)
-	// OpenFile 按路径打开快照文件：返回流式块重组 reader（Read/Seek/Close）与元数据。
-	OpenFile(snapshotID int64, path string) (io.ReadSeekCloser, meta.FileRow, error)
+	// ListDir 返回 path 的直接子项（非递归，不含自身）。
+	ListDir(path string) ([]meta.FileRow, error)
+	// OpenFile 按路径打开文件：返回流式块重组 reader（Read/Seek/Close）与元数据。
+	OpenFile(path string) (io.ReadSeekCloser, meta.FileRow, error)
 }
 
-// FileWriter 写路径服务：WebDAV 写使用（写即快照：每个方法独立提交一个快照）。
+// FileWriter 写路径服务：WebDAV 写使用（v0.5：原地更新，无快照语义）。
 type FileWriter interface {
-	// PutFile 以"写即快照"语义写入（或覆盖）path 文件内容。
+	// PutFile 写入（或覆盖）path 文件内容（原地 upsert 当前状态）。
 	PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) error
-	// Mkcol 以"写即快照"语义创建目录条目；已存在返回 os.ErrExist。
+	// Mkcol 创建目录条目；已存在时幂等返回 nil。
 	Mkcol(path string) error
-	// DeletePath 以"写即快照"语义删除 path（文件或目录，目录递归删整棵子树）。
+	// DeletePath 删除 path（文件或目录，目录递归删整棵子树）；不存在幂等。
 	DeletePath(path string) error
-	// MovePath 以"写即快照"语义移动/改名 src 至 dst（目录移动递归整棵子树）。
+	// MovePath 移动/改名 src 至 dst（目录移动递归整棵子树）。
 	MovePath(src, dst string) error
 }
 
