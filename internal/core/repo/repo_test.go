@@ -820,3 +820,149 @@ func TestConcurrentMkcolPut(t *testing.T) {
 		t.Fatal("重试后 data/blob 仍不在清单")
 	}
 }
+
+// --- Task 5：blob 并发上传专项 ---
+
+// TestStoreChunkConcurrentDedup：8 goroutine 并发上传同一内容 → 后端只 1 个
+// blob、返回同一 chunk id（in-flight 去重防双写，其余 7 个复用）。
+func TestStoreChunkConcurrentDedup(t *testing.T) {
+	r, be := newTestRepo(t)
+	data := bytes.Repeat([]byte{0xCD}, 1000)
+	const n = 8
+	ids := make([]int64, n)
+	reuseds := make([]bool, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id, reused, err := r.StoreChunk(data)
+			if err != nil {
+				t.Errorf("StoreChunk: %v", err)
+				return
+			}
+			ids[i], reuseds[i] = id, reused
+		}(i)
+	}
+	wg.Wait()
+	for i := 1; i < n; i++ {
+		if ids[i] != ids[0] {
+			t.Fatalf("并发同内容应返回同一 chunk id: %v", ids)
+		}
+	}
+	blobs, _ := be.List()
+	if len(blobs) != 1 {
+		t.Fatalf("并发同内容后端应只 1 个 blob: %v", blobs)
+	}
+	// 恰好一个 !reused（首个上传者），其余 7 个复用
+	first := 0
+	for _, r2 := range reuseds {
+		if !r2 {
+			first++
+		}
+	}
+	if first != 1 {
+		t.Fatalf("应恰 1 个新建其余复用: %v", reuseds)
+	}
+}
+
+// TestStoreChunkConcurrentDistinct：8 goroutine 并发上传不同内容 → 8 个 blob、
+// 8 个不同 chunk id，全部可解密读回。
+func TestStoreChunkConcurrentDistinct(t *testing.T) {
+	r, be := newTestRepo(t)
+	const n = 8
+	datas := make([][]byte, n)
+	ids := make([]int64, n)
+	for i := range datas {
+		datas[i] = bytes.Repeat([]byte{byte(i)}, 100+i*10)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id, reused, err := r.StoreChunk(datas[i])
+			if err != nil || reused {
+				t.Errorf("StoreChunk(%d): %v reused=%v", i, err, reused)
+				return
+			}
+			ids[i] = id
+		}(i)
+	}
+	wg.Wait()
+	seen := map[int64]bool{}
+	for _, id := range ids {
+		if id == 0 || seen[id] {
+			t.Fatalf("不同内容应各得不同 id: %v", ids)
+		}
+		seen[id] = true
+	}
+	blobs, _ := be.List()
+	if len(blobs) != n {
+		t.Fatalf("应 %d 个 blob, got %d", n, len(blobs))
+	}
+	// 全部 blob 可解密（内容寻址无错配）
+	for _, name := range blobs {
+		raw, err := be.Get(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pt, err := r.key.Decrypt(raw, name)
+		if err != nil || len(pt) == 0 {
+			t.Fatalf("blob %s 解密失败: %v", name, err)
+		}
+	}
+}
+
+// TestPutFileConcurrentChunks：多块大文件（>4×chunkSize 触发 worker 池并行）
+// 并发写入不同路径 → 读回与源逐字节一致（块顺序重组正确——并发结果按 idx
+// 归位是正确性关键）。
+func TestPutFileConcurrentChunks(t *testing.T) {
+	r, _ := newTestRepo(t)
+	now := time.Now().UnixNano()
+	unlock := r.WriteSessionLock()
+	for _, d := range []string{"d1", "d2", "d3"} {
+		if err := r.UpsertFile(meta.FileRow{Path: d, IsDir: true, Mode: 0o40755, MTimeNs: now}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unlock()
+
+	big := make([]byte, r.ChunkSizeBytes()*6+r.ChunkSizeBytes()/3) // 6.33 块
+	for i := range big {
+		big[i] = byte(i * 7)
+	}
+	var wg sync.WaitGroup
+	errCh := make(chan error, 3)
+	for _, p := range []string{"d1/big.bin", "d2/big.bin", "d3/big.bin"} {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			if err := r.PutFile(p, 0o644, now, bytes.NewReader(big)); err != nil {
+				errCh <- err
+			}
+		}(p)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("并发多块 PUT 失败: %v", err)
+	}
+	for _, p := range []string{"d1/big.bin", "d2/big.bin", "d3/big.bin"} {
+		fr, row, err := r.OpenFile(p)
+		if err != nil {
+			t.Fatalf("打开 %s: %v", p, err)
+		}
+		if row.Size != int64(len(big)) {
+			t.Fatalf("%s size 不符: %d", p, row.Size)
+		}
+		got, err := io.ReadAll(fr)
+		fr.Close()
+		if err != nil {
+			t.Fatalf("读取 %s: %v", p, err)
+		}
+		if !bytes.Equal(got, big) {
+			t.Fatalf("%s 内容与源不一致（块顺序重组错误）: %d bytes", p, len(got))
+		}
+	}
+}

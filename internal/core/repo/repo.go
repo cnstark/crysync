@@ -28,10 +28,24 @@ type Repo struct {
 	backend   backend.Backend
 	key       *crypto.Key
 	chunkSize int
+	// inflight：StoreChunk 并发上传去重登记表（hash -> 进行中上传）。
+	// 防同内容并发双写后端 blob（夸克 WebDAV 单次 PUT 固定开销 ~3s，双写
+	// 浪费整段窗口；SQLite 访问在驱动层串行，in-flight 防的是 backend.Put
+	// 网络 IO 的重叠）。
+	inflightMu sync.Mutex
+	inflight   map[[32]byte]*chunkInflight
+}
+
+// chunkInflight 一次进行中的块上传：完成后 close(done) 广播，等待者复用结果。
+type chunkInflight struct {
+	done chan struct{}
+	id   int64
+	err  error
 }
 
 func New(metaDB *meta.DB, be backend.Backend, key *crypto.Key, chunkSize int) *Repo {
-	return &Repo{meta: metaDB, backend: be, key: key, chunkSize: chunkSize}
+	return &Repo{meta: metaDB, backend: be, key: key, chunkSize: chunkSize,
+		inflight: make(map[[32]byte]*chunkInflight)}
 }
 
 // lockWrite 获取模块写锁（短持：WebDAV 单请求的行更新段）。
@@ -54,7 +68,9 @@ func (r *Repo) ChunkSizeBytes() int {
 	return r.chunkSize
 }
 
-// StoreChunk 将明文块去重存储：哈希命中则复用已有 chunk，否则加密写入后端。
+// StoreChunk 将明文块去重存储：哈希命中复用已有 chunk；并发同内容上传时
+// 在 in-flight 登记表上等待复用（防双写后端）。可并发调用（PutFile worker
+// 池与并发 PUT 请求各自调用；SQLite 驱动层串行，backend.Put 网络 IO 并行）。
 func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
 	h := sha256.Sum256(data)
 	if info, exists, err := r.meta.FindChunkByHash(h); err != nil {
@@ -62,6 +78,28 @@ func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
 	} else if exists {
 		return info.ID, true, nil
 	}
+	// in-flight 登记：同内容上传进行中则等待其完成并复用结果
+	r.inflightMu.Lock()
+	w, dup := r.inflight[h]
+	if !dup {
+		w = &chunkInflight{done: make(chan struct{})}
+		r.inflight[h] = w
+	}
+	r.inflightMu.Unlock()
+	if dup {
+		<-w.done
+		return w.id, true, w.err
+	}
+	// 上传者：收尾先删登记再发信号——删除后新到的同内容调用走 FindChunkByHash
+	// 命中已入库行；已在 done 上等待的按信号返回（结果与错误一并携带）
+	defer func() {
+		r.inflightMu.Lock()
+		delete(r.inflight, h)
+		r.inflightMu.Unlock()
+		w.id, w.err = chunkID, err
+		close(w.done)
+	}()
+
 	blobName, err := crypto.RandomBlobName()
 	if err != nil {
 		return 0, false, err
@@ -75,8 +113,10 @@ func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
 	}
 	id, err := r.meta.InsertChunk(h, blobName, int64(len(data)))
 	if err != nil {
-		// 并发写同一内容：另一个连接先插入，回退为复用
+		// 跨进程/连接并发写同一内容：对方已插入，删掉自己刚写的重复 blob
+		// 后回退为复用（不删则残留一个永远不被引用的孤儿 blob）
 		if info, exists, e2 := r.meta.FindChunkByHash(h); e2 == nil && exists {
+			_ = r.backend.Delete(blobName)
 			return info.ID, true, nil
 		}
 		return 0, false, err
@@ -503,36 +543,95 @@ func (r *Repo) cleanupNewChunks(newChunks []int64) {
 }
 
 // PutFile 写入（或覆盖）path 文件内容。
-// v0.5 单一当前状态语义：阶段 1 无锁分块去重上传（blob 写后端为网络 IO，
-// 内容寻址并发安全——任务 5 将并行化）；阶段 2 短锁内行更新（父目录校验
-// + 原地 upsert）。行更新失败 → 文件保留旧状态、新 blob 成孤儿（GC 回收）。
+// v0.5 两阶段语义：阶段 1 无锁并发分块去重上传——4 worker 有界池并行
+// StoreChunk（blob 写后端为网络 IO，内容寻址并发安全，StoreChunk 内部
+// in-flight 去重防同内容双写）；chunkSize 32MiB 下单 chunk 自然退化为顺序
+// 单飞。并发 PUT 请求（绿联 restic fork 4 并发）间阶段 1 互不阻塞。阶段 2
+// 短锁内行更新（父目录校验 + 原地 upsert）。失败 → 文件保留旧状态、本次
+// 新建 chunk 行清理、blob 成孤儿（GC 回收）。
 func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) error {
-	buf := make([]byte, r.chunkSize)
-	var chunks []meta.ChunkRef
+	const uploadWorkers = 4
+	type chunkJob struct {
+		idx  int
+		data []byte
+	}
+	type chunkRes struct {
+		idx    int
+		n      int64
+		id     int64
+		reused bool
+		err    error
+	}
+	jobCh := make(chan chunkJob, uploadWorkers)
+	resCh := make(chan chunkRes, uploadWorkers)
+	errCh := make(chan error, 1)
+
+	// producer：顺序读流切块送任务（channel 满即背压，源读暂停；每块独立
+	// 缓冲——job 发出后 producer 继续读，worker 消费期间缓冲不可复用）
+	go func() {
+		defer close(jobCh)
+		defer close(errCh)
+		idx := 0
+		for {
+			data := make([]byte, r.chunkSize)
+			n, err := io.ReadFull(src, data)
+			if n > 0 {
+				jobCh <- chunkJob{idx: idx, data: data[:n]}
+				idx++
+			}
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return
+			}
+			if err != nil {
+				errCh <- err // 源断流：停止切块（已发的块由 worker 收完）
+				return
+			}
+		}
+	}()
+	// 4 worker：各自 StoreChunk（backend.Put 网络 IO 并行）
+	var wg sync.WaitGroup
+	for w := 0; w < uploadWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobCh {
+				id, reused, err := r.StoreChunk(j.data)
+				resCh <- chunkRes{idx: j.idx, n: int64(len(j.data)), id: id, reused: reused, err: err}
+			}
+		}()
+	}
+	go func() { wg.Wait(); close(resCh) }()
+
+	// collector：归位乱序结果（idx 槽位），累计总量与本次新建 chunk
+	refsByIdx := make(map[int]meta.ChunkRef)
 	var total int64
 	var newChunks []int64 // 本次新建且未复用的 chunk（出错时回收）
-	for {
-		n, err := io.ReadFull(src, buf)
-		if n > 0 {
-			id, reused, err2 := r.StoreChunk(buf[:n])
-			if err2 != nil {
-				r.cleanupNewChunks(newChunks)
-				return err2
+	var firstErr error
+	for res := range resCh {
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
 			}
-			if !reused {
-				newChunks = append(newChunks, id)
-			}
-			chunks = append(chunks, meta.ChunkRef{ChunkID: id, IDX: len(chunks)})
-			total += int64(n)
-		}
-		if err == nil {
 			continue
 		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
+		refsByIdx[res.idx] = meta.ChunkRef{ChunkID: res.id, IDX: res.idx}
+		total += res.n
+		if !res.reused {
+			newChunks = append(newChunks, res.id)
 		}
+	}
+	if perr, ok := <-errCh; ok && firstErr == nil {
+		firstErr = perr
+	}
+	if firstErr != nil {
 		r.cleanupNewChunks(newChunks)
-		return err
+		return firstErr
+	}
+	// 槽位归位：idx 连续（producer 顺序编号），按序转有序 refs（块顺序 =
+	// 文件内容顺序，重组依赖）
+	chunks := make([]meta.ChunkRef, len(refsByIdx))
+	for idx, ref := range refsByIdx {
+		chunks[idx] = ref
 	}
 	unlock := r.lockWrite()
 	defer unlock()
