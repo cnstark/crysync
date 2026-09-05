@@ -78,7 +78,7 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 case "$1" in
-  init|snapshots|prune|version|--version|-v)
+  init|version|--version|-v)
     exec crysync "$@"
     ;;
   *)
