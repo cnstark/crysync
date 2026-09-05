@@ -58,6 +58,8 @@ func OpenModule(module *config.ModuleConfig) (*Module, error) {
 		return nil, fmt.Errorf("模块 %s 后端不可用: %w", module.Name, err)
 	}
 	r := repo.New(db, be, key, module.ChunkSizeBytes())
+	// 上传并发上限（跨连接共享闸门）：限制 backend.Put 网络写并发，0 = 不限制
+	r.SetUploadConcurrency(module.MaxUploadConcurrency)
 	// v0.5：单一当前状态模型——FileWriter 直接指向 repo（无快照裁剪包装）。
 	// 写方法内部：blob 上传无锁并发 + 行更新模块级短锁（见 repo 注释）。
 	return &Module{

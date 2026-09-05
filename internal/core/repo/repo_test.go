@@ -966,3 +966,134 @@ func TestPutFileConcurrentChunks(t *testing.T) {
 		}
 	}
 }
+
+// --- 模块级上传并发上限 ---
+
+// countingBackend 包装 InMemory，观测 backend.Put 的重叠并发（上限测试用）。
+type countingBackend struct {
+	backend.Backend
+	mu    sync.Mutex
+	cur   int
+	max   int
+	delay time.Duration // 每 Put 模拟网络耗时，放大重叠窗口
+}
+
+func (c *countingBackend) Put(name string, data []byte) error {
+	c.mu.Lock()
+	c.cur++
+	if c.cur > c.max {
+		c.max = c.cur
+	}
+	c.mu.Unlock()
+	if c.delay > 0 {
+		time.Sleep(c.delay)
+	}
+	err := c.Backend.Put(name, data)
+	c.mu.Lock()
+	c.cur--
+	c.mu.Unlock()
+	return err
+}
+
+func newCountingRepo(t *testing.T, delay time.Duration) (*Repo, *countingBackend) {
+	t.Helper()
+	db, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	key, _ := crypto.GenerateKey()
+	cb := &countingBackend{Backend: backend.NewInMemory(), delay: delay}
+	return New(db, cb, key, 64), cb
+}
+
+// TestUploadGateLimitsConcurrency：上限 1 时并发 StoreChunk 的后端 Put 段
+// 完全串行（max 重叠 = 1）。
+func TestUploadGateLimitsConcurrency(t *testing.T) {
+	r, cb := newCountingRepo(t, 20*time.Millisecond)
+	r.SetUploadConcurrency(1)
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, _, err := r.StoreChunk(bytes.Repeat([]byte{byte(i + 1)}, 300)); err != nil {
+				t.Errorf("StoreChunk: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.max != 1 {
+		t.Fatalf("上限 1 时后端 Put 并发应为 1, got %d", cb.max)
+	}
+	if blobs, _ := cb.List(); len(blobs) != 4 {
+		t.Fatalf("4 个不同内容应全部上传: %d", len(blobs))
+	}
+}
+
+// TestUploadGateUnlimited：不设上限时并发 StoreChunk 的后端 Put 重叠。
+func TestUploadGateUnlimited(t *testing.T) {
+	r, cb := newCountingRepo(t, 30*time.Millisecond)
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if _, _, err := r.StoreChunk(bytes.Repeat([]byte{byte(i + 9)}, 300)); err != nil {
+				t.Errorf("StoreChunk: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.max < 2 {
+		t.Fatalf("无上限时 Put 应可重叠, max=%d", cb.max)
+	}
+}
+
+// TestUploadGateSharedAcrossRepos：同 meta DB 路径的两个 Repo 实例共享同一
+// 闸门（跨连接限制——rsync 每连接一个实例、webdav 缓存一个）。
+func TestUploadGateSharedAcrossRepos(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "meta.db")
+	db1, err := meta.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	db2, err := meta.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	key, _ := crypto.GenerateKey()
+	cb := &countingBackend{Backend: backend.NewInMemory(), delay: 20 * time.Millisecond}
+	r1 := New(db1, cb, key, 64)
+	r2 := New(db2, cb, key, 64)
+	r1.SetUploadConcurrency(2)
+	r2.SetUploadConcurrency(2) // 同 path 复用同容量闸门
+
+	var wg sync.WaitGroup
+	// 各 goroutine 不同内容（绕过 in-flight 去重），6 路上传争 2 槽位
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		r := r1
+		if i >= 3 {
+			r = r2
+		}
+		go func(i int) {
+			defer wg.Done()
+			if _, _, err := r.StoreChunk([]byte{byte(i), byte(i + 1), byte(i + 2)}); err != nil {
+				t.Errorf("StoreChunk: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.max > 2 {
+		t.Fatalf("两实例共享上限 2: 实际重叠 %d", cb.max)
+	}
+}

@@ -45,8 +45,34 @@ modules:
 	if m.ChunkSizeBytes() != 4194304 {
 		t.Fatalf("默认分块大小应为 4MiB")
 	}
+	if m.MaxUploadConcurrency != 0 {
+		t.Fatalf("缺省上传并发应为 0（不限制）: %d", m.MaxUploadConcurrency)
+	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
+	}
+}
+
+// TestModuleUploadConcurrency：max_upload_concurrency 显式值解析。
+func TestModuleUploadConcurrency(t *testing.T) {
+	p := writeTemp(t, `
+front:
+  rsync:
+    listen: "127.0.0.1:873"
+modules:
+  - name: home
+    path: "/"
+    backend: { type: dir, path: /tmp/data }
+    keyfile: /tmp/keys/home.key
+    meta: /tmp/meta/home.db
+    max_upload_concurrency: 2
+`)
+	c, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Modules[0].MaxUploadConcurrency != 2 {
+		t.Fatalf("显式 max_upload_concurrency 应解析为 2: %d", c.Modules[0].MaxUploadConcurrency)
 	}
 }
 

@@ -23,11 +23,19 @@ import (
 // 无法跨连接/跨前端互斥——此包级锁保证同一模块的写操作全局串行。
 var moduleWriteLocks sync.Map // meta DB path -> *sync.Mutex
 
+// moduleUploadGates 模块级上传并发闸门（键 = meta DB 路径）：跨连接/跨前端
+// 共享的信号量，限制同一模块同时进行的 backend.Put 网络写总数。Repo 实例
+// 各自持有 gate 引用（SetUploadConcurrency 时 LoadOrStore），0 = 不限制。
+var moduleUploadGates sync.Map // meta DB path -> chan struct{}
+
 type Repo struct {
 	meta      *meta.DB
 	backend   backend.Backend
 	key       *crypto.Key
 	chunkSize int
+	// uploadGate 模块上传并发闸门（nil = 不限制）。跨 Repo 实例共享同一
+	// 通道——限制后端 API 压力需统计全部连接的上传总数，实例内信号量不够。
+	uploadGate chan struct{}
 	// inflight：StoreChunk 并发上传去重登记表（hash -> 进行中上传）。
 	// 防同内容并发双写后端 blob（夸克 WebDAV 单次 PUT 固定开销 ~3s，双写
 	// 浪费整段窗口；SQLite 访问在驱动层串行，in-flight 防的是 backend.Put
@@ -62,6 +70,18 @@ func (r *Repo) lockWrite() func() {
 // 会话期间排队等待——替代 v0.4 快照事务的并发隔离（绿联单客户端场景无感）。
 // 契约：会话内直接调用 meta 层写方法（不经 PutFile 等再次加锁），避免死锁。
 func (r *Repo) WriteSessionLock() func() { return r.lockWrite() }
+
+// SetUploadConcurrency 设置模块 blob 上传并发上限（0/负值 = 不限制）。
+// 闸门按 meta DB 路径跨 Repo 实例共享（首个设置者定容量，daemon 无热重载
+// 故不处理容量变更）。OpenModule 对每个新打开的仓库调用。
+func (r *Repo) SetUploadConcurrency(limit int) {
+	if limit <= 0 {
+		r.uploadGate = nil
+		return
+	}
+	v, _ := moduleUploadGates.LoadOrStore(r.meta.DBPath(), make(chan struct{}, limit))
+	r.uploadGate = v.(chan struct{})
+}
 
 // ChunkSizeBytes 返回分块大小（字节）。receiver 用它确定内容缓冲/分块边界。
 func (r *Repo) ChunkSizeBytes() int {
@@ -108,7 +128,7 @@ func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
 	if err != nil {
 		return 0, false, err
 	}
-	if err := r.backend.Put(blobName, blob); err != nil {
+	if err := r.putBlob(blobName, blob); err != nil {
 		return 0, false, fmt.Errorf("写入后端: %w", err)
 	}
 	id, err := r.meta.InsertChunk(h, blobName, int64(len(data)))
@@ -122,6 +142,16 @@ func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
 		return 0, false, err
 	}
 	return id, false, nil
+}
+
+// putBlob 写 blob 到后端：uploadGate 非 nil 时先获取并发槽位（超出上限排队），
+// 完成即释放。只闸门网络写段——加密/SQLite 不占槽位。
+func (r *Repo) putBlob(name string, blob []byte) error {
+	if g := r.uploadGate; g != nil {
+		g <- struct{}{}
+		defer func() { <-g }()
+	}
+	return r.backend.Put(name, blob)
 }
 
 // UpsertFile 原地落库文件行并附加块关联（替换+refcount 维护+关联全在

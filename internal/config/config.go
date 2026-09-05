@@ -76,11 +76,16 @@ type ModuleConfig struct {
 	ReadOnly bool   `yaml:"read_only"`
 	// MaxConnections 模块并发连接上限（对齐 rsyncd max connections，
 	// daemon-parm.txt）：0 = 无限制（缺省），负值 = 禁用模块，正数 = 上限。
-	MaxConnections int           `yaml:"max_connections"`
-	Backend        BackendConfig `yaml:"backend"`
-	Keyfile        string        `yaml:"keyfile"`
-	Meta           string        `yaml:"meta"`
-	ChunkSize      int           `yaml:"chunk_size"`
+	MaxConnections int `yaml:"max_connections"`
+	// MaxUploadConcurrency 模块内 blob 上传到后端的并发上限（跨连接/跨前端
+	// 共享，限制的是 backend.Put 网络写）：0 = 不限制（缺省）；正数 = 同时
+	// 最多 N 路上传，超出排队——限制后端 API 压力（夸克 WebDAV 每 PUT 内部
+	// 多次串行往返，过量并发可能触发限流）。读与删除不受限。
+	MaxUploadConcurrency int           `yaml:"max_upload_concurrency"`
+	Backend              BackendConfig `yaml:"backend"`
+	Keyfile              string        `yaml:"keyfile"`
+	Meta                 string        `yaml:"meta"`
+	ChunkSize            int           `yaml:"chunk_size"`
 }
 
 func (m *ModuleConfig) ChunkSizeBytes() int {
