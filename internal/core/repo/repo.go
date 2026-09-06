@@ -2,9 +2,11 @@
 package repo
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -16,6 +18,7 @@ import (
 	"crysync/internal/backend"
 	"crysync/internal/core/crypto"
 	"crysync/internal/core/meta"
+	"crysync/internal/core/types"
 )
 
 // moduleWriteLocks 模块级共享写锁（键 = meta DB 路径）：v0.5 单一当前状态
@@ -29,10 +32,11 @@ var moduleWriteLocks sync.Map // meta DB path -> *sync.Mutex
 var moduleUploadGates sync.Map // meta DB path -> chan struct{}
 
 type Repo struct {
-	meta      *meta.DB
-	backend   backend.Backend
-	key       *crypto.Key
-	chunkSize int
+	meta            *meta.DB
+	backend         backend.Backend
+	key             *crypto.Key
+	chunkSize       int
+	inflightLimiter *InflightLimiter
 	// uploadGate 模块上传并发闸门（nil = 不限制）。跨 Repo 实例共享同一
 	// 通道——限制后端 API 压力需统计全部连接的上传总数，实例内信号量不够。
 	uploadGate chan struct{}
@@ -83,15 +87,46 @@ func (r *Repo) SetUploadConcurrency(limit int) {
 	r.uploadGate = v.(chan struct{})
 }
 
+// SetInflightLimiter 注入进程级在途块限制器。
+func (r *Repo) SetInflightLimiter(l *InflightLimiter) { r.inflightLimiter = l }
+
+// InflightLimiter 返回当前 Repo 使用的进程级在途限制器，供运行时组装和测试观测。
+func (r *Repo) InflightLimiter() *InflightLimiter { return r.inflightLimiter }
+
 // ChunkSizeBytes 返回分块大小（字节）。receiver 用它确定内容缓冲/分块边界。
 func (r *Repo) ChunkSizeBytes() int {
 	return r.chunkSize
+}
+
+func (r *Repo) acquireInflight(ctx context.Context) (func(), error) {
+	if r.inflightLimiter == nil {
+		return func() {}, nil
+	}
+	return r.inflightLimiter.Acquire(ctx)
 }
 
 // StoreChunk 将明文块去重存储：哈希命中复用已有 chunk；并发同内容上传时
 // 在 in-flight 登记表上等待复用（防双写后端）。可并发调用（PutFile worker
 // 池与并发 PUT 请求各自调用；SQLite 驱动层串行，backend.Put 网络 IO 并行）。
 func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
+	return r.StoreChunkContext(context.Background(), data)
+}
+
+// StoreChunkContext 将明文块去重存储，并响应调用方取消。
+func (r *Repo) StoreChunkContext(ctx context.Context, data []byte) (chunkID int64, reused bool, err error) {
+	release, err := r.acquireInflight(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	defer release()
+	return r.storeChunkContext(ctx, data)
+}
+
+// storeChunkContext 执行实际工作；调用方已持有 inflight 槽位。
+func (r *Repo) storeChunkContext(ctx context.Context, data []byte) (chunkID int64, reused bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
 	h := sha256.Sum256(data)
 	if info, exists, err := r.meta.FindChunkByHash(h); err != nil {
 		return 0, false, err
@@ -107,8 +142,12 @@ func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
 	}
 	r.inflightMu.Unlock()
 	if dup {
-		<-w.done
-		return w.id, true, w.err
+		select {
+		case <-w.done:
+			return w.id, true, w.err
+		case <-ctx.Done():
+			return 0, false, ctx.Err()
+		}
 	}
 	// 上传者：收尾先删登记再发信号——删除后新到的同内容调用走 FindChunkByHash
 	// 命中已入库行；已在 done 上等待的按信号返回（结果与错误一并携带）
@@ -128,7 +167,7 @@ func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
 	if err != nil {
 		return 0, false, err
 	}
-	if err := r.putBlob(blobName, blob); err != nil {
+	if err := r.putBlobContext(ctx, blobName, blob); err != nil {
 		return 0, false, fmt.Errorf("写入后端: %w", err)
 	}
 	id, err := r.meta.InsertChunk(h, blobName, int64(len(data)))
@@ -147,9 +186,23 @@ func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
 // putBlob 写 blob 到后端：uploadGate 非 nil 时先获取并发槽位（超出上限排队），
 // 完成即释放。只闸门网络写段——加密/SQLite 不占槽位。
 func (r *Repo) putBlob(name string, blob []byte) error {
+	return r.putBlobContext(context.Background(), name, blob)
+}
+
+func (r *Repo) putBlobContext(ctx context.Context, name string, blob []byte) error {
 	if g := r.uploadGate; g != nil {
-		g <- struct{}{}
+		select {
+		case g <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		defer func() { <-g }()
+	}
+	if cb, ok := r.backend.(backend.ContextBackend); ok {
+		return cb.PutContext(ctx, name, blob)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return r.backend.Put(name, blob)
 }
@@ -580,10 +633,18 @@ func (r *Repo) cleanupNewChunks(newChunks []int64) {
 // 短锁内行更新（父目录校验 + 原地 upsert）。失败 → 文件保留旧状态、本次
 // 新建 chunk 行清理、blob 成孤儿（GC 回收）。
 func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) error {
+	_, err := r.PutFileContext(context.Background(), path, mode, mtimeNs, src)
+	return err
+}
+
+// PutFileContext 流式写入文件：读取每个块前取得进程级在途槽位，块在查重、
+// 加密和后端上传完成前持续占用槽位。请求取消或任一块失败时不更新文件行。
+func (r *Repo) PutFileContext(ctx context.Context, path string, mode uint32, mtimeNs int64, src io.Reader) (types.PutResult, error) {
 	const uploadWorkers = 4
 	type chunkJob struct {
-		idx  int
-		data []byte
+		idx     int
+		data    []byte
+		release func()
 	}
 	type chunkRes struct {
 		idx    int
@@ -595,6 +656,31 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 	jobCh := make(chan chunkJob, uploadWorkers)
 	resCh := make(chan chunkRes, uploadWorkers)
 	errCh := make(chan error, 1)
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var closeSrcOnce sync.Once
+	closeSrc := func() {
+		closeSrcOnce.Do(func() {
+			if c, ok := src.(io.Closer); ok {
+				_ = c.Close()
+			}
+		})
+	}
+	watchDone := make(chan struct{})
+	var watchWG sync.WaitGroup
+	watchWG.Add(1)
+	go func() {
+		defer watchWG.Done()
+		select {
+		case <-ctx.Done():
+			closeSrc()
+		case <-watchDone:
+		}
+	}()
+	defer func() {
+		close(watchDone)
+		watchWG.Wait()
+	}()
 
 	// producer：顺序读流切块送任务（channel 满即背压，源读暂停；每块独立
 	// 缓冲——job 发出后 producer 继续读，worker 消费期间缓冲不可复用）
@@ -603,17 +689,32 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 		defer close(errCh)
 		idx := 0
 		for {
+			release, err := r.acquireInflight(workCtx)
+			if err != nil {
+				errCh <- err
+				return
+			}
 			data := make([]byte, r.chunkSize)
 			n, err := io.ReadFull(src, data)
 			if n > 0 {
-				jobCh <- chunkJob{idx: idx, data: data[:n]}
+				select {
+				case jobCh <- chunkJob{idx: idx, data: data[:n], release: release}:
+				case <-workCtx.Done():
+					release()
+					return
+				}
 				idx++
+			} else {
+				release()
 			}
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return
 			}
 			if err != nil {
-				errCh <- err // 源断流：停止切块（已发的块由 worker 收完）
+				select {
+				case errCh <- err:
+				default:
+				}
 				return
 			}
 		}
@@ -625,8 +726,13 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 		go func() {
 			defer wg.Done()
 			for j := range jobCh {
-				id, reused, err := r.StoreChunk(j.data)
+				id, reused, err := r.storeChunkContext(workCtx, j.data)
+				j.release()
 				resCh <- chunkRes{idx: j.idx, n: int64(len(j.data)), id: id, reused: reused, err: err}
+				if err != nil {
+					closeSrc()
+					cancel()
+				}
 			}
 		}()
 	}
@@ -655,7 +761,10 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 	}
 	if firstErr != nil {
 		r.cleanupNewChunks(newChunks)
-		return firstErr
+		if errors.Is(firstErr, context.Canceled) && ctx.Err() != nil {
+			return types.PutResult{}, ctx.Err()
+		}
+		return types.PutResult{}, firstErr
 	}
 	// 槽位归位：idx 连续（producer 顺序编号），按序转有序 refs（块顺序 =
 	// 文件内容顺序，重组依赖）
@@ -663,18 +772,26 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 	for idx, ref := range refsByIdx {
 		chunks[idx] = ref
 	}
+	if err := ctx.Err(); err != nil {
+		r.cleanupNewChunks(newChunks)
+		return types.PutResult{}, err
+	}
 	unlock := r.lockWrite()
 	defer unlock()
+	if err := ctx.Err(); err != nil {
+		r.cleanupNewChunks(newChunks)
+		return types.PutResult{}, err
+	}
 	if err := checkParentDir(r, path); err != nil {
 		r.cleanupNewChunks(newChunks)
-		return err
+		return types.PutResult{}, err
 	}
 	row := meta.FileRow{Path: path, Mode: mode, Size: total, MTimeNs: mtimeNs}
 	if err := r.UpsertFile(row, chunks); err != nil {
 		r.cleanupNewChunks(newChunks)
-		return err
+		return types.PutResult{}, err
 	}
-	return nil
+	return types.PutResult{Size: total, MTimeNs: mtimeNs}, nil
 }
 
 // Mkcol 创建目录条目；已存在时幂等返回 nil（目录已存在即目标状态已达

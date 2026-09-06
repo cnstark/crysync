@@ -2,6 +2,7 @@
 package backend
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,13 @@ func NewDir(path string) (*Dir, error) {
 }
 
 func (d *Dir) Put(name string, data []byte) error {
+	return d.PutContext(context.Background(), name, data)
+}
+
+func (d *Dir) PutContext(ctx context.Context, name string, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	final := filepath.Join(d.path, name)
 	tmp, err := os.CreateTemp(d.path, "tmp-*")
 	if err != nil {
@@ -24,6 +32,11 @@ func (d *Dir) Put(name string, data []byte) error {
 		tmp.Close()
 		os.Remove(tmp.Name())
 		return fmt.Errorf("写入临时文件: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmp.Name())

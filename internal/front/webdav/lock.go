@@ -1,6 +1,6 @@
 // internal/front/webdav/lock.go
 // noopLockSystem 接受 LOCK/UNLOCK 但不维护任何状态：Windows/macOS 客户端
-// 偶发 LOCK 请求不报错；写冲突真正保障靠 SQLite 单写者 + 快照事务串行化。
+// 偶发 LOCK 请求不报错；写冲突真正保障靠模块写锁与 SQLite 单写者串行化。
 package webdav
 
 import (

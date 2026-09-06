@@ -69,6 +69,13 @@ func RunReceiverWithReader(ctx context.Context, br *bufio.Reader, conn net.Conn,
 	return RunReceiver(ctx, br, conn, module, s, logger)
 }
 
+func storeChunk(ctx context.Context, s types.Session, data []byte) (int64, bool, error) {
+	if cs, ok := s.(types.ContextSession); ok {
+		return cs.StoreChunkContext(ctx, data)
+	}
+	return s.StoreChunk(data)
+}
+
 // ITEM_* 标志（rsync.h:205-235，iflags 以 shortint 小端 2 字节发送）
 const (
 	itemTransfer = uint16(1 << 15) // ITEM_TRANSFER：需内容传输
@@ -547,7 +554,7 @@ func receiveFileLegacy(ctx context.Context, stream *MuxStream, out *MuxWriter, n
 			return nil
 		}
 		keepAlive() // StoreChunk 可能写慢后端（WebDAV）：续期 + 心跳防客户端超时误断
-		id, reused, err := s.StoreChunk(data)
+		id, reused, err := storeChunk(ctx, s, data)
 		if err != nil {
 			return err
 		}
@@ -734,7 +741,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 			return nil
 		}
 		keepAlive() // StoreChunk 可能写慢后端（WebDAV）：续期 + 心跳防客户端超时误断
-		id, reused, err := s.StoreChunk(data)
+		id, reused, err := storeChunk(ctx, s, data)
 		if err != nil {
 			return err
 		}
@@ -753,7 +760,7 @@ func receiveFileDelta(ctx context.Context, stream *MuxStream, out *MuxWriter, nd
 	flushFull := func() error {
 		for len(data) >= chunkSize {
 			full := data[:chunkSize]
-			id, reused, err := s.StoreChunk(full)
+			id, reused, err := storeChunk(ctx, s, full)
 			if err != nil {
 				return err
 			}

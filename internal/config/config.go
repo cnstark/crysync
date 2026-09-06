@@ -10,10 +10,20 @@ import (
 const DefaultChunkSize = 4194304
 
 type Config struct {
-	Front   FrontConfig    `yaml:"front"`
-	Log     LogConfig      `yaml:"log"`
-	Modules []ModuleConfig `yaml:"modules"`
+	Front              FrontConfig    `yaml:"front"`
+	Log                LogConfig      `yaml:"log"`
+	Upload             UploadConfig   `yaml:"upload"`
+	Modules            []ModuleConfig `yaml:"modules"`
+	uploadMaxSpecified bool
 }
+
+// UploadConfig 进程级上传资源限制。
+type UploadConfig struct {
+	// MaxInflightChunks 是所有模块、前端和连接共享的在途块数上限。
+	MaxInflightChunks int `yaml:"max_inflight_chunks"`
+}
+
+const DefaultMaxInflightChunks = 8
 
 // FrontConfig 前端层配置：每协议前端一节（缺省不启用）。
 type FrontConfig struct {
@@ -109,6 +119,17 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("解析配置: %w", err)
 	}
 	c.applyLogDefaults()
+	var raw map[string]yaml.Node
+	if err := yaml.Unmarshal([]byte(expanded), &raw); err == nil {
+		if upload, ok := raw["upload"]; ok && upload.Kind == yaml.MappingNode {
+			for i := 0; i+1 < len(upload.Content); i += 2 {
+				if upload.Content[i].Value == "max_inflight_chunks" {
+					c.uploadMaxSpecified = true
+				}
+			}
+		}
+	}
+	c.applyUploadDefaults()
 	if err := c.validateStructure(); err != nil {
 		return nil, err
 	}
@@ -116,6 +137,12 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+func (c *Config) applyUploadDefaults() {
+	if !c.uploadMaxSpecified && c.Upload.MaxInflightChunks == 0 {
+		c.Upload.MaxInflightChunks = DefaultMaxInflightChunks
+	}
 }
 
 // applyLogDefaults 填充 log 节缺省值（指针字段由 accessor 处理）。
@@ -169,6 +196,9 @@ func (c *Config) Validate() error {
 // validateStructure 校验配置的基本结构完整性（模块存在性及各模块必需字段）。
 // Load 使用它保证返回结构合法；重复模块名、listen 等完整性校验由 Validate 完成。
 func (c *Config) validateStructure() error {
+	if c.Upload.MaxInflightChunks <= 0 {
+		return fmt.Errorf("upload.max_inflight_chunks 必须为正数")
+	}
 	if len(c.Modules) == 0 {
 		return fmt.Errorf("至少需要一个模块")
 	}

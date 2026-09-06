@@ -59,11 +59,15 @@ func (w *WebDAV) blobURL(name string) string {
 // do 发送请求：带 Basic 认证、统一状态码处理。
 // wantStatus 为空时接受 2xx；非 2xx 返回错误。
 func (w *WebDAV) do(method, url string, body []byte, want ...int) (*http.Response, error) {
+	return w.doContext(context.Background(), method, url, body, want...)
+}
+
+func (w *WebDAV) doContext(ctx context.Context, method, url string, body []byte, want ...int) (*http.Response, error) {
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
 	}
-	req, err := http.NewRequest(method, url, rdr)
+	req, err := http.NewRequestWithContext(ctx, method, url, rdr)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +101,11 @@ func (w *WebDAV) do(method, url string, body []byte, want ...int) (*http.Respons
 
 // putOnce 单次 PUT。
 func (w *WebDAV) putOnce(name string, data []byte) error {
-	resp, err := w.do(http.MethodPut, w.blobURL(name), data)
+	return w.putOnceContext(context.Background(), name, data)
+}
+
+func (w *WebDAV) putOnceContext(ctx context.Context, name string, data []byte) error {
+	resp, err := w.doContext(ctx, http.MethodPut, w.blobURL(name), data)
 	if err != nil {
 		return err
 	}
@@ -106,15 +114,25 @@ func (w *WebDAV) putOnce(name string, data []byte) error {
 }
 
 func (w *WebDAV) Put(name string, data []byte) error {
+	return w.PutContext(context.Background(), name, data)
+}
+
+func (w *WebDAV) PutContext(ctx context.Context, name string, data []byte) error {
 	// 指数退避重试（设计文档 §7：后端写失败重试 3 次再中止）
 	var err error
 	delay := 200 * time.Millisecond
 	for attempt := 0; attempt < 3; attempt++ {
-		if err = w.putOnce(name, data); err == nil {
+		if err = w.putOnceContext(ctx, name, data); err == nil {
 			return nil
 		}
 		if attempt < 2 {
-			time.Sleep(delay)
+			t := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return ctx.Err()
+			case <-t.C:
+			}
 			delay *= 2
 		}
 	}

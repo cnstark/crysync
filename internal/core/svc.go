@@ -10,3 +10,6 @@ type Session = types.Session
 type FileStore = types.FileStore
 type FileWriter = types.FileWriter
 type RsyncService = types.RsyncService
+type PutResult = types.PutResult
+type ContextFileWriter = types.ContextFileWriter
+type ContextSession = types.ContextSession

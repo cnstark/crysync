@@ -1,20 +1,38 @@
-# CrySync 配置示例（docker compose 部署时挂载到 /conf/crysync.yaml，权限 0600）
-# front 节：rsync 与 webdav 两前端并列，各配 listen 与认证（至少启用一个）
+# Docker 配置示例；本地二进制用法见 docs/usage.md。
+# 替换口令，文件权限设为 0600，并确保容器运行身份可读。
 front:
   rsync:
     listen: "0.0.0.0:873"
     auth:
-      users: { backup: "changeme" }   # rsyncd 协议限制：明文；配置权限收紧到 0600
+      users: { backup: "changeme" }
   webdav:
     listen: "0.0.0.0:8080"
     auth:
-      users: { user: "passwd" }       # Basic 认证（明文 base64），生产建议 TLS 反代
+      users: { user: "passwd" }
+# 删除不使用的前端节；用户表省略时该前端匿名放行。
 log:
-  file: /var/log/crysync/crysyncd.log
-  level: info                         # debug/info/warn/error，缺省 info
+  level: info
+  # 默认写 stderr，由 Docker 收集。
+  # 文件日志需另行准备可写持久卷：
+  # file: /logs/crysyncd.log
+  # max_size_mb: 16
+  # max_files: 5
+# 所有模块、前端和连接共享的在途块上限；默认 8。每块默认 4 MiB，约占 64 MiB 受控内存。
+upload:
+  max_inflight_chunks: 8
 modules:
   - name: home
-    path: "/"
+    path: "/"                     # 模块列表展示，不是磁盘源路径
+    read_only: false
+    max_connections: 0            # 仅 rsync：0 不限，负数禁用
+    max_upload_concurrency: 0      # 同进程跨前端 blob 上传上限；0 不限
+    chunk_size: 4194304            # 4 MiB，仓库使用期间保持固定
     backend: { type: dir, path: /data/home }
+    # WebDAV 后端替代示例（变量须传入容器环境）：
+    # backend:
+    #   type: webdav
+    #   url: "${STORAGE_URL}"
+    #   username: "${STORAGE_USER}"
+    #   password: "${STORAGE_PASSWORD}"
     keyfile: /keys/home.key
     meta: /meta/home.db

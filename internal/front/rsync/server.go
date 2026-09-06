@@ -31,6 +31,13 @@ type rsyncService struct {
 	types.FileStore
 }
 
+func (s *rsyncService) StoreChunkContext(ctx context.Context, data []byte) (int64, bool, error) {
+	if cs, ok := s.Session.(types.ContextSession); ok {
+		return cs.StoreChunkContext(ctx, data)
+	}
+	return s.Session.StoreChunk(data)
+}
+
 func (s *rsyncService) GetFileRow(path string) (meta.FileRow, bool, error) {
 	return s.Session.GetFileRow(path)
 }
@@ -61,17 +68,25 @@ func newSessionID() string {
 
 // Server rsync 前端服务：监听并服务 rsync 协议连接（cfg.Front.Rsync 提供 listen/auth）。
 type Server struct {
-	cfg    *config.Config
-	logger *slog.Logger
+	cfg     *config.Config
+	logger  *slog.Logger
+	runtime *core.Runtime
 }
 
 // New 构造 rsync 前端（cfg.Front.Rsync 为 nil 时调用方不应构造）。
 // logger 为 nil 时全部日志丢弃（向后兼容测试/嵌入用法）。
 func New(cfg *config.Config, logger *slog.Logger) *Server {
+	return NewWithRuntime(cfg, logger, core.NewRuntime(cfg.Upload.MaxInflightChunks))
+}
+
+func NewWithRuntime(cfg *config.Config, logger *slog.Logger, runtime *core.Runtime) *Server {
 	if logger == nil {
 		logger = nopLogger
 	}
-	return &Server{cfg: cfg, logger: logger}
+	if runtime == nil {
+		runtime = core.NewRuntime(cfg.Upload.MaxInflightChunks)
+	}
+	return &Server{cfg: cfg, logger: logger, runtime: runtime}
 }
 
 func (s *Server) Name() string { return "rsync" }
@@ -122,7 +137,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			defer wg.Done()
 			defer c.Close()
 			c.SetDeadline(time.Now().Add(24 * time.Hour))
-			if err := handleConn(ctx, c, s.cfg, s.logger, limiter); err != nil && !errors.Is(err, protocol.ErrClientClosed) {
+			if err := handleConn(ctx, c, s.cfg, s.logger, limiter, s.runtime); err != nil && !errors.Is(err, protocol.ErrClientClosed) {
 				s.logger.Warn("conn_error", "client", c.RemoteAddr().String(), "err", err.Error())
 			}
 		}(conn)
@@ -163,7 +178,7 @@ func (l *moduleConnLimiter) release(name string) {
 // handleConn：handshake 与协议共享同一个 bufio.Reader（buffer 可能预读协议字节，
 // 必须传给后续协议解析，否则预读字节丢失）。握手成功后派生会话级 logger
 // （module/client/session 字段贯穿该会话全部日志事件）。
-func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config, logger *slog.Logger, limiter *moduleConnLimiter) error {
+func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config, logger *slog.Logger, limiter *moduleConnLimiter, runtime *core.Runtime) error {
 	// 握手阶段（greeting→模块选择→认证→argv 协商）读超时上限：防半开/挂死
 	// 客户端占住连接 24h（rsync 3.5.0 DAEMON_HANDSHAKE_TIMEOUT=60 同旨）；
 	// 协商完成后由 protocol.applyIoTimeout 覆盖（--timeout=N 滚动或恢复 24h）
@@ -174,7 +189,7 @@ func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config, logger *
 		return err
 	}
 	defer limiter.release(module.Name)
-	mod, err := core.OpenModule(module)
+	mod, err := runtime.OpenModule(module)
 	if err != nil {
 		fmt.Fprintf(conn, "@ERROR: %v\n", err)
 		return err

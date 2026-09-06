@@ -95,8 +95,7 @@ func (k *Key) Encrypt(plaintext []byte, blobName string) ([]byte, error) {
 	out = append(out, blobMagic...)
 	out = append(out, blobVersion)
 	out = append(out, nonce...)
-	sealed := gcm.Seal(nil, nonce, plaintext, []byte(blobName))
-	out = append(out, sealed...)
+	out = gcm.Seal(out, nonce, plaintext, []byte(blobName))
 	return out, nil
 }
 

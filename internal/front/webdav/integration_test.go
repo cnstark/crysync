@@ -202,7 +202,7 @@ func TestWebDAVRsyncCrossFront(t *testing.T) {
 		}
 	}
 
-	// 4) WebDAV DELETE + MOVE + MKCOL（写即快照生效，rsync 恢复验证）
+	// 4) WebDAV DELETE + MOVE + MKCOL（写入立即生效，rsync 恢复验证）
 	code, _ = webdavDo(t, http.MethodDelete, davBase+"/home/upload.txt", nil, nil)
 	if code != http.StatusNoContent {
 		t.Fatalf("DELETE 失败: %d", code)
@@ -235,7 +235,7 @@ func TestWebDAVRsyncCrossFront(t *testing.T) {
 		t.Fatalf("MKCOL 后 newdir 应存在: %v", err)
 	}
 
-	// 5) 单一状态收敛：多次跨前端写后，仓库清单 = 当前一致状态（快照历史
+	// 5) 单一状态收敛：多次跨前端写后，仓库清单 = 当前一致状态（历史
 	// 已删除——v0.5 单一当前状态模型）
 	mod, err := core.OpenModule(modCfg)
 	if err != nil {

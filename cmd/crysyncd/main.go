@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"crysync/internal/config"
+	"crysync/internal/core"
 	"crysync/internal/front"
 	"crysync/internal/front/rsync"
 	"crysync/internal/front/webdav"
@@ -42,12 +43,13 @@ func main() {
 	}
 
 	// 前端层组装：配置了哪个前端就启动哪个（至少一个，Validate 已保证）
+	runtime := core.NewRuntime(cfg.Upload.MaxInflightChunks)
 	var fronts []front.Front
 	if cfg.Front.Rsync != nil {
-		fronts = append(fronts, rsync.New(cfg, logger))
+		fronts = append(fronts, rsync.NewWithRuntime(cfg, logger, runtime))
 	}
 	if cfg.Front.WebDAV != nil {
-		fronts = append(fronts, webdav.New(cfg, logger))
+		fronts = append(fronts, webdav.NewWithRuntime(cfg, logger, runtime))
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

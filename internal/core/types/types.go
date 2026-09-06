@@ -4,6 +4,7 @@
 package types
 
 import (
+	"context"
 	"io"
 
 	"crysync/internal/core/meta"
@@ -60,6 +61,22 @@ type FileWriter interface {
 	DeletePath(path string) error
 	// MovePath 移动/改名 src 至 dst（目录移动递归整棵子树）。
 	MovePath(src, dst string) error
+}
+
+// PutResult 是一次成功流式上传的结果。
+type PutResult struct {
+	Size    int64
+	MTimeNs int64
+}
+
+// ContextFileWriter 是支持请求取消和结果返回的写入扩展接口。
+type ContextFileWriter interface {
+	PutFileContext(context.Context, string, uint32, int64, io.Reader) (PutResult, error)
+}
+
+// ContextSession 是支持请求取消的 rsync 写入扩展接口。
+type ContextSession interface {
+	StoreChunkContext(context.Context, []byte) (chunkID int64, reused bool, err error)
 }
 
 // RsyncService rsync 前端会话所需完整能力（Session ∪ FileStore）：

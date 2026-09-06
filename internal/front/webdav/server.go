@@ -19,16 +19,24 @@ import (
 )
 
 type Server struct {
-	cfg    *config.Config
-	logger *slog.Logger
+	cfg     *config.Config
+	logger  *slog.Logger
+	runtime *core.Runtime
 }
 
 // New 构造 WebDAV 前端（cfg.Front.WebDAV 为 nil 时调用方不应构造）。
 func New(cfg *config.Config, logger *slog.Logger) *Server {
+	return NewWithRuntime(cfg, logger, core.NewRuntime(cfg.Upload.MaxInflightChunks))
+}
+
+func NewWithRuntime(cfg *config.Config, logger *slog.Logger, runtime *core.Runtime) *Server {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Server{cfg: cfg, logger: logger}
+	if runtime == nil {
+		runtime = core.NewRuntime(cfg.Upload.MaxInflightChunks)
+	}
+	return &Server{cfg: cfg, logger: logger, runtime: runtime}
 }
 
 func (s *Server) Name() string { return "webdav" }
@@ -44,7 +52,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	modules := map[string]*core.Module{}
 	for i := range s.cfg.Modules {
 		m := &s.cfg.Modules[i]
-		mod, err := core.OpenModule(m)
+		mod, err := s.runtime.OpenModule(m)
 		if err != nil {
 			s.logger.Error("module_open_error", "module", m.Name, "err", err.Error())
 			continue
@@ -106,7 +114,7 @@ func (s *Server) buildMux(modules map[string]*core.Module) http.Handler {
 		// idempotentDelete：短路 DELETE（x/net/webdav 的 Stat 前置检查
 		// 把"删除不存在"固定映射 404，绿联 restic fork 对 404 敏感）。
 		mux.Handle(prefix+"/", auth(readOnlyGuard(m.ReadOnly,
-			idempotentDelete(dirBrowse(h, mod.FileStore, prefix), mod.FileWriter, prefix))))
+			idempotentDelete(dirBrowse(streamingPut(h, mod.FileWriter, prefix), mod.FileStore, prefix), mod.FileWriter, prefix))))
 	}
 	// 虚拟根（catch-all）：挂载服务器根的客户端 PROPFIND / 可见模块列表
 	//（按配置声明顺序，仅含已就绪模块）；未认证时先得 401 质询。

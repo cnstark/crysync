@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"context"
 	"fmt"
 	"sync"
 )
@@ -13,6 +14,12 @@ type Backend interface {
 	Ping() error
 }
 
+// ContextBackend 可取消的后端扩展接口。Backend 保留旧方法以兼容嵌入者。
+type ContextBackend interface {
+	Backend
+	PutContext(context.Context, string, []byte) error
+}
+
 // InMemory：单元测试用的假后端。并发安全（v0.5 起 blob 上传锁外并发，
 // 测试用例会多 goroutine 同时写同一测试后端）。
 type InMemory struct {
@@ -23,6 +30,12 @@ type InMemory struct {
 func NewInMemory() *InMemory { return &InMemory{m: map[string][]byte{}} }
 
 func (m *InMemory) Put(name string, data []byte) error {
+	return m.PutContext(context.Background(), name, data)
+}
+func (m *InMemory) PutContext(ctx context.Context, name string, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.m[name] = append([]byte(nil), data...)

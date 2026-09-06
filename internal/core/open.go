@@ -28,6 +28,10 @@ type Module struct {
 // OpenModule 打开模块仓库：必要时自动初始化（密钥+元数据）、
 // 校验密钥、打开元数据、构造后端。
 func OpenModule(module *config.ModuleConfig) (*Module, error) {
+	return openModule(module, nil)
+}
+
+func openModule(module *config.ModuleConfig, rt *Runtime) (*Module, error) {
 	if _, err := ensureKeyfile(module); err != nil {
 		return nil, err
 	}
@@ -60,6 +64,9 @@ func OpenModule(module *config.ModuleConfig) (*Module, error) {
 	r := repo.New(db, be, key, module.ChunkSizeBytes())
 	// 上传并发上限（跨连接共享闸门）：限制 backend.Put 网络写并发，0 = 不限制
 	r.SetUploadConcurrency(module.MaxUploadConcurrency)
+	if rt != nil {
+		r.SetInflightLimiter(rt.inflight)
+	}
 	// v0.5：单一当前状态模型——FileWriter 直接指向 repo（无快照裁剪包装）。
 	// 写方法内部：blob 上传无锁并发 + 行更新模块级短锁（见 repo 注释）。
 	return &Module{

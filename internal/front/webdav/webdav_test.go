@@ -1,19 +1,47 @@
 package webdav
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"golang.org/x/net/webdav"
 
+	"crysync/internal/core"
 	"crysync/internal/core/meta"
 )
+
+type contextTestWriter struct {
+	fakeWriter
+	started chan struct{}
+	release chan struct{}
+	err     error
+}
+
+func (w *contextTestWriter) PutFileContext(ctx context.Context, path string, mode uint32, mtimeNs int64, src io.Reader) (core.PutResult, error) {
+	if w.err != nil {
+		return core.PutResult{}, w.err
+	}
+	b := make([]byte, 1)
+	if _, err := io.ReadFull(src, b); err != nil {
+		return core.PutResult{}, err
+	}
+	close(w.started)
+	select {
+	case <-w.release:
+	case <-ctx.Done():
+		return core.PutResult{}, ctx.Err()
+	}
+	return core.PutResult{Size: 1, MTimeNs: mtimeNs}, nil
+}
 
 // fakeStore 最小 FileStore 实现（只实现测试用方法）。
 type fakeStore struct {
@@ -246,8 +274,8 @@ func TestWriteOperations(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPut, "/noparent/x.txt", strings.NewReader("x"))
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	// 409 判定下沉到 repo.PutFile 锁内 checkParentDir（适配层不再锁外预检，
-	// 曾因读到被单份模式 trim 删除的快照而 409 重试风暴）；fakeWriter 不做
+	// 409 判定下沉到 repo.PutFile 锁内 checkParentDir（适配层不做锁外预检）；
+	// fakeWriter 不做
 	// 父目录检查，真实行为由 repo 层测试与集成测试覆盖。
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("PUT（fake 层无父目录检查）应 201, got %d", rec.Code)
@@ -289,6 +317,69 @@ func TestReadOnlyFS(t *testing.T) {
 	// ——read_only 的 403 由 readOnlyGuard 中间件层保障（本测试仅验证适配层拒绝写）
 	if rec.Code == http.StatusCreated || rec.Code == http.StatusOK {
 		t.Fatalf("只读适配层不应允许写, got %d", rec.Code)
+	}
+}
+
+func TestStreamingPutStatusAndETag(t *testing.T) {
+	writer := &fakeWriter{puts: map[string]string{}}
+	h := streamingPut(http.NotFoundHandler(), writer, "/home")
+	req := httptest.NewRequest(http.MethodPut, "/home/a.txt", strings.NewReader("abc"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated || rec.Header().Get("ETag") == "" {
+		t.Fatalf("旧 FileWriter PUT 应返回 201 和 ETag，得到 code=%d etag=%q", rec.Code, rec.Header().Get("ETag"))
+	}
+
+	bad := &fakeWriter{puts: map[string]string{}}
+	badHandler := streamingPut(http.NotFoundHandler(), badWriter{fakeWriter: bad, err: os.ErrNotExist}, "/home")
+	req = httptest.NewRequest(http.MethodPut, "/home/a.txt", strings.NewReader("abc"))
+	rec = httptest.NewRecorder()
+	badHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("父目录缺失应 409，得到 %d", rec.Code)
+	}
+
+	readOnly := readOnlyGuard(true, streamingPut(http.NotFoundHandler(), writer, "/home"))
+	req = httptest.NewRequest(http.MethodPut, "/home/a.txt", strings.NewReader("abc"))
+	rec = httptest.NewRecorder()
+	readOnly.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("只读模块 PUT 应 403，得到 %d", rec.Code)
+	}
+}
+
+type badWriter struct {
+	*fakeWriter
+	err error
+}
+
+func (w badWriter) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) error {
+	return w.err
+}
+
+func TestStreamingPutStartsBeforeBodyEOF(t *testing.T) {
+	w := &contextTestWriter{fakeWriter: fakeWriter{puts: map[string]string{}}, started: make(chan struct{}), release: make(chan struct{})}
+	h := streamingPut(http.NotFoundHandler(), w, "/home")
+	req := httptest.NewRequest(http.MethodPut, "/home/a.txt", strings.NewReader("first-and-more"))
+	done := make(chan struct{})
+	go func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Errorf("PUT 应 201，得到 %d", rec.Code)
+		}
+		close(done)
+	}()
+	select {
+	case <-w.started:
+	case <-time.After(time.Second):
+		t.Fatal("首块未在请求体 EOF 前交给写入器")
+	}
+	close(w.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("流式 PUT 未收口")
 	}
 }
 

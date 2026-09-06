@@ -76,6 +76,35 @@ modules:
 	}
 }
 
+func TestUploadInflightDefaultsAndValidation(t *testing.T) {
+	p := writeTemp(t, `
+front:
+  rsync:
+    listen: "127.0.0.1:873"
+modules:
+  - name: home
+    backend: { type: dir, path: /tmp/data }
+    keyfile: /tmp/keys/home.key
+    meta: /tmp/meta/home.db
+`)
+	c, err := Load(p)
+	if err != nil || c.Upload.MaxInflightChunks != DefaultMaxInflightChunks {
+		t.Fatalf("缺省 inflight 应为 %d: %+v %v", DefaultMaxInflightChunks, c.Upload, err)
+	}
+	p = writeTemp(t, `
+upload: { max_inflight_chunks: 0 }
+front: { rsync: { listen: "127.0.0.1:873" } }
+modules:
+  - name: home
+    backend: { type: dir, path: /tmp/data }
+    keyfile: /tmp/keys/home.key
+    meta: /tmp/meta/home.db
+`)
+	if _, err := Load(p); err == nil {
+		t.Fatal("显式 0 inflight 应报错")
+	}
+}
+
 func TestValidateErrors(t *testing.T) {
 	p := writeTemp(t, "front:\n  rsync:\n    listen: \"\"\nmodules:\n  - name: a\n    path: /\n    backend: { type: dir, path: /x }\n    keyfile: /k\n    meta: /m\n")
 	c, err := Load(p)

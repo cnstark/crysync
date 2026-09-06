@@ -1,9 +1,12 @@
 // internal/front/webdav/write.go
-// 写路径：PUT 请求体缓冲到临时文件，Close 时以"写即快照"语义落库。
+// 写路径：PUT 由 streamingPut 直接流式落库；COPY 等 FileSystem 写操作仍使用临时文件。
 package webdav
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -14,10 +17,68 @@ import (
 	"crysync/internal/core"
 )
 
-// openWrite 打开写句柄：read_only 拒绝。父目录存在性不在前置检查--
-// PutFile 在写锁内的 checkParentDir 才是权威判定（锁外预检查曾读 ActiveSnapshotID
-// 到一个已被并发单份模式 trim 删除的快照，GET 旧快照清单必然落空 -> PUT 409
-// 重试风暴；405/409 映射仍由 PutFile 返回的 os.ErrNotExist 驱动）。
+// streamingPut 直接把请求体交给核心流式上传，避免 PUT 先完整写入临时文件。
+// COPY 仍通过 moduleFS.openWrite 使用临时文件，因此这里只拦截 PUT。
+func streamingPut(next http.Handler, writer core.FileWriter, prefix string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			next.ServeHTTP(w, r)
+			return
+		}
+		path := normalize(strings.TrimPrefix(r.URL.Path, prefix))
+		if path == "" {
+			http.Error(w, "cannot write module root", http.StatusMethodNotAllowed)
+			return
+		}
+		mtime := time.Now().UnixNano()
+		if cw, ok := writer.(core.ContextFileWriter); ok {
+			result, err := cw.PutFileContext(r.Context(), path, 0o100644, mtime, r.Body)
+			if err != nil {
+				writePutError(w, err)
+				return
+			}
+			w.Header().Set("ETag", fmt.Sprintf(`"%x%x"`, result.MTimeNs, result.Size))
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		// 兼容只实现旧 FileWriter 的嵌入者；正式 Repo 实现 ContextFileWriter。
+		cr := &countingReader{r: r.Body}
+		if err := writer.PutFile(path, 0o100644, mtime, cr); err != nil {
+			writePutError(w, err)
+			return
+		}
+		w.Header().Set("ETag", fmt.Sprintf(`"%x%x"`, mtime, cr.n))
+		w.WriteHeader(http.StatusCreated)
+	})
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
+}
+
+func writePutError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		status = http.StatusConflict
+	case errors.Is(err, os.ErrPermission):
+		status = http.StatusForbidden
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// 请求已取消时响应可能已无法发送；若仍可写，使用客户端取消语义。
+		status = 499
+	}
+	http.Error(w, err.Error(), status)
+}
+
+// openWrite 打开 COPY 等写句柄：read_only 拒绝。父目录存在性由最终写入阶段
+// 的 checkParentDir 判定，避免锁外检查与提交之间出现竞态。
 func (m *moduleFS) openWrite(ctx context.Context, path string) (webdav.File, error) {
 	if m.readOnly || m.writer == nil {
 		return nil, os.ErrPermission
@@ -32,7 +93,7 @@ func (m *moduleFS) openWrite(ctx context.Context, path string) (webdav.File, err
 	return &writeFile{writer: m.writer, path: path, tmp: tmp}, nil
 }
 
-// writeFile 缓冲写句柄：Write 收集到临时文件，Close 时 PutFile（写即快照）。
+// writeFile 缓冲写句柄：COPY 收集到临时文件，Close 时 PutFile。
 type writeFile struct {
 	writer core.FileWriter
 	path   string
