@@ -9,26 +9,30 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"path"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
-// WebDAV：基于 WebDAV 协议的 Backend 实现（blob 名 = 64 hex，无路径分隔符，
-// 直接作为资源名）。方法映射：
+// WebDAV：基于 WebDAV 协议的 Backend 实现。逻辑 blob 名通过哈希前缀映射到
+// 多级 collection，完整逻辑名作为叶子资源名。方法映射：
 //
-//	Put=PUT、Get=GET、Delete=DELETE、List=PROPFIND(depth=1)、Ping=PROPFIND(根)。
+//	Put=MKCOL+PUT、Get=GET、Delete=DELETE、List=逐层 PROPFIND(depth=1)、Ping=PROPFIND(根)。
 //
 // 写失败（网络/超时）按设计文档 §7 指数退避重试 3 次再报错；读失败不重试。
 type WebDAV struct {
-	baseURL string
-	user    string
-	pass    string
-	client  *http.Client
+	baseURL       string
+	user          string
+	pass          string
+	client        *http.Client
+	bucketDepth   int
+	collectionsMu sync.Mutex
+	collections   map[string]bool
 }
 
 // NewWebDAV 构造 WebDAV 后端。url 为后端根（blob 存放在其下）。
-func NewWebDAV(rawURL, user, pass string) (*WebDAV, error) {
+func NewWebDAV(rawURL, user, pass string, bucketDepth int) (*WebDAV, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("解析 webdav URL: %w", err)
@@ -36,11 +40,17 @@ func NewWebDAV(rawURL, user, pass string) (*WebDAV, error) {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("webdav URL 必须为 http/https: %q", rawURL)
 	}
+	depth, err := normalizeBucketDepth(bucketDepth)
+	if err != nil {
+		return nil, err
+	}
 	base := strings.TrimSuffix(u.String(), "/")
 	return &WebDAV{
-		baseURL: base,
-		user:    user,
-		pass:    pass,
+		baseURL:     base,
+		user:        user,
+		pass:        pass,
+		bucketDepth: depth,
+		collections: make(map[string]bool),
 		client: &http.Client{
 			// 300s：公网 WebDAV 后端（如夸克云盘）上行带宽可低至 ~0.1MiB/s，
 			// 大块 blob（chunk_size 配置 32MiB 时）传输需要数百秒；60s 会在
@@ -51,9 +61,21 @@ func NewWebDAV(rawURL, user, pass string) (*WebDAV, error) {
 	}, nil
 }
 
+func (w *WebDAV) collectionURL(parts []string) string {
+	u := w.baseURL
+	for _, part := range parts {
+		u += "/" + url.PathEscape(part)
+	}
+	return u
+}
+
 // blobURL 返回 blob 资源的完整 URL。
-func (w *WebDAV) blobURL(name string) string {
-	return w.baseURL + "/" + url.PathEscape(name)
+func (w *WebDAV) blobURL(name string) (string, error) {
+	parts, err := bucketParts(name, w.bucketDepth)
+	if err != nil {
+		return "", err
+	}
+	return w.collectionURL(parts) + "/" + url.PathEscape(name), nil
 }
 
 // do 发送请求：带 Basic 认证、统一状态码处理。
@@ -105,7 +127,15 @@ func (w *WebDAV) putOnce(name string, data []byte) error {
 }
 
 func (w *WebDAV) putOnceContext(ctx context.Context, name string, data []byte) error {
-	resp, err := w.doContext(ctx, http.MethodPut, w.blobURL(name), data)
+	parts, err := bucketParts(name, w.bucketDepth)
+	if err != nil {
+		return err
+	}
+	if err := w.ensureCollections(ctx, parts); err != nil {
+		return err
+	}
+	blobURL := w.collectionURL(parts) + "/" + url.PathEscape(name)
+	resp, err := w.doContext(ctx, http.MethodPut, blobURL, data)
 	if err != nil {
 		return err
 	}
@@ -118,6 +148,9 @@ func (w *WebDAV) Put(name string, data []byte) error {
 }
 
 func (w *WebDAV) PutContext(ctx context.Context, name string, data []byte) error {
+	if _, err := bucketParts(name, w.bucketDepth); err != nil {
+		return err
+	}
 	// 指数退避重试（设计文档 §7：后端写失败重试 3 次再中止）
 	var err error
 	delay := 200 * time.Millisecond
@@ -140,7 +173,11 @@ func (w *WebDAV) PutContext(ctx context.Context, name string, data []byte) error
 }
 
 func (w *WebDAV) Get(name string) ([]byte, error) {
-	resp, err := w.do(http.MethodGet, w.blobURL(name), nil)
+	blobURL, err := w.blobURL(name)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := w.do(http.MethodGet, blobURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("读取 blob %s: %w", name, err)
 	}
@@ -153,8 +190,12 @@ func (w *WebDAV) Get(name string) ([]byte, error) {
 }
 
 func (w *WebDAV) Delete(name string) error {
+	blobURL, err := w.blobURL(name)
+	if err != nil {
+		return err
+	}
 	// 404 视为已删除（幂等）
-	resp, err := w.do(http.MethodDelete, w.blobURL(name), nil, http.StatusNoContent, http.StatusNotFound, http.StatusOK)
+	resp, err := w.do(http.MethodDelete, blobURL, nil, http.StatusNoContent, http.StatusNotFound, http.StatusOK)
 	if err != nil {
 		return fmt.Errorf("删除 blob %s: %w", name, err)
 	}
@@ -162,16 +203,100 @@ func (w *WebDAV) Delete(name string) error {
 	return nil
 }
 
-// multistatus PROPFIND 响应（只解析 blob 名需要的 href 字段）。
+// multistatus PROPFIND 响应，同时保留 resource type 以区分 collection。
 type multistatus struct {
 	Responses []struct {
-		Href string `xml:"href"`
+		Href     string `xml:"href"`
+		Propstat []struct {
+			Prop struct {
+				ResourceType struct {
+					Collection *struct{} `xml:"collection"`
+				} `xml:"resourcetype"`
+			} `xml:"prop"`
+		} `xml:"propstat"`
 	} `xml:"response"`
 }
 
-// List 用 PROPFIND depth=1 列出后端根下的资源名。
-func (w *WebDAV) List() ([]string, error) {
-	req, err := http.NewRequest("PROPFIND", w.baseURL+"/", nil)
+func (w *WebDAV) ensureCollections(ctx context.Context, parts []string) error {
+	for i := 1; i <= len(parts); i++ {
+		key := strings.Join(parts[:i], "/")
+		w.collectionsMu.Lock()
+		known := w.collections[key]
+		w.collectionsMu.Unlock()
+		if known {
+			continue
+		}
+		resp, err := w.doContext(ctx, "MKCOL", w.collectionURL(parts[:i]), nil, http.StatusCreated, http.StatusMethodNotAllowed)
+		if err != nil {
+			return fmt.Errorf("创建 WebDAV 分桶 %s: %w", key, err)
+		}
+		resp.Body.Close()
+		w.collectionsMu.Lock()
+		w.collections[key] = true
+		w.collectionsMu.Unlock()
+	}
+	return nil
+}
+
+func collectionResponse(r struct {
+	Href     string `xml:"href"`
+	Propstat []struct {
+		Prop struct {
+			ResourceType struct {
+				Collection *struct{} `xml:"collection"`
+			} `xml:"resourcetype"`
+		} `xml:"prop"`
+	} `xml:"propstat"`
+}) bool {
+	for _, ps := range r.Propstat {
+		if ps.Prop.ResourceType.Collection != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// hrefChildName extracts exactly one child segment relative to currentURL.
+func hrefChildName(href, currentURL string) (string, bool, error) {
+	h, err := url.Parse(href)
+	if err != nil {
+		return "", false, err
+	}
+	c, err := url.Parse(currentURL)
+	if err != nil {
+		return "", false, err
+	}
+	hp := strings.TrimSuffix(h.EscapedPath(), "/")
+	cp := strings.TrimSuffix(c.EscapedPath(), "/")
+	if hp == cp {
+		return "", false, nil
+	}
+	prefix := cp + "/"
+	if !strings.HasPrefix(hp, prefix) {
+		return "", false, nil
+	}
+	rel := strings.TrimPrefix(hp, prefix)
+	if rel == "" || strings.Contains(rel, "/") {
+		return "", false, nil
+	}
+	name, err := url.PathUnescape(rel)
+	if err != nil {
+		return "", false, err
+	}
+	return name, true, nil
+}
+
+func (w *WebDAV) propfind(currentURL string) ([]struct {
+	Href     string `xml:"href"`
+	Propstat []struct {
+		Prop struct {
+			ResourceType struct {
+				Collection *struct{} `xml:"collection"`
+			} `xml:"resourcetype"`
+		} `xml:"prop"`
+	} `xml:"propstat"`
+}, error) {
+	req, err := http.NewRequest("PROPFIND", strings.TrimSuffix(currentURL, "/")+"/", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -192,23 +317,54 @@ func (w *WebDAV) List() ([]string, error) {
 	if err := xml.NewDecoder(resp.Body).Decode(&ms); err != nil {
 		return nil, fmt.Errorf("解析 PROPFIND 响应: %w", err)
 	}
-	// href 可能是绝对 URL 或根相对路径；blob 名取最后一段且必须为 64 hex
+	return ms.Responses, nil
+}
+
+// List 逐层使用 PROPFIND depth=1，返回叶子文件的逻辑 blob 名。
+func (w *WebDAV) List() ([]string, error) {
 	seen := map[string]bool{}
 	var out []string
-	for _, r := range ms.Responses {
-		u, err := url.Parse(r.Href)
+	var walk func([]string) error
+	walk = func(parts []string) error {
+		currentURL := w.collectionURL(parts)
+		responses, err := w.propfind(currentURL)
 		if err != nil {
-			continue
+			return err
 		}
-		name := path.Base(u.Path)
-		if name == "." || name == "/" || name == "" {
-			continue // 根自身
+		level := len(parts)
+		for _, r := range responses {
+			name, ok, err := hrefChildName(r.Href, currentURL)
+			if err != nil {
+				return fmt.Errorf("解析 PROPFIND href: %w", err)
+			}
+			if !ok {
+				continue
+			}
+			if level < w.bucketDepth {
+				if collectionResponse(r) && isBucketPart(name) {
+					if err := walk(append(parts, name)); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			if collectionResponse(r) || isTemporaryBlob(name) {
+				continue
+			}
+			if !blobBelongsToBucket(name, parts, w.bucketDepth) {
+				continue
+			}
+			if !seen[name] {
+				seen[name] = true
+				out = append(out, name)
+			}
 		}
-		if !seen[name] {
-			seen[name] = true
-			out = append(out, name)
-		}
+		return nil
 	}
+	if err := walk(nil); err != nil {
+		return nil, err
+	}
+	sort.Strings(out)
 	return out, nil
 }
 

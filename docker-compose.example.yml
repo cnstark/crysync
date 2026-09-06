@@ -3,7 +3,7 @@
 #   cp docker-compose.example.yml docker-compose.yml
 # 前置：配置文件已就绪——复制并编辑 conf/crysync.yaml.example 为 conf/crysync.yaml
 #（front 节含 rsync 与 webdav 两前端（至少启用一个）；密码、模块名、后端类型按需修改，
-#  权限 0600；WebDAV 后端无需 /data 卷）
+#  权限 0600；两种后端均按 bucket_depth 分桶，WebDAV 后端无需 /data 卷）
 # 端口：873 = rsync 前端；8080 = WebDAV 前端（按需开放，或仅暴露在局域网/反代后）
 # 卷权限：entrypoint 自动探测挂载目录属主并降权运行，挂载数据目录属主需一致且运行身份具有写权限；
 #   可选 PUID/PGID 环境变量显式指定运行身份；显式写 user: 则跳过探测（需自行保证权限）

@@ -68,6 +68,9 @@ func (m *InMemory) List() ([]string, error) {
 func (m *InMemory) Ping() error { return nil }
 
 // backend.go 中补 Dir 类型声明，dir.go 提供实现
-type Dir struct{ path string }
+type Dir struct {
+	path        string
+	bucketDepth int
+}
 
 func (d *Dir) Path() string { return d.path }

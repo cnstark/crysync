@@ -46,9 +46,9 @@ func openModule(module *config.ModuleConfig, rt *Runtime) (*Module, error) {
 	var be backend.Backend
 	switch module.Backend.Type {
 	case "dir":
-		be, err = backend.NewDir(module.Backend.Path)
+		be, err = backend.NewDir(module.Backend.Path, module.Backend.BucketDepth)
 	case "webdav":
-		be, err = backend.NewWebDAV(module.Backend.URL, module.Backend.Username, module.Backend.Password)
+		be, err = backend.NewWebDAV(module.Backend.URL, module.Backend.Username, module.Backend.Password, module.Backend.BucketDepth)
 	default:
 		db.Close()
 		return nil, fmt.Errorf("模块 %s: 未知后端类型 %q", module.Name, module.Backend.Type)

@@ -27,12 +27,16 @@ modules:
     max_connections: 0            # 仅 rsync：0 不限，负数禁用
     max_upload_concurrency: 0      # 同进程跨前端 blob 上传上限；0 不限
     chunk_size: 4194304            # 4 MiB，仓库使用期间保持固定
-    backend: { type: dir, path: /data/home }
+    backend:
+      type: dir
+      path: /data/home
+      bucket_depth: 2              # Dir/WebDAV 共用；每级 2 个 hex，允许 1～4
     # WebDAV 后端替代示例（变量须传入容器环境）：
     # backend:
     #   type: webdav
     #   url: "${STORAGE_URL}"
     #   username: "${STORAGE_USER}"
     #   password: "${STORAGE_PASSWORD}"
+    #   bucket_depth: 2
     keyfile: /keys/home.key
     meta: /meta/home.db

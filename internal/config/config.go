@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"crysync/internal/backend"
 	"gopkg.in/yaml.v3"
 )
 
@@ -73,11 +74,12 @@ type AuthConfig struct {
 }
 
 type BackendConfig struct {
-	Type     string `yaml:"type"`
-	Path     string `yaml:"path"`
-	URL      string `yaml:"url"`
-	Username string `yaml:"username"`
-	Password string `yaml:"password"`
+	Type        string `yaml:"type"`
+	Path        string `yaml:"path"`
+	URL         string `yaml:"url"`
+	Username    string `yaml:"username"`
+	Password    string `yaml:"password"`
+	BucketDepth int    `yaml:"bucket_depth"`
 }
 
 type ModuleConfig struct {
@@ -202,7 +204,8 @@ func (c *Config) validateStructure() error {
 	if len(c.Modules) == 0 {
 		return fmt.Errorf("至少需要一个模块")
 	}
-	for _, m := range c.Modules {
+	for i := range c.Modules {
+		m := &c.Modules[i]
 		if m.Name == "" {
 			return fmt.Errorf("模块名不能为空")
 		}
@@ -212,6 +215,11 @@ func (c *Config) validateStructure() error {
 		if m.Backend.Type == "" {
 			return fmt.Errorf("模块 %s 缺少 backend.type", m.Name)
 		}
+		depth, err := backend.NormalizeBucketDepth(m.Backend.BucketDepth)
+		if err != nil {
+			return fmt.Errorf("模块 %s: %w", m.Name, err)
+		}
+		m.Backend.BucketDepth = depth
 	}
 	return nil
 }

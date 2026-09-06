@@ -1,6 +1,6 @@
 # 配置参考
 
-配置为 YAML。完整可复制模板见 [conf/crysync.yaml.example](../conf/crysync.yaml.example)，本地路径示例见[使用与部署](usage.md#本地快速开始)。本页描述当前 v0.5 代码。
+配置为 YAML。完整可复制模板见 [conf/crysync.yaml.example](../conf/crysync.yaml.example)，本地路径示例见[使用与部署](usage.md#本地快速开始)。本页描述当前代码。
 
 ## 前端与认证
 
@@ -28,11 +28,14 @@
 | `backend.path` | dir 使用 | 本地 blob 目录 |
 | `backend.url` | webdav 使用 | HTTP/HTTPS 后端目录 URL，须已存在且可访问 |
 | `backend.username` / `password` | 可省略 | WebDAV 后端 Basic 凭据，与前端认证独立 |
+| `backend.bucket_depth` | `2`（填 `0` 也为 `2`） | Dir 与 WebDAV 共用的哈希分桶级数，只能为 `1`～`4`；每级取 SHA-256(blob 名) 的两个小写十六进制字符 |
 | `keyfile` | 必填 | 密钥文件路径；首次创建权限为 `0600` |
 | `meta` | 必填 | SQLite 文件路径 |
 | `chunk_size` | `4194304` | 分块字节数；非正数回退 4 MiB；仓库使用期间保持固定 |
 
 `max_upload_concurrency` 限制的是同时进行的后端 PUT 数，不是带宽或 HTTP 客户端数。WebDAV 文件写入内部有 4 个上传 worker；多个请求共用模块上传上限。没有配置热重载，修改后重启生效。进程内锁和闸门不提供多进程共享仓库协调能力。
+
+两种后端都将 blob 保存到分桶路径，例如 `ab/cd/<blobName>`，其中 `ab/cd` 来自逻辑 blob 名的 SHA-256 前缀，文件名仍是完整逻辑名。分桶不能关闭，深度在仓库建立后保持不变；深度越大，WebDAV 的 MKCOL 和 PROPFIND 请求越多。此次布局变化不读取或迁移旧的根目录平铺 blob。
 
 ## 进程级上传内存
 
@@ -54,6 +57,7 @@ modules:
       url: "${STORAGE_URL}"
       username: "${STORAGE_USER}"
       password: "${STORAGE_PASSWORD}"
+      bucket_depth: 2
     keyfile: /keys/archive.key
     meta: /meta/archive.db
 ```

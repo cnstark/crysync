@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,11 +46,43 @@ modules:
 	if m.ChunkSizeBytes() != 4194304 {
 		t.Fatalf("默认分块大小应为 4MiB")
 	}
+	if m.Backend.BucketDepth != 2 {
+		t.Fatalf("缺省 bucket_depth 应归一化为 2: %d", m.Backend.BucketDepth)
+	}
 	if m.MaxUploadConcurrency != 0 {
 		t.Fatalf("缺省上传并发应为 0（不限制）: %d", m.MaxUploadConcurrency)
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestBucketDepthValidation(t *testing.T) {
+	for _, depth := range []int{1, 2, 4} {
+		p := writeTemp(t, fmt.Sprintf(`
+front: { rsync: { listen: "127.0.0.1:873" } }
+modules:
+  - name: home
+    backend: { type: dir, path: /tmp/data, bucket_depth: %d }
+    keyfile: /tmp/keys/home.key
+    meta: /tmp/meta/home.db
+`, depth))
+		if _, err := Load(p); err != nil {
+			t.Fatalf("bucket_depth=%d 应通过: %v", depth, err)
+		}
+	}
+	for _, depth := range []int{-1, 5} {
+		p := writeTemp(t, fmt.Sprintf(`
+front: { rsync: { listen: "127.0.0.1:873" } }
+modules:
+  - name: home
+    backend: { type: dir, path: /tmp/data, bucket_depth: %d }
+    keyfile: /tmp/keys/home.key
+    meta: /tmp/meta/home.db
+`, depth))
+		if _, err := Load(p); err == nil {
+			t.Fatalf("bucket_depth=%d 应失败", depth)
+		}
 	}
 }
 

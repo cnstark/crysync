@@ -27,7 +27,10 @@ front:
 modules:
   - name: home
     path: "/"
-    backend: { type: dir, path: /tmp/crysync-demo/data }
+    backend:
+      type: dir
+      path: /tmp/crysync-demo/data
+      bucket_depth: 2
     keyfile: /tmp/crysync-demo/keys/home.key
     meta: /tmp/crysync-demo/meta/home.db
 ```
@@ -117,6 +120,8 @@ CLI 没有 `--module`、`snapshots`、`prune` 或 `gc`。容器中可执行 `doc
 | 上传慢或后端限流 | 通过 `max_upload_concurrency` 限制模块上传并发；`chunk_size` 会影响请求数和内存使用 |
 
 WebDAV PUT 按块流式处理，收到块后立即查重、加密并上传；进程级 `upload.max_inflight_chunks` 默认 8，槽位耗尽时暂停读取客户端。默认 4 MiB 分块、8 个槽位约占 64 MiB 受控块内存，仍需为 Go runtime、网络和元数据库预留空间。写入成功后才更新清单；上传报错或断流不会把部分请求视为成功。反向代理可能按自身配置缓存请求体。
+
+Dir 与 WebDAV 后端都按 `backend.bucket_depth` 创建 `ab/cd/<blobName>` 形式的多级分桶，默认深度为 2，可设置为 1～4。目录片段来自逻辑 blob 名的 SHA-256；旧平铺布局不读取或迁移，升级时请在新布局仓库重新备份。
 
 服务收到 SIGINT/SIGTERM 后开始退出，但主进程不保证等待所有正在进行的请求或 rsync 会话完成。维护和备份前先停止客户端写入并等待传输结束。
 

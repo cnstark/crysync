@@ -8,11 +8,15 @@ import (
 	"path/filepath"
 )
 
-func NewDir(path string) (*Dir, error) {
+func NewDir(path string, bucketDepth int) (*Dir, error) {
+	depth, err := normalizeBucketDepth(bucketDepth)
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return nil, fmt.Errorf("创建后端目录: %w", err)
 	}
-	return &Dir{path: path}, nil
+	return &Dir{path: path, bucketDepth: depth}, nil
 }
 
 func (d *Dir) Put(name string, data []byte) error {
@@ -23,8 +27,16 @@ func (d *Dir) PutContext(ctx context.Context, name string, data []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	final := filepath.Join(d.path, name)
-	tmp, err := os.CreateTemp(d.path, "tmp-*")
+	parts, err := bucketParts(name, d.bucketDepth)
+	if err != nil {
+		return err
+	}
+	bucketDir := filepath.Join(append([]string{d.path}, parts...)...)
+	if err := os.MkdirAll(bucketDir, 0o700); err != nil {
+		return fmt.Errorf("创建分桶目录: %w", err)
+	}
+	final := filepath.Join(bucketDir, name)
+	tmp, err := os.CreateTemp(bucketDir, ".tmp-*")
 	if err != nil {
 		return fmt.Errorf("创建临时文件: %w", err)
 	}
@@ -50,7 +62,11 @@ func (d *Dir) PutContext(ctx context.Context, name string, data []byte) error {
 }
 
 func (d *Dir) Get(name string) ([]byte, error) {
-	b, err := os.ReadFile(filepath.Join(d.path, name))
+	parts, err := bucketParts(name, d.bucketDepth)
+	if err != nil {
+		return nil, err
+	}
+	b, err := os.ReadFile(filepath.Join(append([]string{d.path}, append(parts, name)...)...))
 	if err != nil {
 		return nil, fmt.Errorf("读取 blob %s: %w", name, err)
 	}
@@ -58,23 +74,44 @@ func (d *Dir) Get(name string) ([]byte, error) {
 }
 
 func (d *Dir) Delete(name string) error {
-	if err := os.Remove(filepath.Join(d.path, name)); err != nil {
+	parts, err := bucketParts(name, d.bucketDepth)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(filepath.Join(append([]string{d.path}, append(parts, name)...)...)); err != nil {
 		return fmt.Errorf("删除 blob %s: %w", name, err)
 	}
 	return nil
 }
 
 func (d *Dir) List() ([]string, error) {
-	entries, err := os.ReadDir(d.path)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	out := make([]string, 0)
+	var visit func(string, []string) error
+	visit = func(dir string, parts []string) error {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
 		}
-		out = append(out, e.Name())
+		for _, e := range entries {
+			if len(parts) < d.bucketDepth {
+				if e.IsDir() && isBucketPart(e.Name()) {
+					next := append(append([]string(nil), parts...), e.Name())
+					if err := visit(filepath.Join(dir, e.Name()), next); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+			if isTemporaryBlob(e.Name()) || !e.Type().IsRegular() ||
+				!blobBelongsToBucket(e.Name(), parts, d.bucketDepth) {
+				continue
+			}
+			out = append(out, e.Name())
+		}
+		return nil
+	}
+	if err := visit(d.path, nil); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

@@ -461,6 +461,51 @@ func TestGC(t *testing.T) {
 	}
 }
 
+func TestDirBucketBackendStoreReadAndGC(t *testing.T) {
+	root := t.TempDir()
+	db, err := meta.Open(filepath.Join(root, "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	be, err := backend.NewDir(filepath.Join(root, "data"), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := New(db, be, key, 64)
+
+	content := []byte("content stored through bucketed dir backend")
+	chunkID, _, err := r.StoreChunk(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock := r.WriteSessionLock()
+	err = r.UpsertFile(meta.FileRow{Path: "file.txt", Mode: 0o644, Size: int64(len(content))}, []meta.ChunkRef{{ChunkID: chunkID, IDX: 0}})
+	unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := be.Put("direct-orphan", []byte("orphan")); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := r.GC()
+	if err != nil || deleted != 1 {
+		t.Fatalf("GC 应删除一个孤儿 blob: deleted=%d err=%v", deleted, err)
+	}
+	var got bytes.Buffer
+	if err := r.ReadFile("file.txt", &got); err != nil || !bytes.Equal(got.Bytes(), content) {
+		t.Fatalf("分桶后端读取失败: got=%q err=%v", got.Bytes(), err)
+	}
+	if names, err := be.List(); err != nil || len(names) != 1 {
+		t.Fatalf("GC 后应只保留一个被引用 blob: names=%v err=%v", names, err)
+	}
+}
+
 // TestUpsertRefcount：覆盖写入同一路径时旧 chunk 引用递减、新 chunk 引用递增
 // （chunk 行在 upsert 事务内随引用归零删除，blob 成孤儿）。
 func TestUpsertRefcount(t *testing.T) {

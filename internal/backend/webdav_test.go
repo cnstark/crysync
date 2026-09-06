@@ -6,7 +6,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -62,7 +66,7 @@ func splitAuth(s string) (string, string, bool) {
 
 func TestWebDAVRoundTrip(t *testing.T) {
 	base := startWebDAVServer(t, "")
-	be, err := NewWebDAV(base, "", "")
+	be, err := NewWebDAV(base, "", "", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,17 +104,17 @@ func TestWebDAVRoundTrip(t *testing.T) {
 func TestWebDAVAuth(t *testing.T) {
 	base := startWebDAVServer(t, "backup:secret")
 	// 无认证 → 失败
-	be, _ := NewWebDAV(base, "", "")
+	be, _ := NewWebDAV(base, "", "", 2)
 	if err := be.Put("abc", []byte("x")); err == nil {
 		t.Fatal("无认证应失败")
 	}
 	// 错误密码 → 失败
-	be2, _ := NewWebDAV(base, "backup", "wrong")
+	be2, _ := NewWebDAV(base, "backup", "wrong", 2)
 	if err := be2.Put("abc", []byte("x")); err == nil {
 		t.Fatal("错误密码应失败")
 	}
 	// 正确认证 → 成功
-	be3, _ := NewWebDAV(base, "backup", "secret")
+	be3, _ := NewWebDAV(base, "backup", "secret", 2)
 	if err := be3.Put("abc", []byte("x")); err != nil {
 		t.Fatalf("正确认证应成功: %v", err)
 	}
@@ -120,11 +124,136 @@ func TestWebDAVAuth(t *testing.T) {
 	}
 }
 
+func TestWebDAVBucketDepthsAndEscaping(t *testing.T) {
+	base := startWebDAVServer(t, "")
+	for _, depth := range []int{1, 2, 4} {
+		be, err := NewWebDAV(base, "", "", depth)
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := fmt.Sprintf("blob-%d name", depth)
+		if err := be.Put(name, []byte(name)); err != nil {
+			t.Fatalf("深度 %d Put: %v", depth, err)
+		}
+		got, err := be.Get(name)
+		if err != nil || !bytes.Equal(got, []byte(name)) {
+			t.Fatalf("深度 %d Get: %q %v", depth, got, err)
+		}
+		names, err := be.List()
+		if err != nil {
+			t.Fatalf("深度 %d List: %v", depth, err)
+		}
+		found := false
+		for _, gotName := range names {
+			if gotName == name {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("深度 %d List 未返回逻辑名 %q: %v", depth, name, names)
+		}
+	}
+}
+
 func TestWebDAVInvalidURL(t *testing.T) {
-	if _, err := NewWebDAV("ftp://host/x", "", ""); err == nil {
+	if _, err := NewWebDAV("ftp://host/x", "", "", 2); err == nil {
 		t.Fatal("非 http(s) URL 应报错")
 	}
-	if _, err := NewWebDAV("://bad", "", ""); err == nil {
+	if _, err := NewWebDAV("://bad", "", "", 2); err == nil {
 		t.Fatal("非法 URL 应报错")
+	}
+}
+
+func TestWebDAVCollectionCache(t *testing.T) {
+	var mkcols atomic.Int32
+	dav := &webdav.Handler{FileSystem: webdav.NewMemFS(), LockSystem: webdav.NewMemLS()}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "MKCOL" {
+			mkcols.Add(1)
+		}
+		dav.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	be, err := NewWebDAV(srv.URL, "", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := be.Put("same-blob", []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if got := mkcols.Load(); got != 2 {
+		t.Fatalf("首次 Put 的 MKCOL 次数 = %d，期望 2", got)
+	}
+	if err := be.Put("same-blob", []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	if got := mkcols.Load(); got != 2 {
+		t.Fatalf("缓存命中后仍发送 MKCOL，累计次数 = %d", got)
+	}
+}
+
+func TestWebDAVConcurrentFirstPut(t *testing.T) {
+	base := startWebDAVServer(t, "")
+	be, err := NewWebDAV(base, "", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = 8
+	errCh := make(chan error, count)
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := be.Put("same-new-blob", []byte("same-data")); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	got, err := be.Get("same-new-blob")
+	if err != nil || !bytes.Equal(got, []byte("same-data")) {
+		t.Fatalf("并发首次建桶后读取失败: got=%q err=%v", got, err)
+	}
+}
+
+func TestWebDAVListIgnoresMisplacedBlob(t *testing.T) {
+	base := startWebDAVServer(t, "")
+	be, err := NewWebDAV(base, "", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := be.Put("valid", []byte("valid")); err != nil {
+		t.Fatal(err)
+	}
+	parts, _ := bucketParts("valid", 2)
+	misplaced := "misplaced"
+	for blobBelongsToBucket(misplaced, parts, 2) {
+		misplaced += "x"
+	}
+	req, err := http.NewRequest(http.MethodPut, be.collectionURL(parts)+"/"+url.PathEscape(misplaced), bytes.NewReader([]byte("x")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		t.Fatalf("准备错误分桶对象失败: HTTP %d", resp.StatusCode)
+	}
+
+	names, err := be.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 1 || names[0] != "valid" {
+		t.Fatalf("List 应只返回严格布局中的 blob，得到 %v", names)
 	}
 }
