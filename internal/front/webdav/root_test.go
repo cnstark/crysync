@@ -11,7 +11,7 @@ import (
 
 // newTestRoot 构造带认证的虚拟根处理器（模拟 buildMux 的装配形态）。
 func newTestRoot(names ...string) http.Handler {
-	return basicAuth(map[string]string{"backup": "secret"})(&rootHandler{moduleNames: names})
+	return basicAuth(map[string]string{"backup": "secret"})(&rootHandler{names: func() []string { return names }})
 }
 
 func TestRootPropfind(t *testing.T) {

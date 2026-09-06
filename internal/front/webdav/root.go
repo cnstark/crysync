@@ -13,7 +13,7 @@ import (
 )
 
 type rootHandler struct {
-	moduleNames []string // 就绪模块名（按配置声明顺序）
+	names func() []string // 就绪模块名（按配置声明顺序，动态读取模块缓存）
 }
 
 func (h *rootHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +45,7 @@ func (h *rootHandler) propfind(w http.ResponseWriter, r *http.Request) {
 	b.WriteString(`<D:multistatus xmlns:D="DAV:">` + "\n")
 	writeRootResponse(&b, "")
 	if r.Header.Get("Depth") != "0" {
-		for _, name := range h.moduleNames {
+		for _, name := range h.names() {
 			writeRootResponse(&b, name)
 		}
 	}
@@ -78,7 +78,7 @@ func writeRootResponse(b *strings.Builder, name string) {
 func (h *rootHandler) getIndex(w http.ResponseWriter) {
 	var b strings.Builder
 	b.WriteString("<!DOCTYPE html><html><head><title>crysync</title></head><body><ul>")
-	for _, name := range h.moduleNames {
+	for _, name := range h.names() {
 		href := xmlEscapeText("/" + name + "/")
 		fmt.Fprintf(&b, `<li><a href="%s">%s/</a></li>`, href, xmlEscapeText(name))
 	}

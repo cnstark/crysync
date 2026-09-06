@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"time"
 
 	"golang.org/x/net/webdav"
 
@@ -18,10 +19,14 @@ import (
 	"crysync/internal/core"
 )
 
+const moduleOpenCooldown = 30 * time.Second // 懒打开失败冷却（与后台退避上限一致）
+
 type Server struct {
 	cfg     *config.Config
 	logger  *slog.Logger
 	runtime *core.Runtime
+	// openCooldown 懒打开失败冷却期（集成测试可缩短；生产用默认值）。
+	openCooldown time.Duration
 }
 
 // New 构造 WebDAV 前端（cfg.Front.WebDAV 为 nil 时调用方不应构造）。
@@ -36,20 +41,25 @@ func NewWithRuntime(cfg *config.Config, logger *slog.Logger, runtime *core.Runti
 	if runtime == nil {
 		runtime = core.NewRuntime(cfg.Upload.MaxInflightChunks)
 	}
-	return &Server{cfg: cfg, logger: logger, runtime: runtime}
+	return &Server{cfg: cfg, logger: logger, runtime: runtime, openCooldown: moduleOpenCooldown}
 }
 
 func (s *Server) Name() string { return "webdav" }
 
 // Serve 监听并服务 WebDAV 请求，直到 ctx 取消。
 // 顺序要点：先完成模块缓存（OpenModule）+ buildMux，再 net.Listen——
-// 保证监听建立时 mux 已就绪（若先监听后开模块，期间的并发请求会命中
-// 默认 mux 返回 404 page not found，并行套件负载下是不可靠的就绪窗口）。
+// 保证监听建立时 mux 已就绪；打开失败的模块由请求路径懒打开自愈。
 func (s *Server) Serve(ctx context.Context) error {
 	wd := s.cfg.Front.WebDAV
 
-	// 模块仓库缓存：启动时逐模块打开（失败记日志跳过，该模块请求 404）
-	modules := map[string]*core.Module{}
+	// 模块仓库缓存：启动时预填充成功打开的模块；失败记日志跳过，
+	// 该模块的后续请求经懒打开自愈（成功自动入缓存，未就绪 503）。
+	order := make([]string, 0, len(s.cfg.Modules))
+	for i := range s.cfg.Modules {
+		order = append(order, s.cfg.Modules[i].Name)
+	}
+	cache := newModuleCache(s.openCooldown, order)
+	var opened []*core.Module
 	for i := range s.cfg.Modules {
 		m := &s.cfg.Modules[i]
 		mod, err := s.runtime.OpenModule(m)
@@ -57,21 +67,21 @@ func (s *Server) Serve(ctx context.Context) error {
 			s.logger.Error("module_open_error", "module", m.Name, "err", err.Error())
 			continue
 		}
-		modules[m.Name] = mod
+		opened = append(opened, mod)
+		cache.preload(m.Name, s.buildModuleHandler(m, mod))
 	}
-	srv := &http.Server{Handler: s.buildMux(modules)}
+	srv := &http.Server{Handler: s.buildMux(cache)}
 
 	ln, err := net.Listen("tcp", wd.Listen)
 	if err != nil {
-		// 监听失败：关闭已打开的模块仓库，避免句柄泄漏
-		//（正常退出不关闭——in-flight 请求可能仍在用，维持原语义）
-		for _, mod := range modules {
+		// 监听失败：关闭已打开的模块仓库，避免句柄泄漏。
+		for _, mod := range opened {
 			_ = mod.Close()
 		}
 		return fmt.Errorf("监听 %s: %w", wd.Listen, err)
 	}
 	defer ln.Close()
-	s.logger.Info("webdav_start", "listen", wd.Listen, "modules", len(modules))
+	s.logger.Info("webdav_start", "listen", wd.Listen, "modules", len(cache.names()))
 
 	go func() {
 		<-ctx.Done()
@@ -84,48 +94,51 @@ func (s *Server) Serve(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) buildMux(modules map[string]*core.Module) http.Handler {
+// buildModuleHandler 构造模块的完整 handler 链（懒打开成功后调用一次并缓存）。
+func (s *Server) buildModuleHandler(m *config.ModuleConfig, mod *core.Module) http.Handler {
+	prefix := "/" + m.Name
+	h := &webdav.Handler{
+		FileSystem: &moduleFS{store: mod.FileStore, writer: mod.FileWriter, readOnly: m.ReadOnly},
+		LockSystem: noopLockSystem{},
+		Logger: func(r *http.Request, err error) {
+			if err != nil {
+				s.logger.Warn("webdav_request_error", "method", r.Method, "path", r.URL.Path, "err", err.Error())
+			}
+		},
+	}
+	// 子树 pattern："/home/" 与 "/home/a.txt" 都命中；"/home" 由 ServeMux
+	// 301 重定向到 "/home/"。Handler.Prefix 统一剥离请求路径与 Destination
+	// 头的 /home 前缀，避免 MOVE/COPY 的目标路径带模块前缀而写失败。
+	h.Prefix = prefix
+	// dirBrowse：浏览器 GET 目录渲染 HTML 文件列表，标准客户端走 PROPFIND
+	// 不受影响；idempotentDelete：短路 DELETE。
+	return readOnlyGuard(m.ReadOnly,
+		idempotentDelete(dirBrowse(streamingPut(h, mod.FileWriter, prefix), mod.FileStore, prefix), mod.FileWriter, prefix))
+}
+
+func (s *Server) buildMux(cache *moduleCache) http.Handler {
 	mux := http.NewServeMux()
 	auth := basicAuth(s.cfg.Front.WebDAV.Auth.Users)
 	for i := range s.cfg.Modules {
 		m := &s.cfg.Modules[i]
-		mod, ok := modules[m.Name]
-		if !ok {
-			continue
-		}
-		h := &webdav.Handler{
-			FileSystem: &moduleFS{store: mod.FileStore, writer: mod.FileWriter, readOnly: m.ReadOnly},
-			LockSystem: noopLockSystem{},
-			Logger: func(r *http.Request, err error) {
-				if err != nil {
-					s.logger.Warn("webdav_request_error", "method", r.Method, "path", r.URL.Path, "err", err.Error())
-				}
-			},
-		}
-		// 子树 pattern："/home/" 与 "/home/a.txt" 都命中；"/home" 由 ServeMux
-		// 301 重定向到 "/home/"（WebDAV 客户端访问根的标准形态）。
-		// Handler.Prefix 设为模块名，由 x/net/webdav 统一剥离请求路径与
-		// Destination 头的 /home 前缀（http.StripPrefix 只剥请求路径，不剥
-		// MOVE/COPY 的 Destination 头，会导致目标路径带模块前缀而写失败）。
 		prefix := "/" + m.Name
-		h.Prefix = prefix
-		// dirBrowse：浏览器 GET 目录渲染 HTML 文件列表（标准客户端走
-		// PROPFIND 不受影响；x/net/webdav 对目录 GET 固定 405）。
-		// idempotentDelete：短路 DELETE（x/net/webdav 的 Stat 前置检查
-		// 把"删除不存在"固定映射 404，绿联 restic fork 对 404 敏感）。
-		mux.Handle(prefix+"/", auth(readOnlyGuard(m.ReadOnly,
-			idempotentDelete(dirBrowse(streamingPut(h, mod.FileWriter, prefix), mod.FileStore, prefix), mod.FileWriter, prefix))))
+		mux.Handle(prefix+"/", auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			h, first, err := cache.open(m.Name,
+				func() (*core.Module, error) { return s.runtime.OpenModule(m) },
+				func(mod *core.Module) http.Handler { return s.buildModuleHandler(m, mod) })
+			if err != nil {
+				if first {
+					s.logger.Warn("module_open_error", "module", m.Name, "err", err.Error())
+				}
+				w.Header().Set("Retry-After", "30")
+				http.Error(w, "503 Service Unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			h.ServeHTTP(w, r)
+		})))
 	}
 	// 虚拟根（catch-all）：挂载服务器根的客户端 PROPFIND / 可见模块列表
-	//（按配置声明顺序，仅含已就绪模块）；未认证时先得 401 质询。
-	// 此前根上无处理器：PROPFIND / 得裸 404，WebDAV 客户端报
-	// "根文件夹不存在或无权限"。
-	rootNames := make([]string, 0, len(modules))
-	for i := range s.cfg.Modules {
-		if _, ok := modules[s.cfg.Modules[i].Name]; ok {
-			rootNames = append(rootNames, s.cfg.Modules[i].Name)
-		}
-	}
-	mux.Handle("/", auth(&rootHandler{moduleNames: rootNames}))
+	//（按配置声明顺序，仅含已就绪模块；懒打开成功后自动出现）；未认证时先得 401。
+	mux.Handle("/", auth(&rootHandler{names: cache.names}))
 	return mux
 }
