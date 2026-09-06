@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type rootHandler struct {
@@ -58,7 +59,7 @@ func (h *rootHandler) propfind(w http.ResponseWriter, r *http.Request) {
 // writeRootResponse 写一条根/模块集合的 response。name 为空 = 根自身。
 func writeRootResponse(b *strings.Builder, name string) {
 	href := "/"
-	display := ""
+	display := "crysync"
 	if name != "" {
 		href = "/" + name + "/"
 		display = name
@@ -66,10 +67,14 @@ func writeRootResponse(b *strings.Builder, name string) {
 	b.WriteString(" <D:response>\n")
 	fmt.Fprintf(b, "  <D:href>%s</D:href>\n", xmlEscapeText(href))
 	b.WriteString("  <D:propstat>\n   <D:prop>\n")
-	if display != "" {
-		fmt.Fprintf(b, "    <D:displayname>%s</D:displayname>\n", xmlEscapeText(display))
-	}
+	fmt.Fprintf(b, "    <D:displayname>%s</D:displayname>\n", xmlEscapeText(display))
 	b.WriteString("    <D:resourcetype><D:collection/></D:resourcetype>\n")
+	// Keep the virtual root's collection properties aligned with the
+	// x/net/webdav handler used for /<module>/. Some WebDAV clients treat a
+	// collection with only resourcetype as inaccessible and report a
+	// misleading "permission denied" error.
+	fmt.Fprintf(b, "    <D:getlastmodified>%s</D:getlastmodified>\n", time.Unix(0, 0).UTC().Format(http.TimeFormat))
+	b.WriteString("    <D:supportedlock><D:lockentry xmlns:D=\"DAV:\"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>\n")
 	b.WriteString("   </D:prop>\n   <D:status>HTTP/1.1 200 OK</D:status>\n")
 	b.WriteString("  </D:propstat>\n </D:response>\n")
 }

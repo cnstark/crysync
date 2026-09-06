@@ -35,7 +35,11 @@ func TestRootPropfind(t *testing.T) {
 		t.Fatalf("PROPFIND 根应 207, got %d: %s", rec.Code, rec.Body.String())
 	}
 	body := rec.Body.String()
-	for _, want := range []string{`<D:href>/</D:href>`, `<D:href>/backup/</D:href>`, `<D:href>/test/</D:href>`, "<D:collection/>"} {
+	for _, want := range []string{`<D:href>/</D:href>`, `<D:href>/backup/</D:href>`, `<D:href>/test/</D:href>`,
+		"<D:displayname>crysync</D:displayname>", "<D:displayname>backup</D:displayname>",
+		"<D:collection/>", "<D:getlastmodified>Thu, 01 Jan 1970 00:00:00 GMT</D:getlastmodified>",
+		"<D:supportedlock>", "<D:lockentry", "<D:lockscope><D:exclusive/>", "<D:locktype><D:write/>",
+	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("PROPFIND 根响应缺 %q: %s", want, body)
 		}
