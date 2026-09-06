@@ -3,6 +3,7 @@
 package rsync
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -13,10 +14,12 @@ import (
 	"testing"
 	"time"
 
+	"crysync/internal/backend"
 	"crysync/internal/config"
 	"crysync/internal/core"
 	"crysync/internal/core/crypto"
 	"crysync/internal/core/meta"
+	corerepo "crysync/internal/core/repo"
 )
 
 // testModule 构造指向临时目录的模块配置（不落任何文件）。
@@ -67,26 +70,79 @@ func TestOpenRepoAutoInitFresh(t *testing.T) {
 	}
 }
 
-// TestOpenRepoMetaAutoCreate：密钥已存在、元数据库缺失时自动建库，密钥不动。
-func TestOpenRepoMetaAutoCreate(t *testing.T) {
+// TestOpenRepoRejectKeyOnlyWithoutBackup：密钥已存在、Meta 与远端备份均缺失时拒绝空库。
+func TestOpenRepoRejectKeyOnlyWithoutBackup(t *testing.T) {
 	m := testModule(t)
 	k, _ := crypto.GenerateKey()
 	if err := crypto.SaveKeyFile(m.Keyfile, k); err != nil {
 		t.Fatal(err)
 	}
-	before, _ := os.ReadFile(m.Keyfile)
+	if _, err := core.OpenModule(m); err == nil || !strings.Contains(err.Error(), "远端没有可恢复备份") {
+		t.Fatalf("密钥单独存在时应拒绝创建空 Meta: %v", err)
+	}
+	if _, err := os.Stat(m.Meta); !os.IsNotExist(err) {
+		t.Fatal("拒绝时不应创建 Meta")
+	}
+}
+
+func TestOpenRepoRejectsFreshInitOverExistingBlobs(t *testing.T) {
+	m := testModule(t)
+	be, err := backend.NewDir(m.Backend.Path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := be.Put("existing", []byte("ciphertext")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := core.OpenModule(m); err == nil || !strings.Contains(err.Error(), "远端已有数据 blob") {
+		t.Fatalf("不应在已有 blob 上生成新 key/Meta: %v", err)
+	}
+	if _, err := os.Stat(m.Keyfile); !os.IsNotExist(err) {
+		t.Fatal("拒绝时不应生成 key")
+	}
+}
+
+func TestOpenRepoRestoresMetaFromRemoteUsingKey(t *testing.T) {
+	m := testModule(t)
 	mod, err := core.OpenModule(m)
 	if err != nil {
-		t.Fatalf("密钥在而元数据缺失时应自动建库: %v", err)
+		t.Fatal(err)
 	}
-	closeRepo := mod.Close
-	closeRepo()
-	if _, err := os.Stat(m.Meta); err != nil {
-		t.Fatalf("元数据库未创建: %v", err)
+	content := []byte("restore from remote meta")
+	if err := mod.Repo.PutFile("restored.txt", 0o644, time.Now().UnixNano(), bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
 	}
-	after, _ := os.ReadFile(m.Keyfile)
-	if string(before) != string(after) {
-		t.Fatal("自动建库不应改动密钥文件")
+	mod.Close()
+	key, err := crypto.LoadKeyFile(m.Keyfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := meta.OpenExisting(m.Meta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	be, err := backend.NewDir(m.Backend.Path, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := corerepo.CreateMetaBackup(context.Background(), db, be, key, 24); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if err := os.Remove(m.Meta); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(m.Meta + "-wal")
+	_ = os.Remove(m.Meta + "-shm")
+
+	mod, err = core.OpenModule(m)
+	if err != nil {
+		t.Fatalf("自动恢复失败: %v", err)
+	}
+	defer mod.Close()
+	var got bytes.Buffer
+	if err := mod.Repo.ReadFile("restored.txt", &got); err != nil || !bytes.Equal(got.Bytes(), content) {
+		t.Fatalf("恢复后文件不完整: got=%q err=%v", got.Bytes(), err)
 	}
 }
 

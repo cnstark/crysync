@@ -101,7 +101,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	defer ln.Close()
 	s.logger.Info("daemon_start", "listen", rc.Listen, "modules", len(s.cfg.Modules))
 
-	// 启动时逐模块自动初始化（密钥+元数据，幂等）；失败仅记日志不中断监听，
+	// 启动时逐模块初始化或恢复（幂等）；失败仅记日志不中断监听，
 	// 连接路径 core.OpenModule 会重试并通过 @ERROR 反馈客户端
 	for i := range s.cfg.Modules {
 		autoInit, err := core.EnsureModuleInit(&s.cfg.Modules[i])

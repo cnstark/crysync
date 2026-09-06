@@ -3,7 +3,9 @@ package backend
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -255,5 +257,34 @@ func TestWebDAVListIgnoresMisplacedBlob(t *testing.T) {
 	}
 	if len(names) != 1 || names[0] != "valid" {
 		t.Fatalf("List 应只返回严格布局中的 blob，得到 %v", names)
+	}
+}
+
+func TestWebDAVMetaNamespace(t *testing.T) {
+	base := startWebDAVServer(t, "")
+	be, err := NewWebDAV(base, "", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := bytes.NewReader([]byte("encrypted meta"))
+	if err := be.PutMetaContext(context.Background(), "one.cmeta", src, int64(src.Len())); err != nil {
+		t.Fatal(err)
+	}
+	names, err := be.ListMetaContext(context.Background())
+	if err != nil || len(names) != 1 || names[0] != "one.cmeta" {
+		t.Fatalf("Meta List: %v %v", names, err)
+	}
+	r, err := be.GetMetaContext(context.Background(), "one.cmeta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(r)
+	r.Close()
+	if string(got) != "encrypted meta" {
+		t.Fatalf("Meta 内容错误: %q", got)
+	}
+	dataNames, err := be.List()
+	if err != nil || len(dataNames) != 0 {
+		t.Fatalf("Meta 不应进入数据 blob List: %v %v", dataNames, err)
 	}
 }

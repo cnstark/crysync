@@ -14,9 +14,9 @@
 | `internal/core/types` | `Session`、`FileStore`、`FileWriter`、`RsyncService` 接口 |
 | `internal/core` | 门面及 `OpenModule` / `EnsureModuleInit` 工厂 |
 | `internal/core/repo` | 文件访问、分块、去重、流式重组、写锁、上传闸门、进程级在途限流、GC 方法 |
-| `internal/core/meta` | SQLite 清单与块引用更新 |
-| `internal/core/crypto` | 密钥格式、随机 blob 名、AES-256-GCM |
-| `internal/backend` | `Put/Get/Delete/List/Ping` 接口，Dir / WebDAV 实现与测试用 InMemory |
+| `internal/core/meta` | SQLite 清单、块引用更新、在线一致快照与结构校验 |
+| `internal/core/crypto` | 密钥格式、随机 blob 名、blob 加密与 CRYM 分片 Meta 加密 |
+| `internal/backend` | blob 的 `Put/Get/Delete/List/Ping` 及 Meta 快照流式存取接口，Dir / WebDAV 实现与测试用 InMemory |
 | `internal/config`、`internal/logging` | YAML 加载与日志轮转 |
 
 前端通过核心接口访问文件；存储实现位于 core 和 backend。接口复用 `meta.FileRow` 等类型，前端不负责加密和后端操作。
@@ -35,6 +35,8 @@
 文件固定分块后以 SHA-256 查重，命中复用同模块已有块。新块使用 AES-256-GCM 和随机 nonce 加密；AAD 绑定逻辑 blob 名，使不同名字下的密文互换不能通过认证。后端内部才把逻辑名映射为物理分桶路径，数据库和加密层不保存物理路径。该机制不对明文元数据库提供认证，也不提供历史回滚检测。旧平铺布局不读取、不迁移。
 
 blob 先写后端，再写块记录，最后更新文件清单。`meta.UpsertFile` 将单个文件替换、旧/新引用计数维护和块关联放在一个事务内。覆盖/删除让引用归零时移除 chunk 行，后端 blob 成为孤儿。`Repo.GC()` 按 `file_chunks JOIN files` 的实际引用回收，但没有 CLI 或定时调用，也不应假设它能与在途上传安全并行。
+
+本地 Meta 是在线数据库；远端 `meta/` 只保存不可变灾难恢复快照。快照由 SQLite Online Backup 生成，再使用从主 key 域分离派生的密钥按帧 AES-GCM 加密。GC 删除 blob 前会合并当前清单与所有保留 Meta 快照的引用集合；任一快照无法验证时停止删除。
 
 ## 写入与并发
 
@@ -58,8 +60,10 @@ WebDAV PUT → 进程级 inflight 槽位 → 4 worker 分块查重/加密/上传
 
 ## 初始化与生命周期
 
-- `EnsureModuleInit` 创建缺失密钥和元数据库，不打开或 Ping 后端；元数据库存在但密钥缺失时拒绝生成新密钥。
-- rsync 前端先监听，再逐模块初始化；选择模块的连接通过 `OpenModule` 打开仓库并 Ping 后端。
+- `EnsureModuleInit` 会探测数据后端并执行初始化状态机。key 与 Meta 都缺失且远端无备份时创建新仓库；只有 key 时必须从远端恢复，远端无有效备份则报错；Meta 存在但 key 缺失时拒绝生成新密钥。
+- daemon 在前端监听前准备模块；恢复候选通过 CRYM 认证、SQLite/关系语义检查以及所有引用 blob 的解密、hash 和大小校验后才原子发布。
+- 每模块只有一个 Meta 备份调度器：启动后立即执行，随后默认每小时执行并保留 24 个版本。
+- daemon 先完成模块初始化或恢复，再启动前端；rsync 连接选择模块时通过 `OpenModule` 做幂等状态检查并 Ping 后端。
 - WebDAV 前端启动时预打开并缓存模块，然后监听；打开失败的模块记日志并跳过，修复后需要重启。
 - daemon 在退出信号或首个前端退出时结束等待，尚无等待全部在途传输完成的停机屏障。
 

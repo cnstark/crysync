@@ -1,13 +1,15 @@
 // internal/core/open.go
-// 模块打开逻辑：中端层负责"配置 → 打开仓库"，前端与 CLI 共用。
-// 打开时自动初始化（密钥+元数据）、校验密钥、构造后端。
+// 模块打开逻辑：中端层负责"配置 → 初始化或恢复 → 打开仓库"，前端与 CLI 共用。
 package core
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"crysync/internal/backend"
 	"crysync/internal/config"
@@ -25,41 +27,29 @@ type Module struct {
 	Close      func() error
 }
 
-// OpenModule 打开模块仓库：必要时自动初始化（密钥+元数据）、
-// 校验密钥、打开元数据、构造后端。
+// OpenModule 打开模块仓库：全新后端自动初始化；只有 key 时从远端恢复 Meta。
 func OpenModule(module *config.ModuleConfig) (*Module, error) {
 	return openModule(module, nil)
 }
 
 func openModule(module *config.ModuleConfig, rt *Runtime) (*Module, error) {
-	if _, err := ensureKeyfile(module); err != nil {
+	be, err := openBackend(module)
+	if err != nil {
+		return nil, err
+	}
+	if err := be.Ping(); err != nil {
+		return nil, fmt.Errorf("模块 %s 后端不可用: %w", module.Name, err)
+	}
+	if _, err := ensureModuleReady(module, be); err != nil {
 		return nil, err
 	}
 	key, err := crypto.LoadKeyFile(module.Keyfile)
 	if err != nil {
 		return nil, err
 	}
-	db, err := meta.Open(module.Meta)
+	db, err := meta.OpenExisting(module.Meta)
 	if err != nil {
 		return nil, err
-	}
-	var be backend.Backend
-	switch module.Backend.Type {
-	case "dir":
-		be, err = backend.NewDir(module.Backend.Path, module.Backend.BucketDepth)
-	case "webdav":
-		be, err = backend.NewWebDAV(module.Backend.URL, module.Backend.Username, module.Backend.Password, module.Backend.BucketDepth)
-	default:
-		db.Close()
-		return nil, fmt.Errorf("模块 %s: 未知后端类型 %q", module.Name, module.Backend.Type)
-	}
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := be.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("模块 %s 后端不可用: %w", module.Name, err)
 	}
 	r := repo.New(db, be, key, module.ChunkSizeBytes())
 	// 上传并发上限（跨连接共享闸门）：限制 backend.Put 网络写并发，0 = 不限制
@@ -78,8 +68,20 @@ func openModule(module *config.ModuleConfig, rt *Runtime) (*Module, error) {
 	}, nil
 }
 
+func openBackend(module *config.ModuleConfig) (backend.Backend, error) {
+	switch module.Backend.Type {
+	case "dir":
+		return backend.NewDir(module.Backend.Path, module.Backend.BucketDepth)
+	case "webdav":
+		return backend.NewWebDAV(module.Backend.URL, module.Backend.Username, module.Backend.Password, module.Backend.BucketDepth)
+	default:
+		return nil, fmt.Errorf("模块 %s: 未知后端类型 %q", module.Name, module.Backend.Type)
+	}
+}
+
 // keyfileMutexes 同进程内按密钥路径串行化自动初始化（多个连接同时首开同一模块）。
-var keyfileMutexes sync.Map // keyfile 路径 -> *sync.Mutex
+var keyfileMutexes sync.Map    // keyfile 路径 -> *sync.Mutex
+var moduleInitMutexes sync.Map // Meta 路径 -> *sync.Mutex
 
 // ensureKeyfile 确保模块密钥文件就绪，返回是否新创建了密钥（供调用方记日志）：
 //   - 密钥已存在：直接返回；
@@ -133,16 +135,139 @@ func ensureKeyfile(module *config.ModuleConfig) (bool, error) {
 	return created, nil
 }
 
-// EnsureModuleInit 确保模块密钥与元数据库就绪（幂等；daemon 启动与 CLI init 共用）：
-// ensureKeyfile + meta.Open 建库。返回是否新创建了密钥（供调用方记日志/打印）。
+type ModuleInitResult struct {
+	KeyCreated   bool
+	MetaRestored bool
+}
+
+// EnsureModuleInit 保留原有布尔结果接口；完整状态使用 PrepareModule。
 func EnsureModuleInit(module *config.ModuleConfig) (bool, error) {
+	result, err := PrepareModule(module)
+	return result.KeyCreated, err
+}
+
+// PrepareModule 探测后端并完成新仓库初始化或 Meta 灾难恢复。
+func PrepareModule(module *config.ModuleConfig) (ModuleInitResult, error) {
+	be, err := openBackend(module)
+	if err != nil {
+		return ModuleInitResult{}, err
+	}
+	if err := be.Ping(); err != nil {
+		return ModuleInitResult{}, fmt.Errorf("模块 %s 后端不可用: %w", module.Name, err)
+	}
+	return ensureModuleReady(module, be)
+}
+
+func ensureModuleReady(module *config.ModuleConfig, be backend.Backend) (ModuleInitResult, error) {
+	v, _ := moduleInitMutexes.LoadOrStore(module.Meta, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	keyExists, err := fileExists(module.Keyfile)
+	if err != nil {
+		return ModuleInitResult{}, err
+	}
+	metaExists, err := fileExists(module.Meta)
+	if err != nil {
+		return ModuleInitResult{}, err
+	}
+	if keyExists && metaExists {
+		return ModuleInitResult{}, nil
+	}
+	if !keyExists && metaExists {
+		return ModuleInitResult{}, fmt.Errorf("模块 %s: 元数据库已存在但密钥文件缺失，拒绝自动生成新密钥", module.Name)
+	}
+	names, err := be.ListMetaContext(context.Background())
+	if err != nil {
+		return ModuleInitResult{}, fmt.Errorf("模块 %s 列出远端 Meta 备份: %w", module.Name, err)
+	}
+	if keyExists {
+		if len(names) == 0 {
+			return ModuleInitResult{}, fmt.Errorf("模块 %s: 密钥存在但本地 Meta 缺失，且远端没有可恢复备份", module.Name)
+		}
+		key, err := crypto.LoadKeyFile(module.Keyfile)
+		if err != nil {
+			return ModuleInitResult{}, err
+		}
+		if _, err := repo.RestoreMeta(context.Background(), module.Meta, be, key); err != nil {
+			return ModuleInitResult{}, fmt.Errorf("模块 %s 恢复 Meta: %w", module.Name, err)
+		}
+		return ModuleInitResult{MetaRestored: true}, nil
+	}
+	if len(names) > 0 {
+		return ModuleInitResult{}, fmt.Errorf("模块 %s: 远端存在 Meta 备份但密钥缺失，拒绝初始化新仓库", module.Name)
+	}
+	blobs, err := be.List()
+	if err != nil {
+		return ModuleInitResult{}, fmt.Errorf("模块 %s 检查远端数据: %w", module.Name, err)
+	}
+	if len(blobs) > 0 {
+		return ModuleInitResult{}, fmt.Errorf("模块 %s: 远端已有数据 blob，但 key、Meta 和远端 Meta 备份均缺失，拒绝覆盖式初始化", module.Name)
+	}
 	autoInit, err := ensureKeyfile(module)
 	if err != nil {
-		return false, err
+		return ModuleInitResult{}, err
 	}
 	db, err := meta.Open(module.Meta)
 	if err != nil {
-		return false, err
+		return ModuleInitResult{KeyCreated: autoInit}, err
 	}
-	return autoInit, db.Close()
+	if _, err := db.EnsureRepositoryID(); err != nil {
+		db.Close()
+		return ModuleInitResult{KeyCreated: autoInit}, err
+	}
+	return ModuleInitResult{KeyCreated: autoInit}, db.Close()
+}
+
+func fileExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// RunMetaBackupScheduler 在当前模块生命周期内立即及定时备份 Meta。
+func RunMetaBackupScheduler(ctx context.Context, module *config.ModuleConfig, logger *slog.Logger) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	be, err := openBackend(module)
+	if err != nil {
+		return err
+	}
+	if _, err := ensureModuleReady(module, be); err != nil {
+		return err
+	}
+	key, err := crypto.LoadKeyFile(module.Keyfile)
+	if err != nil {
+		return err
+	}
+	db, err := meta.OpenExisting(module.Meta)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	backup := func() {
+		name, err := repo.CreateMetaBackup(ctx, db, be, key, module.MetaBackupRetain())
+		if err != nil {
+			logger.Error("meta_backup_error", "module", module.Name, "err", err.Error())
+			return
+		}
+		logger.Info("meta_backup_complete", "module", module.Name, "backup", name)
+	}
+	backup()
+	ticker := time.NewTicker(module.MetaBackupInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			backup()
+		}
+	}
 }

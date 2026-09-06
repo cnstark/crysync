@@ -2,12 +2,15 @@
 package meta
 
 import (
+	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 type DB struct {
@@ -73,6 +76,23 @@ CREATE TABLE IF NOT EXISTS meta (
 `
 
 func Open(path string) (*DB, error) {
+	return open(path, true)
+}
+
+// OpenExisting 打开已有 Meta，绝不创建文件或补建缺失 schema。
+func OpenExisting(path string) (*DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("打开已有元数据库: %w", err)
+	}
+	return open(path, false)
+}
+
+func open(path string, create bool) (*DB, error) {
+	if !create {
+		if _, err := os.Stat(path); err != nil {
+			return nil, err
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("创建元数据目录: %w", err)
 	}
@@ -97,11 +117,27 @@ func Open(path string) (*DB, error) {
 	// OpenModule 启动时并发打开同一模块库（main 起 goroutine 各自执行），
 	// 多语句 Exec 曾在 NAS 慢盘上交错触发 SQLITE_BUSY（busy_timeout 计的是
 	// 单条语句等待，事务化后并发方整体排队，幂等且无窗口）
-	if err := ensureSchema(db); err != nil {
+	if create {
+		err = ensureSchema(db)
+	} else {
+		err = validateRequiredSchema(db)
+	}
+	if err != nil {
 		db.Close()
-		return nil, fmt.Errorf("初始化 schema: %w", err)
+		return nil, fmt.Errorf("校验 schema: %w", err)
 	}
 	return &DB{db: db, path: path}, nil
+}
+
+func validateRequiredSchema(db *sql.DB) error {
+	var count int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('files','chunks','file_chunks','meta')`).Scan(&count); err != nil {
+		return err
+	}
+	if count != 4 {
+		return fmt.Errorf("缺少必需表")
+	}
+	return nil
 }
 
 // isOldSchema 检测是否为 v0.4.x 旧版库（存在 snapshots 表）。
@@ -125,6 +161,63 @@ func ensureSchema(db *sql.DB) error {
 }
 
 func (d *DB) Close() error { return d.db.Close() }
+
+type sqliteBackuper interface {
+	NewBackup(string) (*sqlite.Backup, error)
+}
+
+// BackupTo 使用 SQLite Online Backup API 生成包含 WAL 已提交内容的一致快照。
+func (d *DB) BackupTo(ctx context.Context, dstPath string) error {
+	conn, err := d.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return conn.Raw(func(driverConn any) error {
+		b, ok := driverConn.(sqliteBackuper)
+		if !ok {
+			return fmt.Errorf("SQLite 驱动不支持在线备份")
+		}
+		backup, err := b.NewBackup(dstPath)
+		if err != nil {
+			return err
+		}
+		more, err := backup.Step(-1)
+		if err != nil {
+			_ = backup.Finish()
+			return err
+		}
+		if more {
+			_ = backup.Finish()
+			return fmt.Errorf("SQLite 在线备份未完成")
+		}
+		return backup.Finish()
+	})
+}
+
+// EnsureRepositoryID 返回稳定仓库 ID；旧库首次备份时补写。
+func (d *DB) EnsureRepositoryID() (string, error) {
+	if err := d.SetMeta("repository_schema", "1"); err != nil {
+		return "", err
+	}
+	if value, ok, err := d.GetMeta("repository_id"); err != nil {
+		return "", err
+	} else if ok {
+		if raw, err := hex.DecodeString(value); err != nil || len(raw) != 16 {
+			return "", fmt.Errorf("repository_id 格式错误")
+		}
+		return value, nil
+	}
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	value := hex.EncodeToString(id[:])
+	if err := d.SetMeta("repository_id", value); err != nil {
+		return "", err
+	}
+	return value, nil
+}
 
 // UpsertFile 原子替换文件行：事务内 递减旧引用 → 递增新 refs 引用 →
 // 删除归零的旧 chunk 行 → 替换 files 行 → 附加 file_chunks。

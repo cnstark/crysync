@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"crysync/internal/config"
-	"crysync/internal/core/crypto"
 )
 
 // startLoggedDaemon 同 startDaemon 但注入 buffer logger。
@@ -25,10 +24,6 @@ func startLoggedDaemon(t *testing.T) (int, *bytes.Buffer) {
 	t.Helper()
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "home.key")
-	k, _ := crypto.GenerateKey()
-	if err := crypto.SaveKeyFile(keyPath, k); err != nil {
-		t.Fatal(err)
-	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

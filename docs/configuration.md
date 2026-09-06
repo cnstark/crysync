@@ -32,10 +32,14 @@
 | `keyfile` | 必填 | 密钥文件路径；首次创建权限为 `0600` |
 | `meta` | 必填 | SQLite 文件路径 |
 | `chunk_size` | `4194304` | 分块字节数；非正数回退 4 MiB；仓库使用期间保持固定 |
+| `meta_backup.interval` | `1h` | 加密 Meta 完整快照周期，必须为正的 Go duration（如 `30m`、`2h`） |
+| `meta_backup.retain` | `24` | 后端 `meta/` 中保留的快照版本数，必须为正数 |
 
 `max_upload_concurrency` 限制的是同时进行的后端 PUT 数，不是带宽或 HTTP 客户端数。WebDAV 文件写入内部有 4 个上传 worker；多个请求共用模块上传上限。没有配置热重载，修改后重启生效。进程内锁和闸门不提供多进程共享仓库协调能力。
 
 两种后端都将 blob 保存到分桶路径，例如 `ab/cd/<blobName>`，其中 `ab/cd` 来自逻辑 blob 名的 SHA-256 前缀，文件名仍是完整逻辑名。分桶不能关闭，深度在仓库建立后保持不变；深度越大，WebDAV 的 MKCOL 和 PROPFIND 请求越多。此次布局变化不读取或迁移旧的根目录平铺 blob。
+
+Meta 仍从本地 SQLite 提供在线服务。daemon 启动后立即生成一份 SQLite Online Backup 一致快照，随后按 `interval` 定时生成；快照使用独立的分片 AES-GCM 格式加密并保存到后端根的 `meta/`，成功回读验证后才淘汰旧版本。备份失败会记录错误并保留已有版本，不中断在线读写。周期就是最大恢复点间隔；一小时周期意味着本地 Meta 丢失时最多丢失约一小时的清单更新。
 
 ## 进程级上传内存
 
@@ -60,6 +64,9 @@ modules:
       bucket_depth: 2
     keyfile: /keys/archive.key
     meta: /meta/archive.db
+    meta_backup:
+      interval: 1h
+      retain: 24
 ```
 
 后端需要支持 PUT、GET、DELETE、PROPFIND。当前 PUT 失败最多尝试 **3 次（含首次）**，间隔 200 ms、400 ms；GET 不重试。HTTP 客户端超时 300 秒，Ping 探测超时 10 秒。

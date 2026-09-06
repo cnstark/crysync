@@ -565,8 +565,12 @@ func (r *Repo) GC() (int, error) {
 			garbage[name] = true
 		}
 	}
-	if len(garbage) == 0 {
-		return 0, nil
+	protected, err := ProtectedMetaBlobs(context.Background(), r.meta.DBPath(), r.backend, r.key)
+	if err != nil {
+		return 0, fmt.Errorf("读取 Meta 备份保护集合: %w", err)
+	}
+	for name := range protected {
+		delete(garbage, name)
 	}
 
 	// 先删 chunk 行再删 blob（行删失败 blob 仍会被下一次 GC 按"无对应行"回收）
@@ -574,6 +578,9 @@ func (r *Repo) GC() (int, error) {
 		if err := r.meta.DeleteChunk(id); err != nil {
 			return 0, fmt.Errorf("删除残留 chunk 行 %d: %w", id, err)
 		}
+	}
+	if len(garbage) == 0 {
+		return 0, nil
 	}
 	var deleted int
 	var failed []string

@@ -27,6 +27,9 @@ modules:
     max_connections: 0            # 仅 rsync：0 不限，负数禁用
     max_upload_concurrency: 0      # 同进程跨前端 blob 上传上限；0 不限
     chunk_size: 4194304            # 4 MiB，仓库使用期间保持固定
+    meta_backup:
+      interval: 1h                 # 一致、加密的完整 Meta 快照周期
+      retain: 24                   # 远端 meta/ 保留版本数
     backend:
       type: dir
       path: /data/home

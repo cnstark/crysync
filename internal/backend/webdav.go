@@ -86,15 +86,24 @@ func (w *WebDAV) do(method, url string, body []byte, want ...int) (*http.Respons
 
 func (w *WebDAV) doContext(ctx context.Context, method, url string, body []byte, want ...int) (*http.Response, error) {
 	var rdr io.Reader
+	var size int64 = -1
 	if body != nil {
 		rdr = bytes.NewReader(body)
+		size = int64(len(body))
 	}
-	req, err := http.NewRequestWithContext(ctx, method, url, rdr)
+	return w.doReaderContext(ctx, method, url, rdr, size, want...)
+}
+
+func (w *WebDAV) doReaderContext(ctx context.Context, method, rawURL string, body io.Reader, size int64, want ...int) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, body)
 	if err != nil {
 		return nil, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/octet-stream")
+		if size >= 0 {
+			req.ContentLength = size
+		}
 	}
 	if w.user != "" {
 		req.SetBasicAuth(w.user, w.pass)
@@ -116,9 +125,111 @@ func (w *WebDAV) doContext(ctx context.Context, method, url string, body []byte,
 	if !ok {
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("webdav %s %s: %s", method, url, strings.TrimSpace(string(b)))
+		return nil, fmt.Errorf("webdav %s %s: %s", method, rawURL, strings.TrimSpace(string(b)))
 	}
 	return resp, nil
+}
+
+func (w *WebDAV) metaURL() string { return w.baseURL + "/meta" }
+
+func (w *WebDAV) ensureMetaCollection(ctx context.Context) error {
+	w.collectionsMu.Lock()
+	known := w.collections["@meta"]
+	w.collectionsMu.Unlock()
+	if known {
+		return nil
+	}
+	resp, err := w.doContext(ctx, "MKCOL", w.metaURL(), nil, http.StatusCreated, http.StatusMethodNotAllowed)
+	if err != nil {
+		return fmt.Errorf("创建 WebDAV Meta 目录: %w", err)
+	}
+	resp.Body.Close()
+	w.collectionsMu.Lock()
+	w.collections["@meta"] = true
+	w.collectionsMu.Unlock()
+	return nil
+}
+
+func (w *WebDAV) PutMetaContext(ctx context.Context, name string, src io.ReadSeeker, size int64) error {
+	if err := validateBlobName(name); err != nil {
+		return err
+	}
+	var err error
+	delay := 200 * time.Millisecond
+	for attempt := 0; attempt < 3; attempt++ {
+		if err = w.ensureMetaCollection(ctx); err != nil {
+			// 与 PUT 一起重试，临时的 MKCOL/网络失败不应直接终止。
+		} else if _, err = src.Seek(0, io.SeekStart); err != nil {
+			return err
+		} else {
+			var resp *http.Response
+			resp, err = w.doReaderContext(ctx, http.MethodPut, w.metaURL()+"/"+url.PathEscape(name), src, size)
+			if err == nil {
+				resp.Body.Close()
+				return nil
+			}
+		}
+		w.collectionsMu.Lock()
+		delete(w.collections, "@meta")
+		w.collectionsMu.Unlock()
+		if attempt < 2 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+			delay *= 2
+		}
+	}
+	return fmt.Errorf("上传 Meta 备份 %s: %w", name, err)
+}
+
+func (w *WebDAV) GetMetaContext(ctx context.Context, name string) (io.ReadCloser, error) {
+	if err := validateBlobName(name); err != nil {
+		return nil, err
+	}
+	resp, err := w.doReaderContext(ctx, http.MethodGet, w.metaURL()+"/"+url.PathEscape(name), nil, -1)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+func (w *WebDAV) ListMetaContext(ctx context.Context) ([]string, error) {
+	if err := w.ensureMetaCollection(ctx); err != nil {
+		return nil, err
+	}
+	responses, err := w.propfindContext(ctx, w.metaURL())
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, response := range responses {
+		name, ok, err := hrefChildName(response.Href, w.metaURL())
+		if err != nil {
+			return nil, err
+		}
+		if ok && !collectionResponse(response) && strings.HasSuffix(name, ".cmeta") {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func (w *WebDAV) DeleteMetaContext(ctx context.Context, name string) error {
+	if err := validateBlobName(name); err != nil {
+		return err
+	}
+	resp, err := w.doReaderContext(ctx, http.MethodDelete, w.metaURL()+"/"+url.PathEscape(name), nil, -1,
+		http.StatusNoContent, http.StatusNotFound, http.StatusOK)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	return nil
 }
 
 // putOnce 单次 PUT。
@@ -296,7 +407,20 @@ func (w *WebDAV) propfind(currentURL string) ([]struct {
 		} `xml:"prop"`
 	} `xml:"propstat"`
 }, error) {
-	req, err := http.NewRequest("PROPFIND", strings.TrimSuffix(currentURL, "/")+"/", nil)
+	return w.propfindContext(context.Background(), currentURL)
+}
+
+func (w *WebDAV) propfindContext(ctx context.Context, currentURL string) ([]struct {
+	Href     string `xml:"href"`
+	Propstat []struct {
+		Prop struct {
+			ResourceType struct {
+				Collection *struct{} `xml:"collection"`
+			} `xml:"resourcetype"`
+		} `xml:"prop"`
+	} `xml:"propstat"`
+}, error) {
+	req, err := http.NewRequestWithContext(ctx, "PROPFIND", strings.TrimSuffix(currentURL, "/")+"/", nil)
 	if err != nil {
 		return nil, err
 	}

@@ -11,8 +11,6 @@ import (
 	"syscall"
 	"testing"
 	"time"
-
-	"crysync/internal/core/crypto"
 )
 
 // TestDaemonVersion：--version 打印注入的版本号后退出（无需有效配置文件）。
@@ -39,8 +37,6 @@ func TestDaemonSmoke(t *testing.T) {
 		t.Fatalf("构建失败: %v\n%s", err, out)
 	}
 	keyPath := filepath.Join(dir, "home.key")
-	k, _ := crypto.GenerateKey()
-	crypto.SaveKeyFile(keyPath, k)
 
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	port := ln.Addr().(*net.TCPAddr).Port

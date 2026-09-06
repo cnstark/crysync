@@ -3,12 +3,18 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"crysync/internal/backend"
 	"gopkg.in/yaml.v3"
 )
 
 const DefaultChunkSize = 4194304
+
+const (
+	DefaultMetaBackupInterval = time.Hour
+	DefaultMetaBackupRetain   = 24
+)
 
 type Config struct {
 	Front              FrontConfig    `yaml:"front"`
@@ -82,6 +88,11 @@ type BackendConfig struct {
 	BucketDepth int    `yaml:"bucket_depth"`
 }
 
+type MetaBackupConfig struct {
+	Interval string `yaml:"interval"`
+	Retain   int    `yaml:"retain"`
+}
+
 type ModuleConfig struct {
 	Name     string `yaml:"name"`
 	Path     string `yaml:"path"`
@@ -93,11 +104,12 @@ type ModuleConfig struct {
 	// 共享，限制的是 backend.Put 网络写）：0 = 不限制（缺省）；正数 = 同时
 	// 最多 N 路上传，超出排队——限制后端 API 压力（夸克 WebDAV 每 PUT 内部
 	// 多次串行往返，过量并发可能触发限流）。读与删除不受限。
-	MaxUploadConcurrency int           `yaml:"max_upload_concurrency"`
-	Backend              BackendConfig `yaml:"backend"`
-	Keyfile              string        `yaml:"keyfile"`
-	Meta                 string        `yaml:"meta"`
-	ChunkSize            int           `yaml:"chunk_size"`
+	MaxUploadConcurrency int              `yaml:"max_upload_concurrency"`
+	Backend              BackendConfig    `yaml:"backend"`
+	Keyfile              string           `yaml:"keyfile"`
+	Meta                 string           `yaml:"meta"`
+	ChunkSize            int              `yaml:"chunk_size"`
+	MetaBackup           MetaBackupConfig `yaml:"meta_backup"`
 }
 
 func (m *ModuleConfig) ChunkSizeBytes() int {
@@ -105,6 +117,21 @@ func (m *ModuleConfig) ChunkSizeBytes() int {
 		return DefaultChunkSize
 	}
 	return m.ChunkSize
+}
+
+func (m *ModuleConfig) MetaBackupInterval() time.Duration {
+	if m.MetaBackup.Interval == "" {
+		return DefaultMetaBackupInterval
+	}
+	d, _ := time.ParseDuration(m.MetaBackup.Interval)
+	return d
+}
+
+func (m *ModuleConfig) MetaBackupRetain() int {
+	if m.MetaBackup.Retain == 0 {
+		return DefaultMetaBackupRetain
+	}
+	return m.MetaBackup.Retain
 }
 
 func Load(path string) (*Config, error) {
@@ -220,6 +247,19 @@ func (c *Config) validateStructure() error {
 			return fmt.Errorf("模块 %s: %w", m.Name, err)
 		}
 		m.Backend.BucketDepth = depth
+		if m.MetaBackup.Interval == "" {
+			m.MetaBackup.Interval = DefaultMetaBackupInterval.String()
+		}
+		interval, err := time.ParseDuration(m.MetaBackup.Interval)
+		if err != nil || interval <= 0 {
+			return fmt.Errorf("模块 %s: meta_backup.interval 必须为正的时间长度", m.Name)
+		}
+		if m.MetaBackup.Retain == 0 {
+			m.MetaBackup.Retain = DefaultMetaBackupRetain
+		}
+		if m.MetaBackup.Retain < 1 {
+			return fmt.Errorf("模块 %s: meta_backup.retain 必须为正数", m.Name)
+		}
 	}
 	return nil
 }

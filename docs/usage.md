@@ -33,6 +33,9 @@ modules:
       bucket_depth: 2
     keyfile: /tmp/crysync-demo/keys/home.key
     meta: /tmp/crysync-demo/meta/home.db
+    meta_backup:
+      interval: 1h
+      retain: 24
 ```
 
 ```bash
@@ -102,7 +105,7 @@ Compose 健康检查只检测任一配置示例端口是否监听，不能证明
 |---|---|
 | `crysyncd --config <path>` | 加载配置并启动所配置前端；缺省路径 `/etc/crysync/crysync.yaml` |
 | `crysyncd --version` | 打印构建版本，本地构建缺省 `dev` |
-| `crysync init --config <path>` | 幂等初始化全部配置模块的密钥和元数据库；不探测后端 |
+| `crysync init --config <path>` | 初始化或恢复全部模块；会探测后端，只有 key 时从远端 Meta 恢复 |
 | `crysync version` | 打印构建版本；也接受 `--version`、`-v` |
 
 CLI 没有 `--module`、`snapshots`、`prune` 或 `gc`。容器中可执行 `docker compose run --rm crysync init --config /conf/crysync.yaml`；初始化是可选步骤。
@@ -125,7 +128,9 @@ Dir 与 WebDAV 后端都按 `backend.bucket_depth` 创建 `ab/cd/<blobName>` 形
 
 服务收到 SIGINT/SIGTERM 后开始退出，但主进程不保证等待所有正在进行的请求或 rsync 会话完成。维护和备份前先停止客户端写入并等待传输结束。
 
-恢复一个仓库需要匹配的密钥、SQLite 元数据和全部引用 blob。安排离线备份时，先停止写入并停止服务，再复制这些数据；SQLite 使用 WAL，不能在运行中只复制 `.db` 文件作为一致备份。每个模块使用独立后端目录，避免混入其他应用文件。
+daemon 默认每小时把 SQLite 一致快照加密到数据后端的 `meta/` 目录，并保留 24 个版本。只有 key 而本地 Meta 缺失时，启动会从最新版本向前尝试，校验数据库和全部引用 blob 后再开放模块；没有有效备份时拒绝创建空仓库。全量数据校验需要下载所有引用 blob，大仓库的首次灾难恢复可能耗时较长。
+
+key 不会随 Meta 上传，必须在独立位置备份。定时备份的周期就是最大恢复点间隔；后端与本地 Meta 位于同一磁盘时不能抵御整盘损坏。手工复制运行中的 SQLite `.db` 仍不安全，因为数据库使用 WAL；需要离线复制时先停止服务。每个模块使用独立后端目录，避免混入其他应用文件。
 
 ## 协议兼容边界
 

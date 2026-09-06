@@ -3,12 +3,42 @@ package backend
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 )
+
+func TestDirMetaNamespace(t *testing.T) {
+	b, err := NewDir(t.TempDir(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := bytes.NewReader([]byte("encrypted meta"))
+	if err := b.PutMetaContext(context.Background(), "one.cmeta", src, int64(src.Len())); err != nil {
+		t.Fatal(err)
+	}
+	names, err := b.ListMetaContext(context.Background())
+	if err != nil || len(names) != 1 || names[0] != "one.cmeta" {
+		t.Fatalf("Meta List: %v %v", names, err)
+	}
+	r, err := b.GetMetaContext(context.Background(), "one.cmeta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(r)
+	r.Close()
+	if string(got) != "encrypted meta" {
+		t.Fatalf("Meta 内容错误: %q", got)
+	}
+	dataNames, err := b.List()
+	if err != nil || len(dataNames) != 0 {
+		t.Fatalf("Meta 不应进入数据 blob List: %v %v", dataNames, err)
+	}
+}
 
 func TestDirBackendRoundtrip(t *testing.T) {
 	b, err := NewDir(t.TempDir(), 2)

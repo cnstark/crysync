@@ -16,14 +16,11 @@ import (
 	"golang.org/x/net/webdav"
 
 	"crysync/internal/config"
-	"crysync/internal/core/crypto"
 )
 
 func TestServeEndToEnd(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "home.key")
-	k, _ := crypto.GenerateKey()
-	crypto.SaveKeyFile(keyPath, k)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -97,10 +94,6 @@ func startDaemon(t *testing.T) (int, *config.Config) {
 	t.Helper()
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "home.key")
-	k, _ := crypto.GenerateKey()
-	if err := crypto.SaveKeyFile(keyPath, k); err != nil {
-		t.Fatal(err)
-	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -347,10 +340,6 @@ func TestServeWebDAVBackend(t *testing.T) {
 	davURL, _ := startWebDAVServer(t)
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "home.key")
-	k, _ := crypto.GenerateKey()
-	if err := crypto.SaveKeyFile(keyPath, k); err != nil {
-		t.Fatal(err)
-	}
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -398,8 +387,6 @@ func TestServeWebDAVBackend(t *testing.T) {
 func TestServeReadOnlyModule(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "ro.key")
-	k, _ := crypto.GenerateKey()
-	crypto.SaveKeyFile(keyPath, k)
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()

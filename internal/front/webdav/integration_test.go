@@ -18,7 +18,6 @@ import (
 
 	"crysync/internal/config"
 	"crysync/internal/core"
-	"crysync/internal/core/crypto"
 	"crysync/internal/front/rsync"
 )
 
@@ -28,13 +27,6 @@ func startDualFront(t *testing.T) (rsyncPort int, davBase string, modCfg *config
 	t.Helper()
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "home.key")
-	k, err := crypto.GenerateKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := crypto.SaveKeyFile(keyPath, k); err != nil {
-		t.Fatal(err)
-	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

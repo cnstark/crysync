@@ -54,6 +54,35 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// 在任何前端监听前完成模块初始化或灾难恢复，避免 key 存在而 Meta 缺失时
+	// 短暂暴露一个空仓库。单模块失败沿用现有隔离语义，其他模块继续启动。
+	ready := make(map[string]bool, len(cfg.Modules))
+	for i := range cfg.Modules {
+		m := &cfg.Modules[i]
+		result, err := core.PrepareModule(m)
+		if err != nil {
+			logger.Error("module_init_error", "module", m.Name, "err", err.Error())
+			continue
+		}
+		ready[m.Name] = true
+		if result.KeyCreated {
+			logger.Info("module_auto_init", "module", m.Name)
+		}
+		if result.MetaRestored {
+			logger.Info("module_meta_restored", "module", m.Name)
+		}
+	}
+	for i := range cfg.Modules {
+		m := &cfg.Modules[i]
+		if !ready[m.Name] {
+			continue
+		}
+		go func() {
+			if err := core.RunMetaBackupScheduler(ctx, m, logger); err != nil && ctx.Err() == nil {
+				logger.Error("meta_backup_scheduler_error", "module", m.Name, "err", err.Error())
+			}
+		}()
+	}
 	errCh := make(chan error, len(fronts))
 	for _, f := range fronts {
 		go func(f front.Front) {

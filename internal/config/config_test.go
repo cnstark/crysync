@@ -49,11 +49,41 @@ modules:
 	if m.Backend.BucketDepth != 2 {
 		t.Fatalf("缺省 bucket_depth 应归一化为 2: %d", m.Backend.BucketDepth)
 	}
+	if m.MetaBackupInterval() != DefaultMetaBackupInterval || m.MetaBackupRetain() != DefaultMetaBackupRetain {
+		t.Fatalf("Meta 备份默认值错误: interval=%s retain=%d", m.MetaBackupInterval(), m.MetaBackupRetain())
+	}
 	if m.MaxUploadConcurrency != 0 {
 		t.Fatalf("缺省上传并发应为 0（不限制）: %d", m.MaxUploadConcurrency)
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestMetaBackupConfigValidation(t *testing.T) {
+	for _, tc := range []struct {
+		interval string
+		retain   int
+		ok       bool
+	}{
+		{"30m", 12, true},
+		{"0s", 12, false},
+		{"bad", 12, false},
+		{"1h", -1, false},
+	} {
+		p := writeTemp(t, fmt.Sprintf(`
+front: { rsync: { listen: "127.0.0.1:873" } }
+modules:
+  - name: home
+    backend: { type: dir, path: /tmp/data }
+    keyfile: /tmp/keys/home.key
+    meta: /tmp/meta/home.db
+    meta_backup: { interval: %q, retain: %d }
+`, tc.interval, tc.retain))
+		_, err := Load(p)
+		if (err == nil) != tc.ok {
+			t.Fatalf("interval=%q retain=%d: err=%v, ok=%v", tc.interval, tc.retain, err, tc.ok)
+		}
 	}
 }
 

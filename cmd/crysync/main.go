@@ -56,15 +56,17 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	// 与 daemon 启动共用同一套初始化逻辑（幂等；密钥缺失但元数据库已存在时拒绝）
+	// 与 daemon 启动共用同一套初始化/恢复状态机。
 	for i := range cfg.Modules {
 		m := &cfg.Modules[i]
-		autoInit, err := core.EnsureModuleInit(m)
+		result, err := core.PrepareModule(m)
 		if err != nil {
 			return fmt.Errorf("模块 %s: %w", m.Name, err)
 		}
-		if autoInit {
+		if result.KeyCreated {
 			fmt.Printf("模块 %s: 密钥已生成，元数据已初始化\n", m.Name)
+		} else if result.MetaRestored {
+			fmt.Printf("模块 %s: 已使用现有密钥从远端恢复并校验元数据\n", m.Name)
 		} else {
 			fmt.Printf("模块 %s: 密钥已存在，元数据已初始化\n", m.Name)
 		}
