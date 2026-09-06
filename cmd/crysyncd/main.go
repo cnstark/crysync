@@ -72,11 +72,10 @@ func main() {
 			logger.Info("module_meta_restored", "module", m.Name)
 		}
 	}
+	// 自愈调度对全部模块启动（含启动时初始化失败的模块）：
+	// 失败模块经退避重试恢复后自动获得 Meta 备份调度。
 	for i := range cfg.Modules {
 		m := &cfg.Modules[i]
-		if !ready[m.Name] {
-			continue
-		}
 		go func() {
 			if err := core.RunMetaBackupScheduler(ctx, m, logger); err != nil && ctx.Err() == nil {
 				logger.Error("meta_backup_scheduler_error", "module", m.Name, "err", err.Error())
