@@ -243,11 +243,12 @@ func RunMetaBackupScheduler(ctx context.Context, module *config.ModuleConfig, lo
 		if ctx.Err() != nil {
 			return nil
 		}
-		err := runBackupUntil(ctx, module, logger)
-		if err == nil {
+		err := runBackupUntilWithReadyCallback(ctx, module, logger, func() {
 			if inFailure && ctx.Err() == nil {
 				logger.Info("module_recovered", "module", module.Name)
 			}
+		})
+		if err == nil {
 			return nil
 		}
 		failures++
@@ -267,6 +268,12 @@ func RunMetaBackupScheduler(ctx context.Context, module *config.ModuleConfig, lo
 // runBackupUntil 打开模块并循环备份 Meta：初始化/打开失败返回 err
 // （由外层退避重试），备份失败仅记日志不中断循环，ctx 取消返回 nil。
 func runBackupUntil(ctx context.Context, module *config.ModuleConfig, logger *slog.Logger) error {
+	return runBackupUntilWithReadyCallback(ctx, module, logger, nil)
+}
+
+// runBackupUntilWithReadyCallback 在模块初始化完成、首次备份开始前调用 onReady。
+// 回调仅用于记录恢复等状态变化，不参与初始化与锁保护。
+func runBackupUntilWithReadyCallback(ctx context.Context, module *config.ModuleConfig, logger *slog.Logger, onReady func()) error {
 	be, err := openBackend(module)
 	if err != nil {
 		return err
@@ -283,6 +290,9 @@ func runBackupUntil(ctx context.Context, module *config.ModuleConfig, logger *sl
 		return err
 	}
 	defer db.Close()
+	if onReady != nil && ctx.Err() == nil {
+		onReady()
+	}
 	backup := func() {
 		name, err := repo.CreateMetaBackup(ctx, db, be, key, module.MetaBackupRetain())
 		if err != nil {

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -93,7 +94,8 @@ func TestMetaBackupSchedulerInitRetry(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	go func() { done <- RunMetaBackupScheduler(ctx, module, logger) }()
 
 	time.Sleep(300 * time.Millisecond)
@@ -157,5 +159,8 @@ func TestMetaBackupSchedulerInitRetry(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("调度器未响应取消")
+	}
+	if !strings.Contains(logs.String(), "msg=module_recovered") {
+		t.Fatalf("自愈成功后应记录 module_recovered，日志=%s", logs.String())
 	}
 }
