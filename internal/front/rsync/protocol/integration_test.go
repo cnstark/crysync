@@ -1017,6 +1017,9 @@ func TestRsyncDeleteSemantics(t *testing.T) {
 	src := t.TempDir()
 	os.MkdirAll(filepath.Join(src, "sub"), 0o755)
 	os.MkdirAll(filepath.Join(src, "emptydir"), 0o755)
+	for i := 0; i < 500; i++ {
+		os.MkdirAll(filepath.Join(src, "bulk-delete", fmt.Sprintf("d%04d", i)), 0o755)
+	}
 	os.WriteFile(filepath.Join(src, "a.txt"), []byte("keep"), 0o644)
 	os.WriteFile(filepath.Join(src, "sub", "b.txt"), []byte("gone"), 0o644)
 	os.WriteFile(filepath.Join(src, "emptydir", "keep.txt"), []byte("gone dir"), 0o644)
@@ -1053,6 +1056,7 @@ func TestRsyncDeleteSemantics(t *testing.T) {
 	// 客户端删除 b.txt 与整个 emptydir 后 --delete 推送
 	os.Remove(filepath.Join(src, "sub", "b.txt"))
 	os.RemoveAll(filepath.Join(src, "emptydir"))
+	os.RemoveAll(filepath.Join(src, "bulk-delete"))
 	rsyncRun("-a", "--delete", src+"/", "backup@127.0.0.1::home/del/")
 	m2 := rowsOf()
 	if m2["del/sub/b.txt"] || m2["del/emptydir"] || m2["del/emptydir/keep.txt"] {
@@ -1060,6 +1064,11 @@ func TestRsyncDeleteSemantics(t *testing.T) {
 	}
 	if !m2["del/a.txt"] || !m2["del/sub"] || !m2["other/x.txt"] {
 		t.Fatalf("--delete 不应误删保留条目/其他子路径: %v", m2)
+	}
+	for path := range m2 {
+		if strings.HasPrefix(path, "del/bulk-delete") {
+			t.Fatalf("客户端成功返回时批量删除必须已经完成，仍存在: %s", path)
+		}
 	}
 	// 恢复验证：b.txt / emptydir 不复活
 	dst := t.TempDir()

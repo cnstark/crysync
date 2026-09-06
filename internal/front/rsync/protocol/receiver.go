@@ -102,8 +102,9 @@ type fileStats struct {
 
 // processSession 完整 mux 会话：
 // [条件]filter -> flist（逐条到哨兵）-> [条件]id list -> 传输阶段（generator 角色
-// 逐条 ndx/iflags/sums 驱动 + receiver 角色读回显与 token 流）-> goodbye -> 提交快照。
-// keeper 非 nil（客户端 --timeout=N）时经 KeepAlive 在块存储等本地慢工作点续期。
+// 逐条 ndx/iflags/sums 驱动 + receiver 角色读回显与 token 流）-> --delete 收敛
+// -> goodbye。keeper 非 nil（客户端 --timeout=N）时经 KeepAlive 在块存储、
+// 批量删除等本地慢工作点续期。
 func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *config.ModuleConfig, s types.Session, neg *Negotiation, logger *slog.Logger, keeper *idleKeeper) (err error) {
 	if logger == nil {
 		logger = nopLogger
@@ -338,27 +339,6 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 	}
 
-	// goodbye（generator.c:2336/2368-2376 + main.c:1119，无 delete/delay 的典型序列）：
-	// DONE#1 -> ACK；DONE#2 -> ACK；DONE#3（客户端 break，无 ACK）；DONE#4 -> ACK；DONE#5。
-	// 注意 #3 后客户端不回 ACK，等 ACK 会死锁。
-	for _, step := range []struct {
-		writeDone int // 连续发出的 DONE 数
-		readAck   int // 随后读取的 ACK 数
-	}{
-		{1, 1}, {1, 1}, {2, 1}, {1, 0},
-	} {
-		for k := 0; k < step.writeDone; k++ {
-			if err := writeNdxDone(out, ndxOut); err != nil {
-				return err
-			}
-		}
-		for k := 0; k < step.readAck; k++ {
-			if err := readNdxDone(stream, ndxIn); err != nil {
-				return err
-			}
-		}
-	}
-
 	// --delete 语义（generator.c delete_in_dir/delete_missing，flist.c:1402）：
 	// 删除传输根（prefix 子树）内、本次 flist 未覆盖的文件与目录行——单一状态
 	// 模型下不删除则客户端删掉的文件下次恢复时复活。io_error≠0 时禁用（发送侧
@@ -379,6 +359,10 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 			if covered[row.Path] {
 				continue
 			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			keepAlive()
 			if err := s.DeleteFile(row.Path); err != nil {
 				return fmt.Errorf("--delete: %w", err)
 			}
@@ -386,6 +370,30 @@ func processSession(ctx context.Context, in *MuxReader, out *MuxWriter, module *
 		}
 		if st.deleted > 0 {
 			logger.Info("delete_extraneous", "count", st.deleted, "prefix", prefix)
+		}
+	}
+
+	// goodbye 必须在所有持久化操作完成后开始：最终 DONE 会让客户端成功退出，
+	// 因而它也是服务端状态已收敛的完成边界。若先 goodbye 再删除，客户端返回
+	// 后可短暂读到旧清单，删除失败也无法反馈给客户端。
+	// generator.c:2336/2368-2376 + main.c:1119：
+	// DONE#1 -> ACK；DONE#2 -> ACK；DONE#3（客户端 break，无 ACK）；DONE#4 -> ACK；DONE#5。
+	// 注意 #3 后客户端不回 ACK，等 ACK 会死锁。
+	for _, step := range []struct {
+		writeDone int // 连续发出的 DONE 数
+		readAck   int // 随后读取的 ACK 数
+	}{
+		{1, 1}, {1, 1}, {2, 1}, {1, 0},
+	} {
+		for k := 0; k < step.writeDone; k++ {
+			if err := writeNdxDone(out, ndxOut); err != nil {
+				return err
+			}
+		}
+		for k := 0; k < step.readAck; k++ {
+			if err := readNdxDone(stream, ndxIn); err != nil {
+				return err
+			}
 		}
 	}
 
