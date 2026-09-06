@@ -23,12 +23,52 @@ type moduleFS struct {
 	store    core.FileStore
 	writer   core.FileWriter
 	readOnly bool
+	// urlRoot is the module's external URL path (for example "/quark").
+	// Keeping this path in the FileSystem, instead of Handler.Prefix, means
+	// x/net/webdav sees /quark/ as a named collection. Some NAS clients reject
+	// a collection whose DAV:displayname is empty (the value x/net emits for
+	// handler root "/").
+	urlRoot string
+	// rootName/rootModTime describe the virtual module root. x/net/webdav
+	// derives DAV:displayname and DAV:getlastmodified from os.FileInfo; an
+	// unnamed zero-time root is accepted by Go clients but rejected by some
+	// NAS WebDAV clients as an inaccessible collection.
+	rootName    string
+	rootModTime time.Time
+}
+
+// repoPath converts an external DAV path to a repository-relative path. An
+// empty urlRoot is useful for direct FileSystem unit tests.
+func (m *moduleFS) repoPath(name string) (string, error) {
+	clean := pathpkg.Clean("/" + name)
+	if m.urlRoot == "" {
+		return normalize(clean), nil
+	}
+	root := pathpkg.Clean(m.urlRoot)
+	if clean == root {
+		return "", nil
+	}
+	if !strings.HasPrefix(clean, root+"/") {
+		return "", os.ErrNotExist
+	}
+	return strings.TrimPrefix(clean, root+"/"), nil
+}
+
+func (m *moduleFS) rootInfo() *fileInfo {
+	return &fileInfo{
+		row:     meta.FileRow{IsDir: true, Mode: 0o40755},
+		name:    m.rootName,
+		modTime: m.rootModTime,
+	}
 }
 
 func (m *moduleFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
-	path := normalize(name)
+	path, err := m.repoPath(name)
+	if err != nil {
+		return nil, err
+	}
 	if path == "" {
-		return &fileInfo{row: meta.FileRow{IsDir: true, Mode: 0o40755}}, nil // 模块根
+		return m.rootInfo(), nil // 模块根
 	}
 	row, ok, err := m.store.GetFileRow(path)
 	if err != nil {
@@ -41,13 +81,16 @@ func (m *moduleFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 }
 
 func (m *moduleFS) OpenFile(ctx context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
-	path := normalize(name)
+	path, err := m.repoPath(name)
+	if err != nil {
+		return nil, err
+	}
 	if flag&(os.O_WRONLY|os.O_RDWR) != 0 {
 		return m.openWrite(ctx, path)
 	}
 	if path == "" {
 		// 模块根：与 Stat 一致的虚拟目录，可打开枚举（PROPFIND 遍历用）
-		return &dirFile{fs: m, path: path, fi: &fileInfo{row: meta.FileRow{IsDir: true, Mode: 0o40755}}}, nil
+		return &dirFile{fs: m, path: path, fi: m.rootInfo()}, nil
 	}
 	row, ok, err := m.store.GetFileRow(path)
 	if err != nil {
@@ -71,32 +114,58 @@ func (m *moduleFS) OpenFile(ctx context.Context, name string, flag int, perm os.
 }
 
 func (m *moduleFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
-	return m.writer.Mkcol(normalize(name))
+	path, err := m.repoPath(name)
+	if err != nil {
+		return err
+	}
+	return m.writer.Mkcol(path)
 }
 
 func (m *moduleFS) RemoveAll(ctx context.Context, name string) error {
-	return m.writer.DeletePath(normalize(name))
+	path, err := m.repoPath(name)
+	if err != nil {
+		return err
+	}
+	return m.writer.DeletePath(path)
 }
 
 func (m *moduleFS) Rename(ctx context.Context, oldName, newName string) error {
-	return m.writer.MovePath(normalize(oldName), normalize(newName))
+	oldPath, err := m.repoPath(oldName)
+	if err != nil {
+		return err
+	}
+	newPath, err := m.repoPath(newName)
+	if err != nil {
+		return err
+	}
+	return m.writer.MovePath(oldPath, newPath)
 }
 
 // fileInfo 快照文件行的 os.FileInfo 实现。
 type fileInfo struct {
-	row meta.FileRow
+	row     meta.FileRow
+	name    string
+	modTime time.Time
 }
 
 func (i *fileInfo) Name() string {
+	if i.name != "" {
+		return i.name
+	}
 	if i.row.Path == "" {
 		return ""
 	}
 	return pathpkg.Base(i.row.Path)
 }
-func (i *fileInfo) Size() int64        { return i.row.Size }
-func (i *fileInfo) ModTime() time.Time { return time.Unix(0, i.row.MTimeNs) }
-func (i *fileInfo) IsDir() bool        { return i.row.IsDir }
-func (i *fileInfo) Sys() any           { return nil }
+func (i *fileInfo) Size() int64 { return i.row.Size }
+func (i *fileInfo) ModTime() time.Time {
+	if !i.modTime.IsZero() {
+		return i.modTime
+	}
+	return time.Unix(0, i.row.MTimeNs)
+}
+func (i *fileInfo) IsDir() bool { return i.row.IsDir }
+func (i *fileInfo) Sys() any    { return nil }
 func (i *fileInfo) Mode() os.FileMode {
 	if i.row.IsDir {
 		return 0o755 | os.ModeDir

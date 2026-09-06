@@ -98,7 +98,14 @@ func (s *Server) Serve(ctx context.Context) error {
 func (s *Server) buildModuleHandler(m *config.ModuleConfig, mod *core.Module) http.Handler {
 	prefix := "/" + m.Name
 	h := &webdav.Handler{
-		FileSystem: &moduleFS{store: mod.FileStore, writer: mod.FileWriter, readOnly: m.ReadOnly},
+		FileSystem: &moduleFS{
+			store:       mod.FileStore,
+			writer:      mod.FileWriter,
+			readOnly:    m.ReadOnly,
+			urlRoot:     prefix,
+			rootName:    m.Name,
+			rootModTime: time.Now().UTC(),
+		},
 		LockSystem: noopLockSystem{},
 		Logger: func(r *http.Request, err error) {
 			if err != nil {
@@ -107,9 +114,9 @@ func (s *Server) buildModuleHandler(m *config.ModuleConfig, mod *core.Module) ht
 		},
 	}
 	// 子树 pattern："/home/" 与 "/home/a.txt" 都命中；"/home" 由 ServeMux
-	// 301 重定向到 "/home/"。Handler.Prefix 统一剥离请求路径与 Destination
-	// 头的 /home 前缀，避免 MOVE/COPY 的目标路径带模块前缀而写失败。
-	h.Prefix = prefix
+	// 301 重定向到 "/home/"。不设置 Handler.Prefix：让 x/net/webdav 保留
+	// /home 这段路径，并由 moduleFS 剥离它。这样模块根在 PROPFIND 中是
+	// 有名字的集合，而不是 x/net 特意隐藏名称的处理器根目录。
 	// dirBrowse：浏览器 GET 目录渲染 HTML 文件列表，标准客户端走 PROPFIND
 	// 不受影响；idempotentDelete：短路 DELETE。
 	return readOnlyGuard(m.ReadOnly,

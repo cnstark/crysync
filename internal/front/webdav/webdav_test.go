@@ -131,7 +131,13 @@ func (w *fakeWriter) MovePath(src, dst string) error {
 }
 
 func newTestFS(store *fakeStore, writer *fakeWriter, readOnly bool) *moduleFS {
-	return &moduleFS{store: store, writer: writer, readOnly: readOnly}
+	return &moduleFS{
+		store:       store,
+		writer:      writer,
+		readOnly:    readOnly,
+		rootName:    "test",
+		rootModTime: time.Date(2026, time.September, 7, 0, 0, 0, 0, time.UTC),
+	}
 }
 
 func TestPropfindGet(t *testing.T) {
@@ -162,7 +168,8 @@ func TestPropfindGet(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("GET 不存在应 404, got %d", rec.Code)
 	}
-	// PROPFIND 根（depth 1）含 root.txt 与 sub
+	// PROPFIND 文件系统根（depth 1）含根目录自身、root.txt 与 sub。x/net/webdav
+	// 会刻意隐藏处理器根的 displayname，模块根的行为由下方专项测试覆盖。
 	body := strings.NewReader(`<?xml version="1.0"?><propfind xmlns="DAV:"><prop><displayname/></prop></propfind>`)
 	req = httptest.NewRequest("PROPFIND", "/", body)
 	req.Header.Set("Depth", "1")
@@ -180,6 +187,32 @@ func TestPropfindGet(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK && rec.Code != http.StatusNoContent && rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("HEAD 根应成功, got %d", rec.Code)
+	}
+}
+
+func TestModuleRootPropfindMetadata(t *testing.T) {
+	store := &fakeStore{rows: map[string]meta.FileRow{}, data: map[string]string{}}
+	fs := newTestFS(store, &fakeWriter{puts: map[string]string{}}, false)
+	fs.urlRoot = "/home"
+	h := &webdav.Handler{FileSystem: fs, LockSystem: noopLockSystem{}}
+	body := strings.NewReader(`<?xml version="1.0"?><propfind xmlns="DAV:"><prop><displayname/><getlastmodified/><resourcetype/><supportedlock/></prop></propfind>`)
+	req := httptest.NewRequest("PROPFIND", "/home/", body)
+	req.Header.Set("Depth", "0")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("模块根 PROPFIND 应 207, got %d", rec.Code)
+	}
+	for _, want := range []string{
+		"<D:href>/home/</D:href>",
+		"<D:displayname>test</D:displayname>",
+		"<D:getlastmodified>Mon, 07 Sep 2026 00:00:00 GMT</D:getlastmodified>",
+		"<D:collection xmlns:D=\"DAV:\"/>",
+		"<D:supportedlock>",
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("模块根 PROPFIND 响应缺 %q: %s", want, rec.Body.String())
+		}
 	}
 }
 
