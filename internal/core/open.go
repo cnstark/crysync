@@ -230,11 +230,43 @@ func fileExists(path string) (bool, error) {
 	return false, err
 }
 
-// RunMetaBackupScheduler 在当前模块生命周期内立即及定时备份 Meta。
+// RunMetaBackupScheduler 模块 Meta 备份自愈循环：模块未就绪时指数退避重试
+// 初始化（后端启动竞态/临时故障自动恢复），就绪后立即备份并按 interval
+// 周期备份，直至 ctx 取消。常规返回 nil（ctx 取消）。
 func RunMetaBackupScheduler(ctx context.Context, module *config.ModuleConfig, logger *slog.Logger) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	failures := 0
+	inFailure := false
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		err := runBackupUntil(ctx, module, logger)
+		if err == nil {
+			if inFailure && ctx.Err() == nil {
+				logger.Info("module_recovered", "module", module.Name)
+			}
+			return nil
+		}
+		failures++
+		if failures == 1 || failures%8 == 0 {
+			logger.Warn("module_init_retry", "module", module.Name,
+				"failures", failures, "err", err.Error())
+		}
+		inFailure = true
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(nextInitBackoff(failures)):
+		}
+	}
+}
+
+// runBackupUntil 打开模块并循环备份 Meta：初始化/打开失败返回 err
+// （由外层退避重试），备份失败仅记日志不中断循环，ctx 取消返回 nil。
+func runBackupUntil(ctx context.Context, module *config.ModuleConfig, logger *slog.Logger) error {
 	be, err := openBackend(module)
 	if err != nil {
 		return err
