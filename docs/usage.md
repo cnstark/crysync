@@ -67,7 +67,7 @@ curl -u backup:demo-password -T /tmp/crysync-demo/src/hello.txt   http://127.0.0
 curl -u backup:demo-password http://127.0.0.1:8875/home/from-webdav.txt
 ```
 
-浏览器访问 `http://127.0.0.1:8875/` 可查看模块列表，进入 `/home/` 浏览文件。文件管理器也可挂载服务器根或模块 URL。WebDAV 上传的文件可以通过 rsync 恢复。
+浏览器访问 `http://127.0.0.1:8875/` 可查看已就绪模块，进入 `/home/` 浏览文件。后端尚未就绪的模块请求会返回 503 和 `Retry-After`，后续请求会懒打开并在成功后加入根列表。文件管理器也可挂载服务器根或模块 URL。WebDAV 上传的文件可以通过 rsync 恢复。
 
 restic 本身可经 rclone 的 WebDAV remote 使用此存储；历史 NAS 联调记录中的定制 restic 客户端不代表所有备份客户端均兼容。CrySync 看到的是这些工具写入的仓库文件，备份版本由上层工具维护。
 
@@ -114,8 +114,8 @@ CLI 没有 `--module`、`snapshots`、`prune` 或 `gc`。容器中可执行 `doc
 
 | 现象 | 当前行为与排查方向 |
 |---|---|
-| WebDAV 模块 404 | 启动时打开失败的模块会跳过；检查 `module_open_error`、后端 URL 和权限，修复后重启 |
-| rsync 模块不可用 | 启动初始化失败只记日志；连接选择模块时会重新打开并探测后端，错误返回客户端 |
+| WebDAV 模块 503 | 模块或后端尚未就绪；检查 `module_open_error`、`module_init_retry`、后端 URL 和权限，等待冷却后重试请求 |
+| rsync 模块不可用 | 初始化失败由后台调度器退避重试；检查 `module_init_retry`/`module_recovered`，连接选择模块时也会重新打开并探测后端 |
 | 数据库存在但密钥缺失 | 拒绝自动换钥；恢复对应密钥及挂载，避免丢失现有数据的解密能力 |
 | PUT 返回 409 | 检查父目录是否存在，以及后端目标目录是否有效 |
 | 只读模块写入失败 | rsync 拒绝推送，WebDAV 写方法返回 403 |
