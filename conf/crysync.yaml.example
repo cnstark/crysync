@@ -30,6 +30,8 @@ modules:
     meta_backup:
       interval: 1h                 # 一致、加密的完整 Meta 快照周期
       retain: 24                   # 远端 meta/ 保留版本数
+    gc:
+      interval: 24h                # 孤儿 blob 回收周期；0s 或省略则禁用
     backend:
       type: dir
       path: /data/home

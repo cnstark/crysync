@@ -164,3 +164,63 @@ func TestMetaBackupSchedulerInitRetry(t *testing.T) {
 		t.Fatalf("自愈成功后应记录 module_recovered，日志=%s", logs.String())
 	}
 }
+
+func TestGCSchedulerReclaimsAndLogs(t *testing.T) {
+	root := t.TempDir()
+	module := &config.ModuleConfig{
+		Name:    "home",
+		Backend: config.BackendConfig{Type: "dir", Path: filepath.Join(root, "data")},
+		Keyfile: filepath.Join(root, "key"),
+		Meta:    filepath.Join(root, "meta", "home.db"),
+		GC:      config.GCConfig{Interval: "10ms"},
+	}
+	opened, err := OpenModule(module)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := opened.Repo.StoreChunk([]byte("orphan")); err != nil {
+		opened.Close()
+		t.Fatal(err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	go func() { done <- RunGCScheduler(ctx, module, logger) }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		be, err := openBackend(module)
+		if err != nil {
+			t.Fatal(err)
+		}
+		blobs, err := be.List()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(blobs) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("GC 调度器未回收孤儿 blob")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GC 调度器未响应取消")
+	}
+	if got := logs.String(); !strings.Contains(got, "msg=gc_start") ||
+		!strings.Contains(got, "msg=gc_complete") || !strings.Contains(got, "reclaimed_blobs=1") {
+		t.Fatalf("GC 日志不完整: %s", got)
+	}
+}

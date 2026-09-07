@@ -93,6 +93,12 @@ type MetaBackupConfig struct {
 	Retain   int    `yaml:"retain"`
 }
 
+// GCConfig controls periodic reclamation of unreferenced blobs. An empty or
+// zero interval disables automatic GC, preserving the historical behaviour.
+type GCConfig struct {
+	Interval string `yaml:"interval"`
+}
+
 type ModuleConfig struct {
 	Name     string `yaml:"name"`
 	Path     string `yaml:"path"`
@@ -110,6 +116,7 @@ type ModuleConfig struct {
 	Meta                 string           `yaml:"meta"`
 	ChunkSize            int              `yaml:"chunk_size"`
 	MetaBackup           MetaBackupConfig `yaml:"meta_backup"`
+	GC                   GCConfig         `yaml:"gc"`
 }
 
 func (m *ModuleConfig) ChunkSizeBytes() int {
@@ -132,6 +139,15 @@ func (m *ModuleConfig) MetaBackupRetain() int {
 		return DefaultMetaBackupRetain
 	}
 	return m.MetaBackup.Retain
+}
+
+// GCInterval returns zero when periodic GC is disabled.
+func (m *ModuleConfig) GCInterval() time.Duration {
+	if m.GC.Interval == "" {
+		return 0
+	}
+	d, _ := time.ParseDuration(m.GC.Interval)
+	return d
 }
 
 func Load(path string) (*Config, error) {
@@ -259,6 +275,12 @@ func (c *Config) validateStructure() error {
 		}
 		if m.MetaBackup.Retain < 1 {
 			return fmt.Errorf("模块 %s: meta_backup.retain 必须为正数", m.Name)
+		}
+		if m.GC.Interval != "" {
+			interval, err := time.ParseDuration(m.GC.Interval)
+			if err != nil || interval < 0 {
+				return fmt.Errorf("模块 %s: gc.interval 必须为非负的时间长度（0 为禁用）", m.Name)
+			}
 		}
 	}
 	return nil

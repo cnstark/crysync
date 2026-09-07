@@ -81,6 +81,11 @@ func main() {
 				logger.Error("meta_backup_scheduler_error", "module", m.Name, "err", err.Error())
 			}
 		}()
+		go func() {
+			if err := core.RunGCScheduler(ctx, m, logger); err != nil && ctx.Err() == nil {
+				logger.Error("gc_scheduler_error", "module", m.Name, "err", err.Error())
+			}
+		}()
 	}
 	errCh := make(chan error, len(fronts))
 	for _, f := range fronts {

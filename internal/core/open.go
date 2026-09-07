@@ -265,6 +265,45 @@ func RunMetaBackupScheduler(ctx context.Context, module *config.ModuleConfig, lo
 	}
 }
 
+// RunGCScheduler periodically reclaims orphan blobs for one module. A zero
+// interval disables the scheduler. Each attempt is independently opened so a
+// transient backend failure does not stop subsequent scheduled runs.
+func RunGCScheduler(ctx context.Context, module *config.ModuleConfig, logger *slog.Logger) error {
+	interval := module.GCInterval()
+	if interval == 0 {
+		return nil
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			started := time.Now()
+			logger.Info("gc_start", "module", module.Name)
+			opened, err := OpenModule(module)
+			var reclaimed int
+			if err == nil {
+				reclaimed, err = opened.Repo.GC()
+				closeErr := opened.Close()
+				if err == nil {
+					err = closeErr
+				}
+			}
+			if err != nil {
+				logger.Error("gc_error", "module", module.Name, "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
+				continue
+			}
+			logger.Info("gc_complete", "module", module.Name, "reclaimed_blobs", reclaimed,
+				"elapsed_ms", time.Since(started).Milliseconds())
+		}
+	}
+}
+
 // runBackupUntil 打开模块并循环备份 Meta：初始化/打开失败返回 err
 // （由外层退避重试），备份失败仅记日志不中断循环，ctx 取消返回 nil。
 func runBackupUntil(ctx context.Context, module *config.ModuleConfig, logger *slog.Logger) error {

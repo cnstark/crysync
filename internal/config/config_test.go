@@ -52,11 +52,40 @@ modules:
 	if m.MetaBackupInterval() != DefaultMetaBackupInterval || m.MetaBackupRetain() != DefaultMetaBackupRetain {
 		t.Fatalf("Meta 备份默认值错误: interval=%s retain=%d", m.MetaBackupInterval(), m.MetaBackupRetain())
 	}
+	if m.GCInterval() != 0 {
+		t.Fatalf("未配置 GC 时应禁用: interval=%s", m.GCInterval())
+	}
 	if m.MaxUploadConcurrency != 0 {
 		t.Fatalf("缺省上传并发应为 0（不限制）: %d", m.MaxUploadConcurrency)
 	}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
+	}
+}
+
+func TestGCConfigValidation(t *testing.T) {
+	for _, tc := range []struct {
+		interval string
+		ok       bool
+	}{
+		{"0s", true}, {"6h", true}, {"bad", false}, {"-1h", false},
+	} {
+		p := writeTemp(t, fmt.Sprintf(`
+front: { rsync: { listen: "127.0.0.1:873" } }
+modules:
+  - name: home
+    backend: { type: dir, path: /tmp/data }
+    keyfile: /tmp/keys/home.key
+    meta: /tmp/meta/home.db
+    gc: { interval: %q }
+`, tc.interval))
+		c, err := Load(p)
+		if (err == nil) != tc.ok {
+			t.Fatalf("interval=%q: err=%v, ok=%v", tc.interval, err, tc.ok)
+		}
+		if tc.ok && tc.interval == "6h" && c.Modules[0].GCInterval().Hours() != 6 {
+			t.Fatalf("GC interval 解析错误: %s", c.Modules[0].GCInterval())
+		}
 	}
 }
 

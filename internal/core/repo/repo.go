@@ -505,6 +505,9 @@ func (f *FileReader) Close() error {
 //
 // 返回删除的 blob 数量。
 func (r *Repo) GC() (int, error) {
+	// GC 与同模块写会话/元数据变更串行，避免根据中间状态判断孤儿。
+	unlock := r.lockWrite()
+	defer unlock()
 	blobs, err := r.backend.List()
 	if err != nil {
 		return 0, fmt.Errorf("列出后端: %w", err)

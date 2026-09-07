@@ -34,6 +34,7 @@
 | `chunk_size` | `4194304` | 分块字节数；非正数回退 4 MiB；仓库使用期间保持固定 |
 | `meta_backup.interval` | `1h` | 加密 Meta 完整快照周期，必须为正的 Go duration（如 `30m`、`2h`） |
 | `meta_backup.retain` | `24` | 后端 `meta/` 中保留的快照版本数，必须为正数 |
+| `gc.interval` | 未配置（禁用） | 孤儿 blob 回收周期；`0s` 也表示禁用，启用时必须是非负 Go duration（如 `24h`） |
 
 `max_upload_concurrency` 限制的是同时进行的后端 PUT 数，不是带宽或 HTTP 客户端数。WebDAV 文件写入内部有 4 个上传 worker；多个请求共用模块上传上限。没有配置热重载，修改后重启生效。进程内锁和闸门不提供多进程共享仓库协调能力。
 
@@ -67,6 +68,8 @@ modules:
     meta_backup:
       interval: 1h
       retain: 24
+    gc:
+      interval: 24h
 ```
 
 后端需要支持 PUT、GET、DELETE、PROPFIND。当前 PUT 失败最多尝试 **3 次（含首次）**，间隔 200 ms、400 ms；GET 不重试。HTTP 客户端超时 300 秒，Ping 探测超时 10 秒。
