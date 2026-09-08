@@ -15,6 +15,7 @@ import (
 
 	"golang.org/x/net/webdav"
 
+	"crysync/internal/backend"
 	"crysync/internal/core"
 	"crysync/internal/core/meta"
 )
@@ -24,6 +25,32 @@ type contextTestWriter struct {
 	started chan struct{}
 	release chan struct{}
 	err     error
+}
+
+func TestWritePutErrorReportsBackendFailure(t *testing.T) {
+	rec := httptest.NewRecorder()
+	err := fmt.Errorf("upload chunk: %w", &backend.WebDAVError{
+		Method:     "MKCOL",
+		StatusCode: http.StatusNotFound,
+		RetryAfter: "12",
+		Err:        errors.New("stale parent id"),
+	})
+	writePutError(rec, err)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("后端 404 应映射为 503，得到 %d", rec.Code)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "12" {
+		t.Fatalf("Retry-After = %q，期望 12", got)
+	}
+	if got := rec.Header().Get("X-CrySync-Backend-Status"); got != "404" {
+		t.Fatalf("后端状态头 = %q，期望 404", got)
+	}
+	if got := rec.Header().Get("X-CrySync-Backend-Operation"); got != "MKCOL" {
+		t.Fatalf("后端操作头 = %q，期望 MKCOL", got)
+	}
+	if strings.Contains(rec.Body.String(), "stale parent id") {
+		t.Fatalf("不应向客户端暴露上游错误细节: %q", rec.Body.String())
+	}
 }
 
 func (w *contextTestWriter) PutFileContext(ctx context.Context, path string, mode uint32, mtimeNs int64, src io.Reader) (core.PutResult, error) {

@@ -5,15 +5,70 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// WebDAVError preserves information about a failed request to the storage
+// backend.  StatusCode is zero for a transport failure before an HTTP response
+// was received.  It intentionally never includes the request URL: backend
+// URLs can contain sensitive path information.
+type WebDAVError struct {
+	Method     string
+	StatusCode int
+	RetryAfter string
+	Err        error
+}
+
+func (e *WebDAVError) Error() string {
+	if e.StatusCode != 0 {
+		return fmt.Sprintf("webdav %s: upstream HTTP %d: %v", e.Method, e.StatusCode, e.Err)
+	}
+	return fmt.Sprintf("webdav %s: %v", e.Method, e.Err)
+}
+
+func (e *WebDAVError) Unwrap() error { return e.Err }
+
+// Retryable reports whether retrying a write can reasonably recover.  A 404 is
+// deliberately retryable: some cloud-WebDAV bridges return it transiently when
+// their cached parent-directory ID is stale.
+func (e *WebDAVError) Retryable() bool {
+	return e.StatusCode == 0 || e.StatusCode == http.StatusNotFound ||
+		e.StatusCode == http.StatusRequestTimeout || e.StatusCode == http.StatusTooEarly ||
+		e.StatusCode == http.StatusTooManyRequests || e.StatusCode == http.StatusLocked ||
+		e.StatusCode >= 500
+}
+
+func newWebDAVError(method string, resp *http.Response, err error) error {
+	if resp == nil {
+		return &WebDAVError{Method: method, Err: err}
+	}
+	return &WebDAVError{
+		Method:     method,
+		StatusCode: resp.StatusCode,
+		RetryAfter: resp.Header.Get("Retry-After"),
+		Err:        err,
+	}
+}
+
+// RetryAfterSeconds validates an upstream Retry-After delay before it is sent
+// to a client. Date-form values and unreasonable delays intentionally fall
+// back to CrySync's own retry hint.
+func RetryAfterSeconds(value string) string {
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds < 1 || seconds > 3600 {
+		return ""
+	}
+	return strconv.Itoa(seconds)
+}
 
 // WebDAV：基于 WebDAV 协议的 Backend 实现。逻辑 blob 名通过哈希前缀映射到
 // 多级 collection，完整逻辑名作为叶子资源名。方法映射：
@@ -110,7 +165,7 @@ func (w *WebDAV) doReaderContext(ctx context.Context, method, rawURL string, bod
 	}
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, newWebDAVError(method, nil, err)
 	}
 	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
 	if len(want) > 0 {
@@ -125,7 +180,7 @@ func (w *WebDAV) doReaderContext(ctx context.Context, method, rawURL string, bod
 	if !ok {
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("webdav %s %s: %s", method, rawURL, strings.TrimSpace(string(b)))
+		return nil, newWebDAVError(method, resp, fmt.Errorf("%s", strings.TrimSpace(string(b))))
 	}
 	return resp, nil
 }
@@ -172,6 +227,9 @@ func (w *WebDAV) PutMetaContext(ctx context.Context, name string, src io.ReadSee
 		w.collectionsMu.Lock()
 		delete(w.collections, "@meta")
 		w.collectionsMu.Unlock()
+		if !retryableWriteError(err) {
+			return fmt.Errorf("上传 Meta 备份 %s: %w", name, err)
+		}
 		if attempt < 2 {
 			timer := time.NewTimer(delay)
 			select {
@@ -269,6 +327,15 @@ func (w *WebDAV) PutContext(ctx context.Context, name string, data []byte) error
 		if err = w.putOnceContext(ctx, name, data); err == nil {
 			return nil
 		}
+		if !retryableWriteError(err) {
+			return fmt.Errorf("写入后端 %s: %w", name, err)
+		}
+		// A 404 from cloud-WebDAV can mean that its cached directory ID is
+		// stale. Forgetting local collection knowledge forces the next attempt
+		// to re-run MKCOL and lets the bridge resolve the path again.
+		if isNotFound(err) {
+			w.clearCollections()
+		}
 		if attempt < 2 {
 			t := time.NewTimer(delay)
 			select {
@@ -281,6 +348,25 @@ func (w *WebDAV) PutContext(ctx context.Context, name string, data []byte) error
 		}
 	}
 	return fmt.Errorf("写入后端 %s: %w", name, err)
+}
+
+func retryableWriteError(err error) bool {
+	var webdavErr *WebDAVError
+	if errors.As(err, &webdavErr) {
+		return webdavErr.Retryable()
+	}
+	return false
+}
+
+func isNotFound(err error) bool {
+	var webdavErr *WebDAVError
+	return errors.As(err, &webdavErr) && webdavErr.StatusCode == http.StatusNotFound
+}
+
+func (w *WebDAV) clearCollections() {
+	w.collectionsMu.Lock()
+	clear(w.collections)
+	w.collectionsMu.Unlock()
 }
 
 func (w *WebDAV) Get(name string) ([]byte, error) {
@@ -430,12 +516,12 @@ func (w *WebDAV) propfindContext(ctx context.Context, currentURL string) ([]stru
 	}
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("webdav list: %w", err)
+		return nil, newWebDAVError("PROPFIND", nil, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMultiStatus {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("webdav list: %s", strings.TrimSpace(string(b)))
+		return nil, newWebDAVError("PROPFIND", resp, fmt.Errorf("%s", strings.TrimSpace(string(b))))
 	}
 	var ms multistatus
 	if err := xml.NewDecoder(resp.Body).Decode(&ms); err != nil {
@@ -506,12 +592,12 @@ func (w *WebDAV) Ping() error {
 	}
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("webdav 后端不可达: %w", err)
+		return newWebDAVError("PROPFIND", nil, err)
 	}
 	defer resp.Body.Close()
 	// 服务器实现可能不支持 PROPFIND 返回 207；200（旧实现）也视为可达
 	if resp.StatusCode != http.StatusMultiStatus && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("webdav 后端不可达: HTTP %d", resp.StatusCode)
+		return newWebDAVError("PROPFIND", resp, fmt.Errorf("unexpected response status"))
 	}
 	return nil
 }

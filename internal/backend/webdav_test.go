@@ -4,6 +4,7 @@ package backend
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -192,6 +193,51 @@ func TestWebDAVCollectionCache(t *testing.T) {
 	}
 	if got := mkcols.Load(); got != 2 {
 		t.Fatalf("缓存命中后仍发送 MKCOL，累计次数 = %d", got)
+	}
+}
+
+func TestWebDAVPutRetriesUpstream404(t *testing.T) {
+	var returned404 atomic.Bool
+	dav := &webdav.Handler{FileSystem: webdav.NewMemFS(), LockSystem: webdav.NewMemLS()}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "MKCOL" && !returned404.Swap(true) {
+			http.Error(w, "stale parent id", http.StatusNotFound)
+			return
+		}
+		dav.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	be, err := NewWebDAV(srv.URL, "", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := be.Put("retry-404", []byte("content")); err != nil {
+		t.Fatalf("404 应在重试后恢复，得到 %v", err)
+	}
+	if !returned404.Load() {
+		t.Fatal("测试服务器未返回预期的 404")
+	}
+}
+
+func TestWebDAVErrorPreservesUpstreamStatus(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "12")
+		http.Error(w, "missing upstream object", http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	be, err := NewWebDAV(srv.URL, "", "", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = be.Get("missing")
+	var backendErr *WebDAVError
+	if !errors.As(err, &backendErr) {
+		t.Fatalf("错误未保留 WebDAVError: %v", err)
+	}
+	if backendErr.Method != http.MethodGet || backendErr.StatusCode != http.StatusNotFound || backendErr.RetryAfter != "12" {
+		t.Fatalf("错误详情不符: %+v", backendErr)
 	}
 }
 

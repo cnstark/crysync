@@ -9,11 +9,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/net/webdav"
 
+	"crysync/internal/backend"
 	"crysync/internal/core"
 )
 
@@ -65,7 +67,32 @@ func (r *countingReader) Read(p []byte) (int, error) {
 
 func writePutError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
+	var backendErr *backend.WebDAVError
 	switch {
+	case errors.As(err, &backendErr):
+		// An upstream 404 does not mean that the path requested from CrySync is
+		// absent. Cloud-WebDAV bridges can return 404 for a stale directory ID,
+		// so expose this as a retryable dependency failure instead.
+		if backendErr.StatusCode == http.StatusUnauthorized || backendErr.StatusCode == http.StatusForbidden || !backendErr.Retryable() {
+			status = http.StatusBadGateway
+		} else {
+			status = http.StatusServiceUnavailable
+			w.Header().Set("Retry-After", backend.RetryAfterSeconds(backendErr.RetryAfter))
+			if w.Header().Get("Retry-After") == "" {
+				w.Header().Set("Retry-After", "30")
+			}
+		}
+		w.Header().Set("X-CrySync-Backend-Operation", backendErr.Method)
+		if backendErr.StatusCode != 0 {
+			w.Header().Set("X-CrySync-Backend-Status", strconv.Itoa(backendErr.StatusCode))
+		} else {
+			w.Header().Set("X-CrySync-Backend-Status", "transport")
+		}
+		if backendErr.Retryable() {
+			w.Header().Set("X-CrySync-Backend-Retryable", "true")
+		}
+		http.Error(w, "backend storage unavailable", status)
+		return
 	case errors.Is(err, os.ErrNotExist):
 		status = http.StatusConflict
 	case errors.Is(err, os.ErrPermission):
