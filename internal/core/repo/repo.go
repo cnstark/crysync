@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	pathpkg "path"
 	"strings"
@@ -19,12 +20,19 @@ import (
 	"crysync/internal/core/crypto"
 	"crysync/internal/core/meta"
 	"crysync/internal/core/types"
+	"crysync/internal/trace"
 )
 
 // moduleWriteLocks 模块级共享写锁（键 = meta DB 路径）：v0.5 单一当前状态
 // 模型下 Repo 实例按需创建（rsync 每连接一个、webdav 缓存一个），实例内锁
 // 无法跨连接/跨前端互斥——此包级锁保证同一模块的写操作全局串行。
 var moduleWriteLocks sync.Map // meta DB path -> *sync.Mutex
+
+// moduleMaintenanceLocks prevents GC from observing a WebDAV upload between
+// blob creation and its final file-row commit. Readers are whole WebDAV file
+// writes; GC is the sole writer. It is separate from moduleWriteLocks so
+// concurrent WebDAV uploads retain their streaming parallelism.
+var moduleMaintenanceLocks sync.Map // meta DB path -> *sync.RWMutex
 
 // moduleUploadGates 模块级上传并发闸门（键 = meta DB 路径）：跨连接/跨前端
 // 共享的信号量，限制同一模块同时进行的 backend.Put 网络写总数。Repo 实例
@@ -46,6 +54,7 @@ type Repo struct {
 	// 网络 IO 的重叠）。
 	inflightMu sync.Mutex
 	inflight   map[[32]byte]*chunkInflight
+	logger     *slog.Logger
 }
 
 // chunkInflight 一次进行中的块上传：完成后 close(done) 广播，等待者复用结果。
@@ -57,7 +66,23 @@ type chunkInflight struct {
 
 func New(metaDB *meta.DB, be backend.Backend, key *crypto.Key, chunkSize int) *Repo {
 	return &Repo{meta: metaDB, backend: be, key: key, chunkSize: chunkSize,
-		inflight: make(map[[32]byte]*chunkInflight)}
+		inflight: make(map[[32]byte]*chunkInflight), logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+}
+
+// SetLogger enables structured operation diagnostics for this repository.
+// Callers normally provide a module-scoped logger; nil disables diagnostics.
+func (r *Repo) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	r.logger = logger
+}
+
+func (r *Repo) debug(ctx context.Context, msg string, args ...any) {
+	if id := trace.ID(ctx); id != "" {
+		args = append([]any{"op", id}, args...)
+	}
+	r.logger.Debug(msg, args...)
 }
 
 // lockWrite 获取模块写锁（短持：WebDAV 单请求的行更新段）。
@@ -67,6 +92,20 @@ func (r *Repo) lockWrite() func() {
 	m := mu.(*sync.Mutex)
 	m.Lock()
 	return m.Unlock
+}
+
+func (r *Repo) lockMaintenanceRead() func() {
+	v, _ := moduleMaintenanceLocks.LoadOrStore(r.meta.DBPath(), &sync.RWMutex{})
+	mu := v.(*sync.RWMutex)
+	mu.RLock()
+	return mu.RUnlock
+}
+
+func (r *Repo) lockMaintenanceWrite() func() {
+	v, _ := moduleMaintenanceLocks.LoadOrStore(r.meta.DBPath(), &sync.RWMutex{})
+	mu := v.(*sync.RWMutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // WriteSessionLock 写会话全程互斥（types.Session 接口）：rsync 备份会话
@@ -114,12 +153,21 @@ func (r *Repo) StoreChunk(data []byte) (chunkID int64, reused bool, err error) {
 
 // StoreChunkContext 将明文块去重存储，并响应调用方取消。
 func (r *Repo) StoreChunkContext(ctx context.Context, data []byte) (chunkID int64, reused bool, err error) {
+	started := time.Now()
+	r.debug(ctx, "chunk_store_start", "plain_bytes", len(data))
 	release, err := r.acquireInflight(ctx)
 	if err != nil {
+		r.debug(ctx, "chunk_store_end", "outcome", "error", "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return 0, false, err
 	}
 	defer release()
-	return r.storeChunkContext(ctx, data)
+	chunkID, reused, err = r.storeChunkContext(ctx, data)
+	args := []any{"outcome", "ok", "elapsed_ms", time.Since(started).Milliseconds(), "chunk_id", chunkID, "reused", reused}
+	if err != nil {
+		args = []any{"outcome", "error", "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error()}
+	}
+	r.debug(ctx, "chunk_store_end", args...)
+	return chunkID, reused, err
 }
 
 // storeChunkContext 执行实际工作；调用方已持有 inflight 槽位。
@@ -131,6 +179,7 @@ func (r *Repo) storeChunkContext(ctx context.Context, data []byte) (chunkID int6
 	if info, exists, err := r.meta.FindChunkByHash(h); err != nil {
 		return 0, false, err
 	} else if exists {
+		r.debug(ctx, "chunk_dedup_hit", "chunk_id", info.ID, "plain_bytes", len(data))
 		return info.ID, true, nil
 	}
 	// in-flight 登记：同内容上传进行中则等待其完成并复用结果
@@ -142,6 +191,7 @@ func (r *Repo) storeChunkContext(ctx context.Context, data []byte) (chunkID int6
 	}
 	r.inflightMu.Unlock()
 	if dup {
+		r.debug(ctx, "chunk_dedup_wait", "plain_bytes", len(data))
 		select {
 		case <-w.done:
 			return w.id, true, w.err
@@ -163,10 +213,13 @@ func (r *Repo) storeChunkContext(ctx context.Context, data []byte) (chunkID int6
 	if err != nil {
 		return 0, false, err
 	}
+	encryptStarted := time.Now()
+	r.debug(ctx, "chunk_encrypt_start", "blob", blobName, "plain_bytes", len(data))
 	blob, err := r.key.Encrypt(data, blobName)
 	if err != nil {
 		return 0, false, err
 	}
+	r.debug(ctx, "chunk_encrypt_end", "outcome", "ok", "blob", blobName, "encrypted_bytes", len(blob), "elapsed_ms", time.Since(encryptStarted).Milliseconds())
 	if err := r.putBlobContext(ctx, blobName, blob); err != nil {
 		return 0, false, fmt.Errorf("写入后端: %w", err)
 	}
@@ -190,21 +243,30 @@ func (r *Repo) putBlob(name string, blob []byte) error {
 }
 
 func (r *Repo) putBlobContext(ctx context.Context, name string, blob []byte) error {
+	started := time.Now()
+	r.debug(ctx, "backend_upload_start", "blob", name, "encrypted_bytes", len(blob))
+	var err error
 	if g := r.uploadGate; g != nil {
 		select {
 		case g <- struct{}{}:
 		case <-ctx.Done():
-			return ctx.Err()
+			err = ctx.Err()
+			r.debug(ctx, "backend_upload_end", "outcome", "error", "blob", name, "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
+			return err
 		}
 		defer func() { <-g }()
 	}
 	if cb, ok := r.backend.(backend.ContextBackend); ok {
-		return cb.PutContext(ctx, name, blob)
+		err = cb.PutContext(ctx, name, blob)
+	} else if err = ctx.Err(); err == nil {
+		err = r.backend.Put(name, blob)
 	}
-	if err := ctx.Err(); err != nil {
+	if err != nil {
+		r.debug(ctx, "backend_upload_end", "outcome", "error", "blob", name, "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return err
 	}
-	return r.backend.Put(name, blob)
+	r.debug(ctx, "backend_upload_end", "outcome", "ok", "blob", name, "encrypted_bytes", len(blob), "elapsed_ms", time.Since(started).Milliseconds())
+	return nil
 }
 
 // UpsertFile 原地落库文件行并附加块关联（替换+refcount 维护+关联全在
@@ -505,7 +567,11 @@ func (f *FileReader) Close() error {
 //
 // 返回删除的 blob 数量。
 func (r *Repo) GC() (int, error) {
-	// GC 与同模块写会话/元数据变更串行，避免根据中间状态判断孤儿。
+	// 先取得维护独占锁，再取得元数据写锁，顺序须与 WebDAV PutFileContext
+	// 的维护共享锁一致。这样 GC 不会把尚未提交文件行的上传中 blob 当孤儿。
+	maintenanceUnlock := r.lockMaintenanceWrite()
+	defer maintenanceUnlock()
+	// GC 与同模块 rsync 写会话/元数据变更串行，避免根据中间状态判断孤儿。
 	unlock := r.lockWrite()
 	defer unlock()
 	blobs, err := r.backend.List()
@@ -649,8 +715,22 @@ func (r *Repo) PutFile(path string, mode uint32, mtimeNs int64, src io.Reader) e
 
 // PutFileContext 流式写入文件：读取每个块前取得进程级在途槽位，块在查重、
 // 加密和后端上传完成前持续占用槽位。请求取消或任一块失败时不更新文件行。
-func (r *Repo) PutFileContext(ctx context.Context, path string, mode uint32, mtimeNs int64, src io.Reader) (types.PutResult, error) {
+func (r *Repo) PutFileContext(ctx context.Context, path string, mode uint32, mtimeNs int64, src io.Reader) (result types.PutResult, retErr error) {
 	const uploadWorkers = 4
+	// Keep the shared maintenance lock from the first backend blob write until
+	// the file-row commit (or failure cleanup). Multiple WebDAV writes share it;
+	// only GC takes the exclusive side.
+	maintenanceUnlock := r.lockMaintenanceRead()
+	defer maintenanceUnlock()
+	started := time.Now()
+	r.debug(ctx, "file_write_start", "path", path, "mode", mode, "mtime_ns", mtimeNs)
+	defer func() {
+		if retErr != nil {
+			r.debug(ctx, "file_write_end", "outcome", "error", "path", path, "elapsed_ms", time.Since(started).Milliseconds(), "err", retErr.Error())
+			return
+		}
+		r.debug(ctx, "file_write_end", "outcome", "ok", "path", path, "size", result.Size, "elapsed_ms", time.Since(started).Milliseconds())
+	}()
 	type chunkJob struct {
 		idx     int
 		data    []byte
@@ -736,8 +816,15 @@ func (r *Repo) PutFileContext(ctx context.Context, path string, mode uint32, mti
 		go func() {
 			defer wg.Done()
 			for j := range jobCh {
+				chunkStarted := time.Now()
+				r.debug(workCtx, "file_chunk_start", "path", path, "chunk_index", j.idx, "plain_bytes", len(j.data))
 				id, reused, err := r.storeChunkContext(workCtx, j.data)
 				j.release()
+				if err != nil {
+					r.debug(workCtx, "file_chunk_end", "outcome", "error", "path", path, "chunk_index", j.idx, "elapsed_ms", time.Since(chunkStarted).Milliseconds(), "err", err.Error())
+				} else {
+					r.debug(workCtx, "file_chunk_end", "outcome", "ok", "path", path, "chunk_index", j.idx, "chunk_id", id, "reused", reused, "elapsed_ms", time.Since(chunkStarted).Milliseconds())
+				}
 				resCh <- chunkRes{idx: j.idx, n: int64(len(j.data)), id: id, reused: reused, err: err}
 				if err != nil {
 					closeSrc()

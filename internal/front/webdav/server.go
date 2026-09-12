@@ -62,7 +62,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	var opened []*core.Module
 	for i := range s.cfg.Modules {
 		m := &s.cfg.Modules[i]
-		mod, err := s.runtime.OpenModule(m)
+		mod, err := s.runtime.OpenModuleWithLogger(m, s.logger)
 		if err != nil {
 			s.logger.Error("module_open_error", "module", m.Name, "err", err.Error())
 			continue
@@ -70,7 +70,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		opened = append(opened, mod)
 		cache.preload(m.Name, s.buildModuleHandler(m, mod))
 	}
-	srv := &http.Server{Handler: s.buildMux(cache)}
+	srv := &http.Server{Handler: requestTrace(s.buildMux(cache), s.logger)}
 
 	ln, err := net.Listen("tcp", wd.Listen)
 	if err != nil {
@@ -131,7 +131,7 @@ func (s *Server) buildMux(cache *moduleCache) http.Handler {
 		prefix := "/" + m.Name
 		mux.Handle(prefix+"/", auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			h, first, err := cache.open(m.Name,
-				func() (*core.Module, error) { return s.runtime.OpenModule(m) },
+				func() (*core.Module, error) { return s.runtime.OpenModuleWithLogger(m, s.logger) },
 				func(mod *core.Module) http.Handler { return s.buildModuleHandler(m, mod) })
 			if err != nil {
 				if first {

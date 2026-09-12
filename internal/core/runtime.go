@@ -1,6 +1,8 @@
 package core
 
 import (
+	"log/slog"
+
 	"crysync/internal/config"
 	"crysync/internal/core/repo"
 )
@@ -19,5 +21,10 @@ func NewRuntime(maxInflightChunks int) *Runtime {
 
 // OpenModule 使用当前 Runtime 打开模块，使所有前端共享在途槽位。
 func (rt *Runtime) OpenModule(module *config.ModuleConfig) (*Module, error) {
-	return openModule(module, rt)
+	return openModule(module, rt, nil)
+}
+
+// OpenModuleWithLogger is the Runtime equivalent of OpenModuleWithLogger.
+func (rt *Runtime) OpenModuleWithLogger(module *config.ModuleConfig, logger *slog.Logger) (*Module, error) {
+	return openModule(module, rt, logger)
 }

@@ -1,10 +1,12 @@
 package webdav
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +21,29 @@ import (
 	"crysync/internal/core"
 	"crysync/internal/core/meta"
 )
+
+func TestRequestTraceLogsLifecycle(t *testing.T) {
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	h := requestTrace(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Fatalf("method = %s", r.Method)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("ok"))
+	}), logger)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/home/file.txt", nil))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	got := logs.String()
+	for _, want := range []string{"msg=webdav_request_start", "msg=webdav_request_end", "op=", "status=201", "response_bytes=2"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("日志缺少 %q: %s", want, got)
+		}
+	}
+}
 
 type contextTestWriter struct {
 	fakeWriter

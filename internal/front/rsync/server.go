@@ -13,6 +13,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"crysync/internal/config"
@@ -20,6 +21,7 @@ import (
 	"crysync/internal/core/meta"
 	"crysync/internal/core/types"
 	"crysync/internal/front/rsync/protocol"
+	"crysync/internal/trace"
 )
 
 // rsyncService 组合 Session + FileStore，供协议会话按 RsyncService 使用。
@@ -138,11 +140,27 @@ func (s *Server) Serve(ctx context.Context) error {
 			defer c.Close()
 			c.SetDeadline(time.Now().Add(24 * time.Hour))
 			if err := handleConn(ctx, c, s.cfg, s.logger, limiter, s.runtime); err != nil && !errors.Is(err, protocol.ErrClientClosed) {
-				s.logger.Warn("conn_error", "client", c.RemoteAddr().String(), "err", err.Error())
+				if isLocalProbeDisconnect(c, err) {
+					s.logger.Debug("conn_closed", "client", c.RemoteAddr().String(), "err", err.Error())
+				} else {
+					s.logger.Warn("conn_error", "client", c.RemoteAddr().String(), "err", err.Error())
+				}
 			}
 		}(conn)
 	}
 	return nil
+}
+
+// isLocalProbeDisconnect identifies the TCP connect-and-close pattern used by
+// the container health check. It is expected traffic, not a failed rsync
+// session, and therefore belongs at debug level.
+func isLocalProbeDisconnect(c net.Conn, err error) bool {
+	if !errors.Is(err, io.EOF) && !errors.Is(err, syscall.ECONNRESET) {
+		return false
+	}
+	host, _, splitErr := net.SplitHostPort(c.RemoteAddr().String())
+	ip := net.ParseIP(host)
+	return splitErr == nil && ip != nil && ip.IsLoopback()
 }
 
 // moduleConnLimiter：模块并发连接计数。allow 在模块选定后、认证前占坑（须与
@@ -189,15 +207,17 @@ func handleConn(ctx context.Context, conn net.Conn, cfg *config.Config, logger *
 		return err
 	}
 	defer limiter.release(module.Name)
-	mod, err := runtime.OpenModule(module)
+	sessionID := newSessionID()
+	sess := logger.With("module", module.Name,
+		"client", conn.RemoteAddr().String(), "session", sessionID)
+	ctx = trace.WithID(ctx, sessionID)
+	mod, err := runtime.OpenModuleWithLogger(module, sess)
 	if err != nil {
 		fmt.Fprintf(conn, "@ERROR: %v\n", err)
 		return err
 	}
 	defer mod.Close()
 	svc := &rsyncService{Session: mod.Session, FileStore: mod.FileStore}
-	sess := logger.With("module", module.Name,
-		"client", conn.RemoteAddr().String(), "session", newSessionID())
 	// 方向由 RunSession 在 argv 协商后判定（--sender = 恢复）；只读模块拒绝推送
 	return protocol.RunSessionWithReader(ctx, br, conn, module, svc, sess)
 }

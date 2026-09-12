@@ -3,6 +3,7 @@ package repo
 
 import (
 	"bytes"
+	"context"
 	"crypto/md5"
 	"errors"
 	"fmt"
@@ -19,6 +20,35 @@ import (
 	"crysync/internal/core/meta"
 )
 
+type gcBlockingBackend struct {
+	*backend.InMemory
+	uploadStarted chan struct{}
+	releaseUpload chan struct{}
+	listCalled    chan struct{}
+}
+
+func (b *gcBlockingBackend) PutContext(ctx context.Context, name string, data []byte) error {
+	select {
+	case <-b.uploadStarted:
+	default:
+		close(b.uploadStarted)
+	}
+	select {
+	case <-b.releaseUpload:
+		return b.InMemory.PutContext(ctx, name, data)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *gcBlockingBackend) List() ([]string, error) {
+	select {
+	case b.listCalled <- struct{}{}:
+	default:
+	}
+	return b.InMemory.List()
+}
+
 func newTestRepo(t *testing.T) (*Repo, *backend.InMemory) {
 	t.Helper()
 	db, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
@@ -29,6 +59,50 @@ func newTestRepo(t *testing.T) (*Repo, *backend.InMemory) {
 	key, _ := crypto.GenerateKey()
 	be := backend.NewInMemory()
 	return New(db, be, key, 64), be
+}
+
+func TestGCWaitsForWebDAVFileWrite(t *testing.T) {
+	db, err := meta.Open(filepath.Join(t.TempDir(), "meta.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	key, _ := crypto.GenerateKey()
+	be := &gcBlockingBackend{
+		InMemory:      backend.NewInMemory(),
+		uploadStarted: make(chan struct{}),
+		releaseUpload: make(chan struct{}),
+		listCalled:    make(chan struct{}, 1),
+	}
+	r := New(db, be, key, 64)
+
+	putDone := make(chan error, 1)
+	go func() { putDone <- r.PutFile("inflight.bin", 0o644, 1, bytes.NewReader([]byte("data"))) }()
+	select {
+	case <-be.uploadStarted:
+	case <-time.After(time.Second):
+		t.Fatal("上传未进入后端写入阶段")
+	}
+
+	gcDone := make(chan error, 1)
+	go func() { _, err := r.GC(); gcDone <- err }()
+	select {
+	case <-be.listCalled:
+		t.Fatal("GC 不应在文件写入提交前扫描后端")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(be.releaseUpload)
+	if err := <-putDone; err != nil {
+		t.Fatalf("文件写入失败: %v", err)
+	}
+	select {
+	case <-be.listCalled:
+	case <-time.After(time.Second):
+		t.Fatal("上传完成后 GC 未开始扫描")
+	}
+	if err := <-gcDone; err != nil {
+		t.Fatalf("GC 失败: %v", err)
+	}
 }
 
 // TestListDir：当前清单中 path 的直接子项（非递归，不含自身）；path 为空 = 模块根。

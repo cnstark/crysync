@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"sort"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"crysync/internal/trace"
 )
 
 // WebDAVError preserves information about a failed request to the storage
@@ -81,9 +84,32 @@ type WebDAV struct {
 	user          string
 	pass          string
 	client        *http.Client
+	logger        *slog.Logger
 	bucketDepth   int
 	collectionsMu sync.Mutex
 	collections   map[string]bool
+}
+
+// SetLogger enables request-level diagnostics. Callers should provide a
+// module-scoped logger; nil disables output.
+func (w *WebDAV) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	w.logger = logger
+}
+
+func (w *WebDAV) debug(msg string, args ...any) {
+	if w.logger != nil {
+		w.logger.Debug(msg, args...)
+	}
+}
+
+func (w *WebDAV) debugContext(ctx context.Context, msg string, args ...any) {
+	if id := trace.ID(ctx); id != "" {
+		args = append([]any{"op", id}, args...)
+	}
+	w.debug(msg, args...)
 }
 
 // NewWebDAV 构造 WebDAV 后端。url 为后端根（blob 存放在其下）。
@@ -113,6 +139,7 @@ func NewWebDAV(rawURL, user, pass string, bucketDepth int) (*WebDAV, error) {
 			// 指数退避重试兜底（Put）。
 			Timeout: 300 * time.Second,
 		},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, nil
 }
 
@@ -150,6 +177,8 @@ func (w *WebDAV) doContext(ctx context.Context, method, url string, body []byte,
 }
 
 func (w *WebDAV) doReaderContext(ctx context.Context, method, rawURL string, body io.Reader, size int64, want ...int) (*http.Response, error) {
+	started := time.Now()
+	w.debugContext(ctx, "backend_request_start", "backend", "webdav", "method", method, "request_bytes", size)
 	req, err := http.NewRequestWithContext(ctx, method, rawURL, body)
 	if err != nil {
 		return nil, err
@@ -165,6 +194,7 @@ func (w *WebDAV) doReaderContext(ctx context.Context, method, rawURL string, bod
 	}
 	resp, err := w.client.Do(req)
 	if err != nil {
+		w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", method, "outcome", "error", "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return nil, newWebDAVError(method, nil, err)
 	}
 	ok := resp.StatusCode >= 200 && resp.StatusCode < 300
@@ -180,8 +210,11 @@ func (w *WebDAV) doReaderContext(ctx context.Context, method, rawURL string, bod
 	if !ok {
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, newWebDAVError(method, resp, fmt.Errorf("%s", strings.TrimSpace(string(b))))
+		err := fmt.Errorf("%s", strings.TrimSpace(string(b)))
+		w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", method, "outcome", "error", "status", resp.StatusCode, "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
+		return nil, newWebDAVError(method, resp, err)
 	}
+	w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", method, "outcome", "ok", "status", resp.StatusCode, "elapsed_ms", time.Since(started).Milliseconds())
 	return resp, nil
 }
 
@@ -230,6 +263,7 @@ func (w *WebDAV) PutMetaContext(ctx context.Context, name string, src io.ReadSee
 		if !retryableWriteError(err) {
 			return fmt.Errorf("上传 Meta 备份 %s: %w", name, err)
 		}
+		w.debugContext(ctx, "backend_upload_retry", "backend", "webdav", "blob", name, "attempt", attempt+1, "retry_in_ms", delay.Milliseconds(), "err", err.Error())
 		if attempt < 2 {
 			timer := time.NewTimer(delay)
 			select {
@@ -330,6 +364,7 @@ func (w *WebDAV) PutContext(ctx context.Context, name string, data []byte) error
 		if !retryableWriteError(err) {
 			return fmt.Errorf("写入后端 %s: %w", name, err)
 		}
+		w.debugContext(ctx, "backend_upload_retry", "backend", "webdav", "blob", name, "attempt", attempt+1, "retry_in_ms", delay.Milliseconds(), "err", err.Error())
 		// A 404 from cloud-WebDAV can mean that its cached directory ID is
 		// stale. Forgetting local collection knowledge forces the next attempt
 		// to re-run MKCOL and lets the bridge resolve the path again.
@@ -506,8 +541,11 @@ func (w *WebDAV) propfindContext(ctx context.Context, currentURL string) ([]stru
 		} `xml:"prop"`
 	} `xml:"propstat"`
 }, error) {
+	started := time.Now()
+	w.debugContext(ctx, "backend_request_start", "backend", "webdav", "method", "PROPFIND")
 	req, err := http.NewRequestWithContext(ctx, "PROPFIND", strings.TrimSuffix(currentURL, "/")+"/", nil)
 	if err != nil {
+		w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", "PROPFIND", "outcome", "error", "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return nil, err
 	}
 	req.Header.Set("Depth", "1")
@@ -516,17 +554,22 @@ func (w *WebDAV) propfindContext(ctx context.Context, currentURL string) ([]stru
 	}
 	resp, err := w.client.Do(req)
 	if err != nil {
+		w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", "PROPFIND", "outcome", "error", "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return nil, newWebDAVError("PROPFIND", nil, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusMultiStatus {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, newWebDAVError("PROPFIND", resp, fmt.Errorf("%s", strings.TrimSpace(string(b))))
+		err := fmt.Errorf("%s", strings.TrimSpace(string(b)))
+		w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", "PROPFIND", "outcome", "error", "status", resp.StatusCode, "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
+		return nil, newWebDAVError("PROPFIND", resp, err)
 	}
 	var ms multistatus
 	if err := xml.NewDecoder(resp.Body).Decode(&ms); err != nil {
+		w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", "PROPFIND", "outcome", "error", "status", resp.StatusCode, "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return nil, fmt.Errorf("解析 PROPFIND 响应: %w", err)
 	}
+	w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", "PROPFIND", "outcome", "ok", "status", resp.StatusCode, "elapsed_ms", time.Since(started).Milliseconds())
 	return ms.Responses, nil
 }
 
@@ -582,8 +625,11 @@ func (w *WebDAV) List() ([]string, error) {
 func (w *WebDAV) Ping() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	started := time.Now()
+	w.debugContext(ctx, "backend_request_start", "backend", "webdav", "method", "PROPFIND", "purpose", "ping")
 	req, err := http.NewRequestWithContext(ctx, "PROPFIND", w.baseURL+"/", nil)
 	if err != nil {
+		w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", "PROPFIND", "purpose", "ping", "outcome", "error", "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return err
 	}
 	req.Header.Set("Depth", "0")
@@ -592,12 +638,15 @@ func (w *WebDAV) Ping() error {
 	}
 	resp, err := w.client.Do(req)
 	if err != nil {
+		w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", "PROPFIND", "purpose", "ping", "outcome", "error", "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
 		return newWebDAVError("PROPFIND", nil, err)
 	}
 	defer resp.Body.Close()
 	// 服务器实现可能不支持 PROPFIND 返回 207；200（旧实现）也视为可达
 	if resp.StatusCode != http.StatusMultiStatus && resp.StatusCode != http.StatusOK {
+		w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", "PROPFIND", "purpose", "ping", "outcome", "error", "status", resp.StatusCode, "elapsed_ms", time.Since(started).Milliseconds())
 		return newWebDAVError("PROPFIND", resp, fmt.Errorf("unexpected response status"))
 	}
+	w.debugContext(ctx, "backend_request_end", "backend", "webdav", "method", "PROPFIND", "purpose", "ping", "outcome", "ok", "status", resp.StatusCode, "elapsed_ms", time.Since(started).Milliseconds())
 	return nil
 }

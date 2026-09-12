@@ -29,13 +29,24 @@ type Module struct {
 
 // OpenModule 打开模块仓库：全新后端自动初始化；只有 key 时从远端恢复 Meta。
 func OpenModule(module *config.ModuleConfig) (*Module, error) {
-	return openModule(module, nil)
+	return openModule(module, nil, nil)
 }
 
-func openModule(module *config.ModuleConfig, rt *Runtime) (*Module, error) {
+// OpenModuleWithLogger opens a module with module-scoped debug diagnostics.
+func OpenModuleWithLogger(module *config.ModuleConfig, logger *slog.Logger) (*Module, error) {
+	return openModule(module, nil, logger)
+}
+
+func openModule(module *config.ModuleConfig, rt *Runtime, logger *slog.Logger) (*Module, error) {
 	be, err := openBackend(module)
 	if err != nil {
 		return nil, err
+	}
+	if logger != nil {
+		logger = logger.With("module", module.Name)
+		if logged, ok := be.(interface{ SetLogger(*slog.Logger) }); ok {
+			logged.SetLogger(logger)
+		}
 	}
 	if err := be.Ping(); err != nil {
 		return nil, fmt.Errorf("模块 %s 后端不可用: %w", module.Name, err)
@@ -52,6 +63,9 @@ func openModule(module *config.ModuleConfig, rt *Runtime) (*Module, error) {
 		return nil, err
 	}
 	r := repo.New(db, be, key, module.ChunkSizeBytes())
+	if logger != nil {
+		r.SetLogger(logger)
+	}
 	// 上传并发上限（跨连接共享闸门）：限制 backend.Put 网络写并发，0 = 不限制
 	r.SetUploadConcurrency(module.MaxUploadConcurrency)
 	if rt != nil {
@@ -285,7 +299,7 @@ func RunGCScheduler(ctx context.Context, module *config.ModuleConfig, logger *sl
 		case <-ticker.C:
 			started := time.Now()
 			logger.Info("gc_start", "module", module.Name)
-			opened, err := OpenModule(module)
+			opened, err := OpenModuleWithLogger(module, logger)
 			var reclaimed int
 			if err == nil {
 				reclaimed, err = opened.Repo.GC()
@@ -333,12 +347,14 @@ func runBackupUntilWithReadyCallback(ctx context.Context, module *config.ModuleC
 		onReady()
 	}
 	backup := func() {
+		started := time.Now()
+		logger.Debug("meta_backup_start", "module", module.Name)
 		name, err := repo.CreateMetaBackup(ctx, db, be, key, module.MetaBackupRetain())
 		if err != nil {
-			logger.Error("meta_backup_error", "module", module.Name, "err", err.Error())
+			logger.Error("meta_backup_error", "module", module.Name, "elapsed_ms", time.Since(started).Milliseconds(), "err", err.Error())
 			return
 		}
-		logger.Info("meta_backup_complete", "module", module.Name, "backup", name)
+		logger.Info("meta_backup_complete", "module", module.Name, "backup", name, "elapsed_ms", time.Since(started).Milliseconds())
 	}
 	backup()
 	ticker := time.NewTicker(module.MetaBackupInterval())
